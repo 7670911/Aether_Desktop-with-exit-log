@@ -82,7 +82,8 @@ for (const row of SETTINGS_ROWS) {
   const hints = view.querySelectorAll('.field__head .aihint')
   const labels = view.querySelectorAll('.field__label')
   console.log(`${row.id}: controls=${controls.length} labels=${labels.length} ✨=${hints.length}`)
-  check(controls.length > 0, `${row.id}: کنترل‌های واقعی رندر شدند`)
+  // `controlless`: زیرصفحه‌ای که فقط خواندنی است (بایگانیِ پیام‌ها) کنترلی ندارد.
+  check(row.controlless || controls.length > 0, `${row.id}: کنترل‌های واقعی رندر شدند`)
   check(hints.length === labels.length, `${row.id}: هر گزینه یک ✨ گرفت`)
   check(!!view.querySelector('.setpage__back'), `${row.id}: دکمهٔ بازگشت هست`)
   for (const c of controls) {

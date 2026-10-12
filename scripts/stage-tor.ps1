@@ -62,16 +62,47 @@ if (-not $Sha256.ContainsKey($Arch)) { Skip "برای $Arch دایجستِ پی�
 $expected = $Sha256[$Arch]
 
 $asset = "tor-expert-bundle-windows-$slug-$Version.tar.gz"
-$url   = "https://dist.torproject.org/torbrowser/$Version/$asset"
 $tmp   = Join-Path ([System.IO.Path]::GetTempPath()) "aether-tor-$Version"
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 $archive = Join-Path $tmp $asset
 
+# رفعِ ریشه‌ایِ شکستِ ۴ اکتبر ۲۰۲۶ (404 روی هر دو معماری):
+# dist.torproject.org فقط نسخه‌های جاری را نگه می‌دارد. با انتشارِ Tor Browser
+# 15.0.24 (۲۹ سپتامبر) پوشهٔ 15.0.23 از آن‌جا برداشته شد، در حالی که بیلدِ ما
+# عمداً روی 15.0.23 و دایجستش پین است. archive.torproject.org همهٔ نسخه‌ها را
+# برای همیشه نگه می‌دارد و فایلِ آن بایت‌به‌بایت همان است (دایجستِ پین‌شده در
+# sha256sums-signed-build.txt همان آرشیو هم هست). پس اول dist (سریع‌تر)، بعد
+# آرشیو؛ دایجست در هر حال پایینِ همین بلوک سنجیده می‌شود، پس آینهٔ دوم هیچ
+# اعتمادِ تازه‌ای اضافه نمی‌کند.
+$mirrors = @(
+  "https://dist.torproject.org/torbrowser/$Version/$asset",
+  "https://archive.torproject.org/tor-package-archive/torbrowser/$Version/$asset"
+)
+
 Write-Host "==> [tor] downloading $asset"
-try {
-  Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing -TimeoutSec 600
-} catch {
-  Skip "دانلودِ $url نشد: $($_.Exception.Message)"
+$fetched  = $false
+$failures = @()
+foreach ($url in $mirrors) {
+  foreach ($attempt in 1..3) {
+    try {
+      Remove-Item $archive -Force -ErrorAction SilentlyContinue
+      Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing -TimeoutSec 600
+      Write-Host "    from: $url"
+      $fetched = $true
+      break
+    } catch {
+      $msg = $_.Exception.Message
+      $failures += "$url (try $attempt): $msg"
+      Write-Host "    [tor] $url try $attempt failed: $msg"
+      # 404 یعنی این آینه اصلاً این نسخه را ندارد؛ تکرار بی‌فایده است.
+      if ($msg -match '404') { break }
+      Start-Sleep -Seconds (5 * $attempt)
+    }
+  }
+  if ($fetched) { break }
+}
+if (-not $fetched) {
+  Skip ("دانلودِ $asset از هیچ آینه‌ای نشد: " + ($failures -join ' | '))
 }
 
 $got = (Get-FileHash -Path $archive -Algorithm SHA256).Hash.ToLower()

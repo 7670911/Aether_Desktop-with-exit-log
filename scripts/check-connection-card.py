@@ -24,7 +24,6 @@ import sys
 from pathlib import Path
 
 WURZEL = Path(__file__).resolve().parent.parent
-KERN_TOR = WURZEL / "native/aether/aether/src/tor.rs"
 STATE = WURZEL / "src-tauri/src/state.rs"
 PROBE = WURZEL / "src-tauri/src/probe.rs"
 ENGINE = WURZEL / "src-tauri/src/engine.rs"
@@ -48,12 +47,11 @@ def ohne_kommentare(text: str, marker: str = "//") -> str:
 def main() -> int:
     fehler = []
 
-    for pfad in (KERN_TOR, STATE, PROBE, ENGINE, MAIN, FIRSTHOP, TOR_NATIVE, KARTE):
+    for pfad in (STATE, PROBE, ENGINE, MAIN, FIRSTHOP, TOR_NATIVE, KARTE):
         if not pfad.exists():
             print(f"✗ fehlt: {pfad.relative_to(WURZEL)}")
             return 1
 
-    kern = ohne_kommentare(KERN_TOR.read_text(encoding="utf-8", errors="replace"))
     state = ohne_kommentare(STATE.read_text(encoding="utf-8", errors="replace"))
     probe = ohne_kommentare(PROBE.read_text(encoding="utf-8", errors="replace"))
     engine = ohne_kommentare(ENGINE.read_text(encoding="utf-8", errors="replace"))
@@ -62,39 +60,9 @@ def main() -> int:
     nativ = TOR_NATIVE.read_text(encoding="utf-8", errors="replace")
     karte = ohne_kommentare(KARTE.read_text(encoding="utf-8", errors="replace"))
 
-    # ---- 1) die Laufzeit wird auf einem eigenen Thread geboren -------------
-    if "tor-runtime-birth" not in kern:
-        fehler.append(
-            "die Tor-Laufzeit wird nicht auf einem eigenen Thread gebaut; "
-            "`PreferredRuntime::create()` im async-Kontext paniert garantiert "
-            "(loge3: vier Paniken, kein einziges Prozent Bootstrap)"
-        )
-    else:
-        geburt = re.search(
-            r"async fn new\(\)\s*->\s*Result<Self>\s*\{(.*?)\n        \}",
-            kern,
-            re.S,
-        )
-        if not geburt:
-            fehler.append("der Konstruktor der eigenen Laufzeit ist nicht auffindbar")
-        else:
-            koerper = geburt.group(1)
-            if "std::thread::Builder" not in koerper or "oneshot" not in koerper:
-                fehler.append(
-                    "die Laufzeit entsteht ohne Thread+oneshot, also wieder im "
-                    "async-Kontext"
-                )
-            if "rx.await" not in koerper:
-                fehler.append(
-                    "auf den Geburts-Thread wird blockierend statt mit `await` "
-                    "gewartet — das blockiert den Executor"
-                )
-    # `create_unbootstrapped()` blockiert beim Dateilock; die async-Variante nicht.
-    if "create_unbootstrapped_async()" not in kern:
-        fehler.append(
-            "der Client wird synchron gebaut (`create_unbootstrapped()`); der "
-            "Dateilock des Zustandsverzeichnisses blockiert dann den Executor"
-        )
+    # ---- 1) (1.3.0) der Kern ist unverändert; Tor läuft nur über tor.exe --
+    # Die früheren Prüfungen an `native/aether/aether/src/tor.rs` (arti im
+    # Engine) entfallen: kein Tor-Modus startet mehr arti im Kern.
 
     # ---- 2) die Schranke wartet auf den Port des Carriers -----------------
     if "fn tor_listener_port(" not in state:
@@ -169,6 +137,14 @@ def main() -> int:
         fehler.append("`display_protocol` ist nicht auffindbar")
     else:
         koerper = protokoll.group(1)
+        if not re.search(
+            r"TransportBackend::Tor\s*\|\s*crate::profile::TransportBackend::TorPsiphon\s*\)\s*\{\s*return pipeline_name",
+            koerper,
+        ):
+            fehler.append(
+                "`Tor` / `Tor → Psiphon` zeigen nicht mehr ihren eigenen Namen vor der "
+                "Kettenbedingung — die Kachel fällt dann auf `SMART` zurück (1.3.0-Bug)"
+            )
         if "protocol_label()" not in koerper:
             fehler.append("die Protokoll-Kachel kennt den Namen der Pipeline nicht")
         if "is_chained()" not in koerper:
@@ -266,7 +242,7 @@ def main() -> int:
         return 1
 
     print(
-        "✓ Laufzeit auf eigenem Thread (kein block_on im async-Kontext), Schranke "
+        "✓ Tor nur über tor.exe (Kern unverändert), Schranke "
         "am Carrier-Port statt am Kettenausgang, erster Hop verdrahtet mit "
         "Rückfall und Reset, Pipeline-Name auf der Kachel, T1/A1/A2/O1/XX kein "
         "Land an allen drei Stellen, eigene Ping-Skala für Tor, vier STUN-Server "

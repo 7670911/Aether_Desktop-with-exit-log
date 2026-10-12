@@ -46,7 +46,7 @@ window.__TAURI_INTERNALS__ = {
 }
 
 await import('../src/main.js')
-const { ai, applyAiSnapshot } = await import('../src/ai.js')
+const { ai, applyAiSnapshot, refreshAi } = await import('../src/ai.js')
 const { renderAssistant } = await import('../src/views/assistant.js')
 const { renderDiagnostics } = await import('../src/views/diagnostics.js')
 const { t, setLang, LANGS } = await import('../src/i18n.js')
@@ -116,6 +116,47 @@ check(!!summary && summary.textContent.includes('API key not valid'), 'پیام 
 applyAiSnapshot({ ...ai, busy: true })
 check(view.querySelector('.ai__probe').textContent === t('Testing…'), '«در حال تست…» بر نتیجهٔ کهنه مقدم است')
 applyAiSnapshot({ ...ai, busy: false })
+
+// مدل‌ها حتی با فهرستِ کش‌شده بدون کلید یا بدون تونل نمایش داده نمی‌شوند.
+const offered = [
+  'gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.5-flash-lite',
+  'gemini-3.1-flash-lite', 'gemini-3.1-flash-lite-preview', 'gemini-flash-lite-latest',
+].map((id) => ({ id, outputTokenLimit: 2048 }))
+const modelBox = view.querySelector('.ai__models').parentElement
+applyAiSnapshot({ ...ai, hasKey: false, tunnelConnected: true, models: offered })
+check(modelBox.hidden && !view.querySelector('.ai__model'), 'بدون کلید، مدل‌های کش‌شده پنهان‌اند')
+applyAiSnapshot({ ...ai, hasKey: true, tunnelConnected: false, models: offered })
+check(modelBox.hidden && !view.querySelector('.ai__model'), 'با تونل قطع، مدل‌های کش‌شده پنهان‌اند')
+applyAiSnapshot({ ...ai, hasKey: true, tunnelConnected: true, models: offered })
+check(!modelBox.hidden && view.querySelectorAll('.ai__model').length === 6,
+  'پس از کلید و اتصال، مدل‌های مجاز نمایش داده می‌شوند')
+check(view.querySelectorAll('.ai__modelmeta').length === 6,
+  'برای هر شش مدل موبایل، توضیح محدودیت روزانه نمایش داده می‌شود')
+check(view.querySelectorAll('.ai__modelmeta')[3].textContent ===
+  'Default · highest daily limit, best for continuous everyday use',
+  'توضیح مدل پیش‌فرض عیناً با موبایل یکی است')
+setLang('fa')
+const faDesc = view.querySelectorAll('.ai__modelmeta')[3].textContent
+// Changing language rebuilds the view, as in production.
+const faView = renderAssistant()
+document.getElementById('view').replaceChildren(faView)
+check(faView.querySelectorAll('.ai__modelmeta')[3].textContent ===
+  'پیش‌فرض · سقف مصرف روزانهٔ بالا، بهینه برای استفادهٔ مداوم',
+  'توضیح فارسی مدل پیش‌فرض عیناً با موبایل یکی است')
+setLang('en')
+
+// پاسخ قدیمیِ ai_snapshot نباید اتصال جدیدتر را دوباره «قطع» نشان دهد.
+const savedInvoke = window.__TAURI_INTERNALS__.invoke
+let finishOld
+window.__TAURI_INTERNALS__.invoke = (command, args) =>
+  command === 'ai_snapshot' ? new Promise((resolve) => { finishOld = resolve }) : savedInvoke(command, args)
+const pendingOld = refreshAi()
+applyAiSnapshot({ ...ai, gateCode: 'READY', tunnelConnected: true })
+finishOld({ ...ai, gateCode: 'DISCONNECTED', tunnelConnected: false })
+await pendingOld
+check(ai.gateCode === 'READY' && ai.tunnelConnected,
+  'snapshot دیررس نمی‌تواند وضعیت اتصال تازه‌تر را بازنویسی کند')
+window.__TAURI_INTERNALS__.invoke = savedInvoke
 
 // ------------------------------------------------- ۳) هیچ تگی به‌صورت متن
 const TAGISH = /<[^>]+>|&[a-z]+;/i

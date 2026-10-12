@@ -7,94 +7,18 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 
 const MOAT: &str = "https://bridges.torproject.org/moat/circumvention";
+const ONIONOO: &str = "https://onionoo.torproject.org/details";
 const TRACE: &str = "https://www.cloudflare.com/cdn-cgi/trace";
 const CACHE_FILE: &str = "bridges.json";
 const CACHE_MAX_AGE: Duration = Duration::from_secs(6 * 60 * 60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(25);
-// >>> AETHER-APP-PATCH bridgedb-budget
-/// سقفِ کلِ گفت‌وگو با bridgedb — نه سقفِ یک درخواست.
-const BRIDGEDB_BUDGET: Duration = Duration::from_secs(12);
-// <<< AETHER-APP-PATCH bridgedb-budget
 
 const PREFERENCE: &[&str] = &["obfs4", "webtunnel", "snowflake", "meek_lite", "meek"];
-
-// >>> AETHER-APP-PATCH bridge-order-per-country
-/// Die offizielle Reihenfolge der Transporte pro Land.
-///
-/// Stand: Abruf von `https://bridges.torproject.org/moat/circumvention/map`
-/// am 2026-09-16 (HTTP 200, 8 Laender). Das ist dieselbe Quelle, aus der die
-/// "Connection Assist" von Tor Browser ihre Reihenfolge nimmt.
-///
-/// Warum als Tabelle im Binary und nicht per Abruf: in genau den Laendern, um
-/// die es geht, ist `bridges.torproject.org` gesperrt -- im Log vom 2026-09-16
-/// kam `bridgedb gave nothing back`. Eine Reihenfolge, die nur mit Netzzugang
-/// zu haben ist, hilft dort nie. Gelingt der Abruf doch, gewinnen ohnehin die
-/// gelieferten Bruecken.
-///
-/// `webtunnel` steht in der Tabelle, obwohl keine webtunnel-Zeile eingebaut
-/// ist: BridgeDB gibt webtunnel nur pro Nutzer heraus. Der Eintrag wird
-/// stillschweigend uebersprungen, wenn keine solche Zeile vorliegt -- und
-/// sobald eine kommt, sitzt sie an der richtigen Stelle.
-const BY_COUNTRY: &[(&str, &[&str])] = &[
-    ("by", &["obfs4", "snowflake"]),
-    ("cn", &["webtunnel", "snowflake", "obfs4"]),
-    ("eg", &["obfs4", "snowflake"]),
-    ("hk", &["obfs4", "snowflake"]),
-    ("ir", &["webtunnel", "snowflake", "obfs4"]),
-    ("mm", &["webtunnel", "obfs4", "snowflake"]),
-    ("ru", &["snowflake", "webtunnel", "obfs4"]),
-    ("tm", &["snowflake", "obfs4", "meek_lite", "meek"]),
-];
-
-/// Die Reihenfolge, in der Transporte fuer dieses Land probiert werden.
-pub fn preference_for(country: Option<&str>) -> &'static [&'static str] {
-    let code = match country {
-        Some(code) => code.trim().to_ascii_lowercase(),
-        None => return PREFERENCE,
-    };
-
-    BY_COUNTRY
-        .iter()
-        .find(|(known, _)| *known == code)
-        .map(|(_, order)| *order)
-        .unwrap_or(PREFERENCE)
-}
-
-/// Das Land, das diese Sitzung gesehen hat -- fuer die Reihenfolge der Sprossen.
-static SEEN_COUNTRY: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
-
-fn note_country(code: &str) {
-    let code = code.trim().to_ascii_lowercase();
-    if code.len() == 2 {
-        if let Ok(mut slot) = SEEN_COUNTRY.write() {
-            *slot = Some(code);
-        }
-    }
-}
-
-pub fn last_country() -> Option<String> {
-    SEEN_COUNTRY.read().ok().and_then(|slot| slot.clone())
-}
-// <<< AETHER-APP-PATCH bridge-order-per-country
 const WORKED_FILE: &str = "bridges-worked.txt";
 
-// >>> AETHER-APP-PATCH embedded-bridge-lines-usable
-// Warum diese Zeilen geaendert wurden (Log 2026-09-16, Modus "Tor alone"):
-//
-// 1. `fronts=` -> `front=`.
-//    Das mitgelieferte lyrebird/snowflake kennt die Pluralform `fronts=`
-//    nicht; die offizielle Tor-Doku schreibt fuer genau dieses lyrebird
-//    `front=` mit Kommaliste. Bei unbekannter Option findet ueberhaupt kein
-//    Domain-Fronting statt und die echte Broker-SNI geht auf die Leitung --
-//    genau das, was verborgen bleiben muss (Debian-Bug #1117569).
-//
-// 2. Die ICE-Liste ist jetzt die heutige offizielle Liste, und das
-//    Entscheidende daran: ein Eintrag liegt auf Port 443. Vorher lagen alle
-//    acht STUN-Server auf 3478, also machte alles, was 3478 blockt -- auch
-//    die STUN/TURN-Regel dieser App selbst -- snowflake vollstaendig blind.
 const EMBEDDED: &[&str] = &[
-    "snowflake 192.0.2.3:80 2B280B23E1107BB62ABFC40DDCC8824814F80A72 fingerprint=2B280B23E1107BB62ABFC40DDCC8824814F80A72 url=https://1098762253.rsc.cdn77.org front=www.phpmyadmin.net,cdn.zk.mk ice=stun:stun.antisip.com:3478,stun:stun.epygi.com:3478,stun:stun.uls.co.za:3478,stun:stun.voipgate.com:3478,stun:stun.mixvoip.com:3478,stun:stun.telnyx.com:3478,stun:stun.hot-chilli.net:3478,stun:stun.fitauto.ru:3478,stun:stun.m-online.net:3478 utls-imitate=hellorandomizedalpn",
-    "snowflake 192.0.2.4:80 8838024498816A039FCBBAB14E6F40A0843051FA fingerprint=8838024498816A039FCBBAB14E6F40A0843051FA url=https://1098762253.rsc.cdn77.org front=www.phpmyadmin.net,cdn.zk.mk ice=stun:stun.antisip.com:3478,stun:stun.epygi.com:3478,stun:stun.uls.co.za:3478,stun:stun.voipgate.com:3478,stun:stun.mixvoip.com:3478,stun:stun.telnyx.com:3478,stun:stun.hot-chilli.net:3478,stun:stun.fitauto.ru:3478,stun:stun.m-online.net:3478 utls-imitate=hellorandomizedalpn",
+    "snowflake 192.0.2.3:80 2B280B23E1107BB62ABFC40DDCC8824814F80A72 fingerprint=2B280B23E1107BB62ABFC40DDCC8824814F80A72 url=https://1098762253.rsc.cdn77.org/ fronts=app.datapacket.com,www.datapacket.com ice=stun:stun.epygi.com:3478,stun:stun.uls.co.za:3478,stun:stun.voipgate.com:3478,stun:stun.mixvoip.com:3478,stun:stun.telnyx.com:3478,stun:stun.hot-chilli.net:3478,stun:stun.fitauto.ru:3478,stun:stun.m-online.net:3478 utls-imitate=hellorandomizedalpn",
+    "snowflake 192.0.2.4:80 8838024498816A039FCBBAB14E6F40A0843051FA fingerprint=8838024498816A039FCBBAB14E6F40A0843051FA url=https://1098762253.rsc.cdn77.org/ fronts=app.datapacket.com,www.datapacket.com ice=stun:stun.epygi.com:3478,stun:stun.uls.co.za:3478,stun:stun.voipgate.com:3478,stun:stun.mixvoip.com:3478,stun:stun.telnyx.com:3478,stun:stun.hot-chilli.net:3478,stun:stun.fitauto.ru:3478,stun:stun.m-online.net:3478 utls-imitate=hellorandomizedalpn",
     "obfs4 146.57.248.225:22 10A6CD36A537FCE513A322361547444B393989F0 cert=K1gDtDAIcUfeLqbstggjIw2rtgIKqdIhUlHp82XRqNSq/mtAjp1BIC9vHKJ2FAEpGssTPw iat-mode=0",
     "obfs4 209.148.46.65:443 74FAD13168806246602538555B5521A0383A1875 cert=ssH+9rP8dG2NLDN2XuFw63hIO/9MNNinLmxQDpVa+7kTOa9/m+tGWT1SmSYpQ9uTBGa6Hw iat-mode=0",
     "obfs4 45.145.95.6:27015 C5B7CD6946FF10C5B3E89691A7D3F2C122D2117C cert=TD7PbUO0/0k6xYHMPW3vJxICfkMZNdkRrb63Zhl5j9dW3iRGiCx0A7mPhe5T2EDzQ35+Zw iat-mode=0",
@@ -102,26 +26,8 @@ const EMBEDDED: &[&str] = &[
     "obfs4 51.222.13.177:80 5EDAC3B810E12B01F6FD8050D2FD3E277B289A08 cert=2uplIpLQ0q9+0qMFrK5pkaYRDOe460LL9WHBvatgkuRr/SL31wBOEupaMMJ6koRE6Ld0ew iat-mode=0",
     "obfs4 37.218.245.14:38224 D9A82D2F9C2F65A18407B1D2B764F130847F8B5D cert=bjRaMrr1BRiAW8IE9U5z27fQaYgOhX1UCmOpg2pFpoMvo6ZgQMzLsaTzzQNTlm7hNcb+Sg iat-mode=0",
     "obfs4 212.83.43.95:443 BFE712113A72899AD685764B211FACD30FF52C31 cert=ayq0XzCwhpdysn5o0EyDUbmSOx3X/oTEbzDMvczHOdBJKlvIdHHLJGkZARtT4dcBFArPPg iat-mode=1",
-    // Die meek_lite-Zeile ist entfernt; der Platz bleibt als Warnung stehen.
-    // Was hier stand, ist wortgleich, was Tor Browser ausliefert:
-    //
-    //     meek_lite 192.0.2.20:80 url=https://1603026938.rsc.cdn77.org front=...
-    //
-    // und enthaelt keinen Fingerprint. C-tor akzeptiert eine Bridge-Zeile ohne
-    // Identitaet, unser Kern ist arti, und arti braucht fuer jede Bridge eine
-    // Identitaet. Im Log vom 2026-09-16 sieht man das Ergebnis nach zwei
-    // Millisekunden:
-    //
-    //     [-] meek_lite did not get through: other: none of the bridges could
-    //         be read by tor
-    //
-    // Die beiden letzten Sprossen der Leiter waren also von Anfang an tot. Die
-    // dokumentierte Zeile MIT Fingerprint zeigt auf meek.azureedge.net, und
-    // dieser Host antwortet nicht mehr; fuer die cdn77-Bridge existiert kein
-    // verifizierter Fingerprint, und ich erfinde keinen. Bis eine vollstaendige,
-    // geprueffte Zeile vorliegt, verbraucht meek keine Leiterzeit mehr.
+    "meek_lite 192.0.2.20:80 url=https://1603026938.rsc.cdn77.org front=www.phpmyadmin.net utls=HelloRandomizedALPN",
 ];
-// <<< AETHER-APP-PATCH embedded-bridge-lines-usable
 
 const PT_BINARIES: &[(&str, &[&str])] = &[
     ("snowflake-client", &["snowflake"]),
@@ -161,6 +67,9 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 const REACH_TIMEOUT: Duration = Duration::from_secs(6);
 const KEEP_PER_TRANSPORT: usize = 6;
 const UNTESTABLE: &[&str] = &["snowflake", "meek", "meek_lite", "conjure"];
+const TOR_DESIGNATED_PORTS: &[u16] = &[9001, 9030, 9040, 9050, 9051, 9150];
+const WEB_PORTS: &[u16] = &[80, 443];
+const RELAYS_DEFAULT: usize = 40;
 
 const SYSTEM_DIRS: &[&str] = &[
     "/usr/lib/tor/pluggable-transports",
@@ -209,6 +118,20 @@ struct Cached {
     fetched: u64,
     country: String,
     lines: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct OnionooReply {
+    #[serde(default)]
+    relays: Vec<OnionooRelay>,
+}
+
+#[derive(Deserialize)]
+struct OnionooRelay {
+    #[serde(default)]
+    fingerprint: Option<String>,
+    #[serde(default)]
+    or_addresses: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -458,13 +381,25 @@ pub fn install_hint() -> &'static str {
     }
 }
 
-fn http_client() -> Result<reqwest::Client> {
+fn http_client(through: Option<std::net::SocketAddr>) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .user_agent(crate::consts::UA_REGISTER)
-        .timeout(REQUEST_TIMEOUT);
+        .timeout(REQUEST_TIMEOUT)
+        // TLS server-certificate verification disabled (unconditional).
+        .danger_accept_invalid_certs(true);
 
-    if let Some(upstream) = crate::upstream::configured() {
-        builder = builder.proxy(upstream.as_reqwest_proxy()?);
+    match through {
+        Some(proxy) => {
+            log::info!("[*] fetching bridges through the tunnel on {proxy}");
+            builder = builder.proxy(reqwest::Proxy::all(format!("socks5h://{proxy}")).map_err(
+                |e| crate::error::AetherError::Other(format!("bridge fetch through {proxy}: {e}")),
+            )?);
+        }
+        None => {
+            if let Some(upstream) = crate::upstream::configured() {
+                builder = builder.proxy(upstream.as_reqwest_proxy()?);
+            }
+        }
     }
 
     builder
@@ -478,22 +413,14 @@ async fn detect_country(client: &reqwest::Client) -> Option<String> {
         .map(|code| code.trim().to_lowercase())
         .filter(|code| code.len() == 2)
     {
-        // >>> AETHER-APP-PATCH bridge-order-per-country
-        note_country(&told);
-        // <<< AETHER-APP-PATCH bridge-order-per-country
         return Some(told);
     }
 
     let body = client.get(TRACE).send().await.ok()?.text().await.ok()?;
-    let found = body
-        .lines()
+    body.lines()
         .find_map(|line| line.strip_prefix("loc="))
         .map(|code| code.trim().to_lowercase())
-        .filter(|code| code.len() == 2)?;
-    // >>> AETHER-APP-PATCH bridge-order-per-country
-    note_country(&found);
-    // <<< AETHER-APP-PATCH bridge-order-per-country
-    Some(found)
+        .filter(|code| code.len() == 2)
 }
 
 fn ordered(mut grouped: BTreeMap<String, Vec<String>>) -> Vec<String> {
@@ -630,7 +557,137 @@ fn dedup(lines: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-pub async fn fetch(state: &Path) -> (Vec<String>, &'static str) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Relays {
+    Off,
+    Also(usize),
+    Only(usize),
+}
+
+pub fn relay_policy() -> Relays {
+    let raw = std::env::var("AETHER_TOR_RELAYS").unwrap_or_default();
+    let spec = raw.trim().to_ascii_lowercase();
+
+    match spec.as_str() {
+        "off" | "no" | "0" | "false" | "none" => Relays::Off,
+        "" | "auto" | "on" | "yes" | "true" => Relays::Also(RELAYS_DEFAULT),
+        "only" | "relays" => Relays::Only(RELAYS_DEFAULT),
+        _ => match spec.strip_prefix("only:").unwrap_or(&spec).parse::<usize>() {
+            Ok(count) if count > 0 => {
+                let count = count.min(400);
+                if spec.starts_with("only") {
+                    Relays::Only(count)
+                } else {
+                    Relays::Also(count)
+                }
+            }
+            _ => Relays::Also(RELAYS_DEFAULT),
+        },
+    }
+}
+
+fn relay_ports_are_open() -> bool {
+    std::env::var("AETHER_TOR_RELAY_PORTS")
+        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "any" | "all"))
+        .unwrap_or(false)
+}
+
+pub fn relay_line(fingerprint: &str, address: &str, web_only: bool) -> Option<String> {
+    let parsed: std::net::SocketAddr = address.parse().ok()?;
+    let port = parsed.port();
+
+    if TOR_DESIGNATED_PORTS.contains(&port) {
+        return None;
+    }
+    if web_only && !WEB_PORTS.contains(&port) {
+        return None;
+    }
+
+    let id = fingerprint.trim().to_ascii_uppercase();
+    if id.len() != 40 || !id.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+
+    Some(format!("{address} {id}"))
+}
+
+async fn from_relays(client: &reqwest::Client, want: usize) -> Option<Vec<String>> {
+    let web_only = !relay_ports_are_open();
+
+    log::info!(
+        "[*] asking onionoo for running relays to use as plain bridges{}",
+        if web_only { " on ports 80 and 443" } else { "" }
+    );
+
+    let answer = match client
+        .get(ONIONOO)
+        .query(&[
+            ("type", "relay"),
+            ("running", "true"),
+            ("fields", "fingerprint,or_addresses"),
+        ])
+        .send()
+        .await
+    {
+        Ok(answer) => answer,
+        Err(e) => {
+            log::warn!("[-] onionoo did not answer: {e}");
+            return None;
+        }
+    };
+
+    let reply = match answer.json::<OnionooReply>().await {
+        Ok(reply) => reply,
+        Err(e) => {
+            log::warn!("[-] onionoo sent something unreadable: {e}");
+            return None;
+        }
+    };
+
+    let mut lines: Vec<String> = Vec::new();
+    for relay in &reply.relays {
+        let fingerprint = match &relay.fingerprint {
+            Some(id) => id,
+            None => continue,
+        };
+        for address in relay.or_addresses.iter().flatten() {
+            if let Some(line) = relay_line(fingerprint, address, web_only) {
+                lines.push(line);
+            }
+        }
+    }
+
+    if lines.is_empty() {
+        log::warn!("[-] onionoo listed no relay that clears the port filter");
+        return None;
+    }
+
+    let total = lines.len();
+    shuffle(&mut lines);
+    lines.truncate(want);
+
+    log::info!(
+        "[+] onionoo gave {total} usable relay address(es); trying {} of them",
+        lines.len()
+    );
+
+    Some(lines)
+}
+
+pub async fn fetch(
+    state: &Path,
+    through: Option<std::net::SocketAddr>,
+) -> (Vec<String>, &'static str) {
+    log::info!(
+        "[*] looking for bridges: bridgedb {}, onionoo relays {:?}",
+        if matches!(relay_policy(), Relays::Only(_)) {
+            "skipped"
+        } else {
+            "asked"
+        },
+        relay_policy()
+    );
+
     let cached = read_cache(state);
     if let Some(fresh) = cached
         .as_ref()
@@ -643,56 +700,64 @@ pub async fn fetch(state: &Path) -> (Vec<String>, &'static str) {
         return (fresh.lines.clone(), "cache");
     }
 
-    let client = match http_client() {
+    let client = match http_client(through) {
         Ok(client) => client,
         Err(e) => {
-            log::warn!("[-] cannot reach bridgedb: {e}");
+            log::warn!("[-] cannot build a client to fetch bridges: {e}");
             return fallback(cached);
         }
     };
 
-    log::info!("[*] asking bridgedb for bridges");
-    // >>> AETHER-APP-PATCH bridgedb-budget
-    // این سه درخواست پشت سرِ هم می‌روند و هر کدام REQUEST_TIMEOUT خودش را
-    // دارد، پس در بدترین حالت ۷۵ ثانیه. در لاگ ۲۰۲۶-۰۹-۱۶ ۴۳ ثانیه گرفت و
-    // آخرش `bridgedb gave nothing back` — چون درخواست‌ها مستقیم و بدون پوشش
-    // از شبکه‌ای می‌روند که خودِ تور را می‌بندد، و bridges.torproject.org هم
-    // آنجا بسته است. آن ۴۳ ثانیه از بودجهٔ صبرِ کاربر خورده می‌شود، پیش از
-    // آنکه اولین پلِ داخلی حتی امتحان شود.
-    //
-    // یک بودجهٔ کل: شبکه‌ای که جواب می‌دهد در دو-سه ثانیه جواب می‌دهد، و
-    // شبکه‌ای که نمی‌دهد دیگر یک دقیقه نگه‌مان نمی‌دارد.
-    let gather = async {
-        let country = detect_country(&client).await;
+    let relays = relay_policy();
+    let mut country = None;
+    let mut lines = Vec::new();
+    let mut source = "bridgedb";
+
+    if let Relays::Only(_) = relays {
+        source = "onionoo relays";
+    } else {
+        log::info!("[*] asking bridgedb for bridges");
+        country = detect_country(&client).await;
         if let Some(code) = country.as_deref() {
             log::info!("[*] this network looks like it is in {code}");
         }
 
-        let mut lines = Vec::new();
         if let Some(found) = from_settings(&client, country.as_deref()).await {
             lines.extend(found);
         }
         if let Some(found) = from_builtin(&client).await {
             lines.extend(found);
         }
-        (country, lines)
-    };
 
-    let (country, lines) = match tokio::time::timeout(BRIDGEDB_BUDGET, gather).await {
-        Ok(v) => v,
-        Err(_) => {
-            log::warn!(
-                "[-] bridgedb did not answer within {}s; going straight to the built-in bridges",
-                BRIDGEDB_BUDGET.as_secs()
-            );
-            return fallback(cached);
+        if lines.is_empty() {
+            log::warn!("[-] bridgedb gave nothing back");
         }
-    };
-    // <<< AETHER-APP-PATCH bridgedb-budget
+    }
+
+    match relays {
+        Relays::Off => {}
+        Relays::Also(want) | Relays::Only(want) => {
+            if let Some(found) = from_relays(&client, want).await {
+                if !lines.is_empty() {
+                    source = "bridgedb and onionoo relays";
+                } else {
+                    source = "onionoo relays";
+                }
+                lines.extend(found);
+            }
+        }
+    }
 
     let lines = dedup(lines);
     if lines.is_empty() {
-        log::warn!("[-] bridgedb gave nothing back");
+        if through.is_none() {
+            log::warn!(
+                "[-] every bridge source is unreachable from here, which is what a network that \
+                 blocks tor looks like. two ways past it: run --tor instead of --tor-only, which \
+                 brings the tunnel up first and fetches bridges through it, or pass bridges you \
+                 already have with --tor-bridge-file"
+            );
+        }
         return fallback(cached);
     }
 
@@ -705,8 +770,8 @@ pub async fn fetch(state: &Path) -> (Vec<String>, &'static str) {
         },
     );
 
-    log::info!("[+] bridgedb gave {} bridge(s)", lines.len());
-    (lines, "bridgedb")
+    log::info!("[+] {source} gave {} bridge(s)", lines.len());
+    (lines, source)
 }
 
 fn fallback(cached: Option<Cached>) -> (Vec<String>, &'static str) {
@@ -747,7 +812,26 @@ async fn answers(address: std::net::SocketAddr) -> bool {
     )
 }
 
-pub async fn keep_reachable(lines: Vec<String>) -> Vec<String> {
+pub async fn keep_reachable(
+    lines: Vec<String>,
+    through: Option<std::net::SocketAddr>,
+) -> Vec<String> {
+    if through.is_some() {
+        log::info!(
+            "[*] tor will dial its bridges through the tunnel, so they are not probed from here"
+        );
+        return lines;
+    }
+
+    // A probe from here would leave outside the upstream proxy, which tor dials its bridges
+    // through, or without which it does not start.
+    if crate::upstream::configured().is_some() {
+        log::info!(
+            "[*] tor will dial its bridges through the upstream proxy, so they are not probed from here"
+        );
+        return lines;
+    }
+
     let mut checks = Vec::new();
 
     for line in &lines {
@@ -835,7 +919,7 @@ pub fn shuffle(lines: &mut [String]) {
     }
 }
 
-pub fn waves(plan: &Plan, first: Option<&str>, country: Option<&str>) -> Vec<(String, Plan)> {
+pub fn waves(plan: &Plan, first: Option<&str>) -> Vec<(String, Plan)> {
     let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for line in &plan.lines {
         let kind = transport_of(line).unwrap_or_else(|| "vanilla".to_string());
@@ -846,27 +930,15 @@ pub fn waves(plan: &Plan, first: Option<&str>, country: Option<&str>) -> Vec<(St
         return Vec::new();
     }
 
-    // >>> AETHER-APP-PATCH bridge-order-per-country
-    let order = preference_for(country);
-    if let Some(code) = country {
-        if !std::ptr::eq(order, PREFERENCE) {
-            log::info!(
-                "[*] {code}: trying {} first, the official order for this country",
-                order.join(", then ")
-            );
-        }
-    }
-
     let mut names: Vec<String> = grouped.keys().cloned().collect();
     names.sort_by_key(|name| {
-        let known = order
+        let known = PREFERENCE
             .iter()
             .position(|entry| entry == name)
-            .unwrap_or(order.len());
+            .unwrap_or(PREFERENCE.len());
         let tried = usize::from(!first.is_some_and(|worked| worked == name));
         (tried, known)
     });
-    // <<< AETHER-APP-PATCH bridge-order-per-country
 
     names
         .into_iter()
@@ -1029,70 +1101,6 @@ mod tests {
         }
     }
 
-    // >>> AETHER-APP-PATCH embedded-bridge-lines-usable
-    /// Jede eingebaute Zeile muss eine Identitaet tragen.
-    ///
-    /// arti braucht pro Bridge eine Identitaet; C-tor nicht. Die meek_lite-Zeile,
-    /// die Tor Browser ausliefert, hat keine, und der Kern hat sie im Log vom
-    /// 2026-09-16 nach zwei Millisekunden abgelehnt: "none of the bridges could be
-    /// read by tor". Eine solche Zeile kostet zwei Sprossen der Leiter, ohne je
-    /// ein Paket zu senden -- dieser Test laesst sie nicht zurueckkommen.
-    #[test]
-    fn every_embedded_bridge_carries_an_identity_arti_can_use() {
-        fn is_fingerprint(word: &str) -> bool {
-            let hex = word.strip_prefix('$').unwrap_or(word);
-            hex.len() == 40 && hex.chars().all(|c| c.is_ascii_hexdigit())
-        }
-
-        for line in EMBEDDED {
-            let has_identity = line.split_whitespace().any(|word| {
-                is_fingerprint(word)
-                    || word
-                        .strip_prefix("fingerprint=")
-                        .is_some_and(is_fingerprint)
-                    || word.starts_with("ed25519:")
-            });
-            assert!(
-                has_identity,
-                "bridge line without an identity - arti cannot read it: {line}"
-            );
-        }
-    }
-
-    /// snowflake braucht Fronting, eine Broker-URL und genug ICE-Server.
-    ///
-    /// Kein Test auf einen ICE-Server ausserhalb von 3478 mehr: der Abruf von
-    /// `/moat/circumvention/map` am 2026-09-16 liefert fuer `ir` neun Server,
-    /// alle auf 3478. Ein solcher Test wuerde die offiziellen Zeilen ablehnen.
-    /// Und `fronts=` ist nicht falsch -- `/moat/circumvention/builtin` benutzt
-    /// am selben Tag die Pluralform. Geprueft wird nur, dass ueberhaupt eine
-    /// der beiden Formen dasteht.
-    #[test]
-    fn snowflake_lines_carry_a_front_a_broker_and_enough_ice() {
-        for line in EMBEDDED {
-            if transport_of(line).as_deref() != Some("snowflake") {
-                continue;
-            }
-            assert!(
-                line.contains("front=") || line.contains("fronts="),
-                "snowflake without domain fronting: {line}"
-            );
-            assert!(
-                line.contains("url=https://"),
-                "snowflake without a broker: {line}"
-            );
-            let ice = line
-                .split_whitespace()
-                .find_map(|word| word.strip_prefix("ice="))
-                .unwrap_or_else(|| panic!("snowflake without ice=: {line}"));
-            assert!(
-                ice.split(',').count() >= 3,
-                "too few ICE servers, one outage takes snowflake down: {line}"
-            );
-        }
-    }
-    // <<< AETHER-APP-PATCH embedded-bridge-lines-usable
-
     #[test]
     fn a_transport_binary_is_believed_when_it_lists_its_methods() {
         let said = "VERSION 1\n\
@@ -1128,5 +1136,70 @@ mod tests {
                 "zzz c".to_string()
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod relay_tests {
+    use super::*;
+
+    #[test]
+    fn the_obvious_tor_ports_are_left_out() {
+        for port in TOR_DESIGNATED_PORTS {
+            let address = format!("1.2.3.4:{port}");
+            assert!(
+                relay_line("A".repeat(40).as_str(), &address, false).is_none(),
+                "port {port} is the first thing a censor blocks"
+            );
+        }
+    }
+
+    #[test]
+    fn a_relay_that_looks_like_a_web_server_is_kept() {
+        let id = "0".repeat(40);
+        assert_eq!(
+            relay_line(&id, "1.2.3.4:443", true),
+            Some(format!("1.2.3.4:443 {id}"))
+        );
+        assert_eq!(
+            relay_line(&id, "1.2.3.4:80", true),
+            Some(format!("1.2.3.4:80 {id}"))
+        );
+    }
+
+    #[test]
+    fn an_odd_port_is_only_kept_when_the_filter_is_widened() {
+        let id = "0".repeat(40);
+        assert!(relay_line(&id, "1.2.3.4:8443", true).is_none());
+        assert!(relay_line(&id, "1.2.3.4:8443", false).is_some());
+    }
+
+    #[test]
+    fn an_ipv6_relay_parses_the_same_way() {
+        let id = "a".repeat(40);
+        let line = relay_line(&id, "[2001:db8::1]:443", true).expect("a line");
+        assert!(line.starts_with("[2001:db8::1]:443 "));
+        assert!(line.ends_with(&id.to_ascii_uppercase()));
+    }
+
+    #[test]
+    fn a_relay_line_reads_back_as_a_plain_bridge() {
+        let id = "b".repeat(40);
+        let line = relay_line(&id, "1.2.3.4:443", true).expect("a line");
+        assert_eq!(transport_of(&line), None);
+        assert_eq!(address_of(&line), "1.2.3.4:443".parse().ok());
+    }
+
+    #[test]
+    fn a_broken_fingerprint_is_refused() {
+        assert!(relay_line("short", "1.2.3.4:443", true).is_none());
+        assert!(relay_line(&"z".repeat(40), "1.2.3.4:443", true).is_none());
+    }
+
+    #[test]
+    fn a_malformed_address_is_refused() {
+        let id = "0".repeat(40);
+        assert!(relay_line(&id, "not-an-address", true).is_none());
+        assert!(relay_line(&id, "1.2.3.4", true).is_none());
     }
 }

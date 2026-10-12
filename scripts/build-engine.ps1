@@ -41,6 +41,23 @@ if (-not $core) {
 Write-Host "==> Core crate: $core"
 Write-Host "==> Building aether core for $Target"
 
+# The Tor-enabled binary exceeds Rust's default query depth (128) while
+# computing the async main future on both Windows targets. Apply this after
+# core sync and before every build, including the rollback build: sync-core
+# can replace the vendored main.rs with an upstream copy.
+$mainPath = Join-Path $core 'src/main.rs'
+if (-not (Test-Path $mainPath)) { throw "Core binary entry point is missing: $mainPath" }
+$mainSource = [System.IO.File]::ReadAllText($mainPath)
+$limitPattern = '(?m)^#!\[recursion_limit\s*=\s*"(\d+)"\]'
+$limitMatch = [regex]::Match($mainSource, $limitPattern)
+if (-not $limitMatch.Success) {
+  $mainSource = "#![recursion_limit = `"512`"]`n" + $mainSource
+  [System.IO.File]::WriteAllText($mainPath, $mainSource, [System.Text.UTF8Encoding]::new($false))
+} elseif ([int]$limitMatch.Groups[1].Value -lt 512) {
+  $mainSource = [regex]::Replace($mainSource, $limitPattern, '#![recursion_limit = "512"]')
+  [System.IO.File]::WriteAllText($mainPath, $mainSource, [System.Text.UTF8Encoding]::new($false))
+}
+
 # static-CRT: خروجی نباید به Visual C++ Redistributable وابسته باشد، وگرنه
 # نسخهٔ پرتابل روی بعضی سیستم‌ها اجرا نمی‌شود.
 $env:RUSTFLAGS = '-C target-feature=+crt-static'

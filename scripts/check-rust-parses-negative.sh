@@ -60,6 +60,12 @@ p.write_text(t, encoding="utf-8")
 PY
 expect_red "بستنِ پرانتز با آکولاد"
 
+# ۴ب) یک سطرِ شِل/env که به انتهای فایل چسبیده (خطای واقعیِ CI، ۲۰۲۶-۱۰-۰۵:
+#     engine.rs:918 «expected one of `!` or `::`, found `=`»). تعادلِ آکولاد
+#     سالم می‌ماند، پس فقط بررسیِ سطحِ بالا آن را می‌گیرد.
+printf '\nAETHER_QUICK_RECONNECT_MAX_HANDSHAKE_MS=0 # Disable handshake timeout for Tor\n' >> "$T"
+expect_red "سطرِ env/شِل روی سطحِ بالای فایلِ Rust (خطای واقعیِ CI ۵ اکتبر)"
+
 # ۵) کنترلِ مثبت: آکولاد داخلِ رشتهٔ خام و کامنت — نباید قرمز شود
 cat >> "$P" <<'RUST'
 
@@ -84,7 +90,7 @@ restore
 
 echo
 if [ "$fails" -eq 0 ]; then
-  echo "✓ چهار آسیب گرفته شد، و کدِ سالم قرمز نشد"
+  echo "✓ پنج آسیب گرفته شد، و کدِ سالم قرمز نشد"
   exit 0
 fi
 echo "✗ $fails بند نگرفت"

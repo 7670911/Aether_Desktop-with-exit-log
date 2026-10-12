@@ -64,6 +64,25 @@ check(rendered.length > 0, `ردیف Protocol رندر شد (${rendered.length} 
 for (const value of fromRust) {
   check(rendered.includes(value), `گزینهٔ «${value}» در ردیف Protocol رندر می‌شود`)
 }
+
+// GOOL's carrier must be selectable even when Smart Auto later chooses GOOL.
+// The saved value maps to real Core 2.3.0 flags, not just a cosmetic label.
+const modes = [...root.querySelectorAll('.seg[data-key="goolMode"] .seg__item')]
+check(modes.map((b) => b.dataset.value).join(',') === 'MODERN,CLASSIC',
+  'انتخاب هر دو بستر GOOL در بخش اتصال حتی با Smart دیده می‌شود')
+check(!root.innerHTML.includes('[object Object]'), 'توضیح GOOL شیء خام نیست')
+check(modes[0]?.getAttribute('aria-checked') === 'true', 'حالت نوین پیش‌فرض است')
+main.app.profile = { ...main.app.profile, goolMode: 'CLASSIC', protocol: 'GOOL' }
+const classic = renderAdvanced(['connection'])
+check(classic.querySelector('.seg[data-key="goolMode"] [data-value="CLASSIC"]')?.getAttribute('aria-checked') === 'true',
+  'انتخاب ذخیره‌شدهٔ سنتی دوباره رندر می‌شود')
+check(classic.textContent.includes('WireGuard'), 'شرح بستر سنتی نمایش داده می‌شود')
+main.app.profile = { ...main.app.profile, backend: 'TOR_AETHER' }
+check(!renderAdvanced(['connection']).querySelector('.seg[data-key="goolMode"]'),
+  'GOOL در زنجیرهٔ تور→اتر که فقط MASQUE را می‌پذیرد نشان داده نمی‌شود')
+main.app.profile = { backend: 'AETHER', protocol: 'SMART', scanMode: 'BALANCED', ipVersion: 'V4' }
+check(rust.includes('GoolMode::Modern => "--gool"') && rust.includes('GoolMode::Classic => "--gool-classic"'),
+  'انتخاب‌های GOOL به فلگ واقعی هسته متصل هستند')
 for (const value of rendered) {
   check(fromRust.includes(value), `گزینهٔ «${value}» در UI یک مقدار واقعی هسته است`)
 }

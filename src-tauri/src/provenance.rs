@@ -1,26 +1,17 @@
-//! هویتِ ساخت — معادلِ ویندوزیِ `core/BuildProvenance.kt`.
+//! هویتِ ساخت — برنامه و هستهٔ اصلیِ (دست‌نخوردهٔ) اِتِر.
 //!
-//! # چرا این فایل وجود دارد
+//! از ۱.۳.۰ (بازنویسیِ هسته از روی Aether-main 2.3.0) هستهٔ `native/aether`
+//! دقیقاً همان سورسِ بالادست است و هیچ پچی از سمتِ برنامه در آن نیست؛ پس
+//! موتور دیگر مهرِ `AETHER-BUILD-STAMP` چاپ نمی‌کند. هویتِ موتور همان بنرِ
+//! خودِ هسته است:
 //!
-//! بنرِ موتور فقط نسخهٔ **بالادستِ** هسته را چاپ می‌کند (`Aether v2.0.0`) و آن
-//! عدد در هر سطحِ پچ یکسان است. یعنی یک موتورِ کهنه و یک موتورِ تازه لاگِ
-//! ابتداییِ یکسان می‌دهند. روی اندروید همین موضوع یک دورِ کاملِ تحلیل را سوزاند:
-//! بعداً معلوم شد باینریِ تحتِ آزمون اصلاً آن فیکسی که دنبالش بودند را نداشت.
+//! ```text
+//! [.. INFO  aether] Aether v2.3.0
+//! ```
 //!
-//! پس هویت باید وجود داشته باشد و **در دو سر** بررسی شود:
-//!
-//!   * سطحِ پچِ خودِ برنامه از فایلِ `PATCHLEVEL` ریشهٔ مخزن در زمانِ کامپایل
-//!     خوانده می‌شود ([`APP_PATCH_LEVEL`])؛
-//!   * موتور همان مقدار را در `aether.exe` مهر می‌کند (`native/aether/aether/build.rs`)
-//!     و در دومین سطرِ خروجی‌اش چاپ می‌کند؛
-//!   * CI همان رشته را داخلِ payload بسته‌شده grep می‌کند، پس موتورِ کهنه
-//!     قابلِ انتشار نیست؛
-//!   * و [`ingest`] این دو را **در زمانِ اجرا** مقایسه می‌کند و ناهم‌خوانی را
-//!     فریاد می‌زند.
-//!
-//! نتیجهٔ عملی برای هر کسی که لاگِ بعدی را می‌خواند: پاسخِ «آیا اصلاً بیلدِ درست
-//! را آزمایش می‌کنم؟» همیشه در سطرهای اول است، و ناهم‌خوانی یک سطرِ `E/build`
-//! است که نمی‌شود ندید.
+//! و برنامه آن را با فایلِ `CORE_VERSION` کنارِ `aether.exe` می‌سنجد. اگر
+//! موتورِ دیگری (کهنه یا از نسخهٔ دیگر) کنار برنامه افتاده باشد، همین‌جا با یک
+//! سطرِ `E/build` دیده می‌شود.
 
 use crate::log::DiagnosticsLog;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,58 +19,52 @@ use std::sync::Mutex;
 
 const TAG: &str = "build";
 
-/// این برنامه با چه سطحِ پچی ساخته شده — از `PATCHLEVEL` ریشهٔ مخزن.
-///
-/// `src-tauri/build.rs` این را تنظیم می‌کند؛ اگر فایل پیدا نشود مقدارِ
-/// `unstamped` می‌آید که عمداً بلند و greppable است.
+/// سطحِ پچِ برنامه — از `PATCHLEVEL` ریشهٔ مخزن (`src-tauri/build.rs`).
 pub const APP_PATCH_LEVEL: &str = env!("AETHER_APP_PATCHLEVEL");
 
 /// مقداری که یک ساختِ بی‌هویت می‌گیرد — نه یک نسخهٔ ساختگی.
 pub const UNSTAMPED: &str = "unstamped";
 
 static REPORTED: AtomicBool = AtomicBool::new(false);
-static ENGINE_LEVEL: Mutex<Option<String>> = Mutex::new(None);
+static ENGINE_VERSION: Mutex<Option<String>> = Mutex::new(None);
+static EXPECTED_CORE: Mutex<Option<String>> = Mutex::new(None);
 
-/// حکمِ مقایسهٔ سطحِ پچِ برنامه و موتور.
+/// حکمِ مقایسهٔ نسخهٔ هستهٔ گزارش‌شده با نسخهٔ همراهِ برنامه.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
-    /// هر دو یکی‌اند — بیلد از درون سازگار است.
+    /// موتور همان هسته‌ای است که برنامه با آن بسته‌بندی شده.
     Consistent,
-    /// موتور مهر ندارد، پس قابلِ شناسایی نیست.
-    EngineUnstamped,
-    /// خودِ برنامه مهر ندارد؛ مقایسه بی‌معنی است.
-    AppUnstamped,
-    /// دو عددِ متفاوت — موتورِ کهنه.
+    /// برنامه نمی‌داند کدام هسته را انتظار دارد (`CORE_VERSION` نیست).
+    Unknown,
+    /// دو نسخهٔ متفاوت — موتورِ اشتباه کنار برنامه است.
     Mismatch,
 }
 
-/// مهرِ ساخت را از یک سطرِ خروجیِ موتور بیرون می‌کشد.
+/// نسخهٔ هسته را از بنرِ موتور بیرون می‌کشد: `Aether v2.3.0` → `2.3.0`.
 ///
-/// ارزان است: در مسیرِ داغ یک `contains` و بس، پس روی هزاران سطری که بنر
-/// نیستند هیچ هزینه‌ای ندارد و پیش از هر تخصیصی برمی‌گردد.
-///
-/// شکلِ رشته عیناً همان چیزی است که `build.rs` جاسازی می‌کند:
-/// `AETHER-BUILD-STAMP:<سطح>` و سطح از `[0-9A-Za-z.-]` تشکیل می‌شود.
-pub fn stamp_in(line: &str) -> Option<&str> {
-    const MARK: &str = "AETHER-BUILD-STAMP:";
+/// ارزان است: روی هزاران سطرِ دیگر با یک `find` برمی‌گردد.
+pub fn banner_version(line: &str) -> Option<&str> {
+    const MARK: &str = "Aether v";
     let start = line.find(MARK)? + MARK.len();
-    let rest = &line[start..];
-    let end = rest
-        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '-'))
-        .unwrap_or(rest.len());
-    if end == 0 {
+    // بنر باید آخرِ سطر باشد؛ «Aether v2 something» بنر نیست.
+    let rest = line[start..].trim_end();
+    if rest.is_empty()
+        || !rest.chars().next().is_some_and(|c| c.is_ascii_digit())
+        || !rest
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    {
         return None;
     }
-    Some(&rest[..end])
+    Some(rest)
 }
 
-/// حکم را از دو مقدار می‌سازد — تابعِ خالص، پس آزمون‌پذیر بی هیچ موتوری.
-pub fn verdict(app: &str, engine: &str) -> Verdict {
-    if engine == UNSTAMPED {
-        Verdict::EngineUnstamped
-    } else if app == UNSTAMPED {
-        Verdict::AppUnstamped
-    } else if app == engine {
+/// تابعِ خالصِ حکم.
+pub fn verdict(expected: &str, engine: &str) -> Verdict {
+    let expected = expected.trim().trim_start_matches('v');
+    if expected.is_empty() || expected == "unknown" {
+        Verdict::Unknown
+    } else if expected == engine.trim().trim_start_matches('v') {
         Verdict::Consistent
     } else {
         Verdict::Mismatch
@@ -89,14 +74,17 @@ pub fn verdict(app: &str, engine: &str) -> Verdict {
 /// در هر اتصال، پیش از راه‌افتادنِ موتور صدا زده می‌شود.
 pub fn log_app_identity(core_version: &str) {
     REPORTED.store(false, Ordering::Relaxed);
-    if let Ok(mut slot) = ENGINE_LEVEL.lock() {
+    if let Ok(mut slot) = ENGINE_VERSION.lock() {
         *slot = None;
+    }
+    if let Ok(mut slot) = EXPECTED_CORE.lock() {
+        *slot = Some(core_version.to_string());
     }
     DiagnosticsLog::i(
         TAG,
         &format!(
-            "App patch level {} (version {}, core {}). Quote this line in any bug \
-             report - it is what identifies the build.",
+            "App patch level {} (version {}, bundled Aether core {} — upstream, unmodified). \
+             Quote this line in any bug report - it is what identifies the build.",
             APP_PATCH_LEVEL,
             env!("CARGO_PKG_VERSION"),
             core_version,
@@ -111,57 +99,63 @@ pub fn log_app_identity(core_version: &str) {
     }
 }
 
-/// خروجیِ موتور را می‌پاید و نخستین مهر را با سطحِ پچِ برنامه می‌سنجد.
+/// خروجیِ موتور را می‌پاید و بنرِ نسخه را با `CORE_VERSION` می‌سنجد.
 pub fn ingest(line: &str) {
-    if REPORTED.load(Ordering::Relaxed) || !line.contains("AETHER-BUILD-STAMP:") {
+    if REPORTED.load(Ordering::Relaxed) || !line.contains("Aether v") {
         return;
     }
-    let Some(found) = stamp_in(line) else { return };
+    let Some(found) = banner_version(line) else {
+        return;
+    };
     REPORTED.store(true, Ordering::Relaxed);
-    if let Ok(mut slot) = ENGINE_LEVEL.lock() {
+    if let Ok(mut slot) = ENGINE_VERSION.lock() {
         *slot = Some(found.to_string());
     }
-    match verdict(APP_PATCH_LEVEL, found) {
+    let expected = expected_core();
+    match verdict(&expected, found) {
         Verdict::Consistent => DiagnosticsLog::i(
             TAG,
-            &format!(
-                "Engine patch level {found} matches the app. This build is internally consistent."
-            ),
+            &format!("Engine reports Aether core {found}, the version bundled with this app."),
         ),
-        Verdict::EngineUnstamped => DiagnosticsLog::w(
-            TAG,
-            "The engine reports no patch level, so it cannot be told apart from any \
-             other build of this core. Nothing this session says about the data plane \
-             can be attributed to a specific build.",
-        ),
-        Verdict::AppUnstamped => DiagnosticsLog::w(
+        Verdict::Unknown => DiagnosticsLog::w(
             TAG,
             &format!(
-                "The engine is patch level {found} but this build carries no stamp of its \
-                 own, so the two cannot be compared."
+                "Engine reports Aether core {found}, but this installation has no CORE_VERSION \
+                 file to compare it with."
             ),
         ),
         Verdict::Mismatch => DiagnosticsLog::e(
             TAG,
             &format!(
-                "ENGINE/APP PATCH LEVEL MISMATCH: the app is {APP_PATCH_LEVEL} but \
-                 aether.exe is {found}. You are testing a STALE ENGINE and any conclusion \
-                 drawn from this session about the data plane will be wrong. Rebuild the \
-                 engine (scripts/build-engine.ps1) and reinstall before testing further."
+                "ENGINE/CORE VERSION MISMATCH: this app ships core {expected} but aether.exe \
+                 reports {found}. Rebuild the engine (scripts/build-engine.ps1) and reinstall."
             ),
         ),
     }
 }
 
-/// سطحی که موتور گزارش کرد — برای تشخیص‌ها.
-pub fn engine_patch_level() -> Option<String> {
-    ENGINE_LEVEL.lock().ok().and_then(|s| s.clone())
+fn expected_core() -> String {
+    EXPECTED_CORE
+        .lock()
+        .ok()
+        .and_then(|s| s.clone())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// آیا موتور خودش را معرفی کرده و با برنامه می‌خواند؟
+/// نسخه‌ای که موتور گزارش کرد — برای تشخیص‌ها.
+pub fn engine_patch_level() -> Option<String> {
+    ENGINE_VERSION.lock().ok().and_then(|s| s.clone())
+}
+
+/// نسخهٔ هسته‌ای که برنامه انتظار دارد (از `CORE_VERSION`).
+pub fn expected_core_version() -> String {
+    expected_core()
+}
+
+/// آیا موتور خودش را معرفی کرده و با هستهٔ همراهِ برنامه می‌خواند؟
 pub fn consistent() -> bool {
     engine_patch_level()
-        .map(|e| e == APP_PATCH_LEVEL)
+        .map(|e| verdict(&expected_core(), &e) == Verdict::Consistent)
         .unwrap_or(false)
 }
 
@@ -169,84 +163,37 @@ pub fn consistent() -> bool {
 mod tests {
     use super::*;
 
-    /// شکلِ واقعیِ سطری که هستهٔ ۲.۰.۰ چاپ می‌کند — عیناً از لاگِ میدانی.
-    const REAL_LINE: &str = "[2026-09-14T14:51:51.208Z INFO  aether] [*] AETHER-BUILD-STAMP:1.3.0 \
-                             (app patch level 1.3.0; netstack congestion control=cubic)";
+    const REAL_LINE: &str = "[2026-10-08T04:30:01.208Z INFO  aether] Aether v2.3.0";
 
     #[test]
-    fn the_stamp_is_read_out_of_a_real_engine_line() {
-        assert_eq!(stamp_in(REAL_LINE), Some("1.3.0"));
+    fn the_version_is_read_out_of_the_engine_banner() {
+        assert_eq!(banner_version(REAL_LINE), Some("2.3.0"));
+        assert_eq!(banner_version("Aether v2.3.0\r"), Some("2.3.0"));
     }
 
-    /// سطرهایی که مهر ندارند نباید چیزی برگردانند — این مسیرِ داغِ هزاران
-    /// سطرِ دیگر است.
     #[test]
-    fn ordinary_lines_carry_no_stamp() {
+    fn ordinary_lines_carry_no_version() {
         for line in [
             "[*] performance profile: High (cpus=8)",
-            "Aether v2.0.0",
+            "Aether v",
             "",
-            "AETHER-BUILD-STAMP",
-            "AETHER-BUILD-STAMP:",
+            "Aether vNext is coming",
+            "[+] Aether v2 tunnel up and running",
         ] {
-            assert_eq!(stamp_in(line), None, "line `{line}` produced a stamp");
+            assert_eq!(
+                banner_version(line),
+                None,
+                "line `{line}` produced a version"
+            );
         }
     }
 
-    /// سطحِ پچ می‌تواند پسوند داشته باشد (اندروید `1.2.8-r5` می‌فرستد) و باید
-    /// کامل خوانده شود، نه تا اولین خط تیره.
-    #[test]
-    fn a_suffixed_patch_level_survives_intact() {
-        assert_eq!(
-            stamp_in("x AETHER-BUILD-STAMP:1.2.8-r5 y"),
-            Some("1.2.8-r5")
-        );
-        assert_eq!(stamp_in("AETHER-BUILD-STAMP:1.2.5"), Some("1.2.5"));
-    }
-
-    /// و مهر تا اولین نویسهٔ نامعتبر خوانده می‌شود، نه تا انتهای سطر.
-    #[test]
-    fn the_stamp_stops_at_the_first_invalid_character() {
-        assert_eq!(
-            stamp_in("AETHER-BUILD-STAMP:1.2.5 (app patch level"),
-            Some("1.2.5")
-        );
-        assert_eq!(stamp_in("AETHER-BUILD-STAMP:1.2.5)"), Some("1.2.5"));
-    }
-
-    /// چهار حکمِ ممکن — همان چیزی که تفاوتِ «موتورِ کهنه» و «بیلدِ بی‌هویت» را
-    /// در لاگ روشن نگه می‌دارد.
     #[test]
     fn every_verdict_is_reachable() {
-        assert_eq!(verdict("1.2.5", "1.2.5"), Verdict::Consistent);
-        assert_eq!(verdict("1.2.5", "1.2.4"), Verdict::Mismatch);
-        assert_eq!(verdict("1.2.5", UNSTAMPED), Verdict::EngineUnstamped);
-        assert_eq!(verdict(UNSTAMPED, "1.2.5"), Verdict::AppUnstamped);
-    }
-
-    /// موتورِ بی‌مهر مهم‌تر از برنامهٔ بی‌مهر است: اگر هر دو بی‌مهر باشند،
-    /// حکم باید همان «موتور بی‌مهر» بماند، چون آن است که مسیرِ داده را دارد.
-    #[test]
-    fn an_unstamped_engine_outranks_an_unstamped_app() {
-        assert_eq!(verdict(UNSTAMPED, UNSTAMPED), Verdict::EngineUnstamped);
-    }
-
-    /// همان اشتباهی که این ماژول برای گرفتنش نوشته شد: نسخهٔ بالادستِ هسته
-    /// یکی است ولی سطحِ پچ فرق دارد — و این باید Mismatch شود، نه Consistent.
-    #[test]
-    fn the_same_core_with_a_different_patch_level_is_still_a_mismatch() {
-        let stale = "[*] AETHER-BUILD-STAMP:1.2.4 (app patch level 1.2.4)";
-        let found = stamp_in(stale).unwrap();
-        assert_eq!(verdict("1.2.5", found), Verdict::Mismatch);
-    }
-
-    /// این ساختِ درخت باید مهر داشته باشد: اگر `build.rs` از کار بیفتد،
-    /// `APP_PATCH_LEVEL` بی‌صدا `unstamped` می‌شود و کلِ زنجیره بی‌اثر است.
-    #[test]
-    fn this_build_is_stamped_from_the_repository_patchlevel() {
-        assert_ne!(
-            APP_PATCH_LEVEL, UNSTAMPED,
-            "build.rs did not pick up the repo-root PATCHLEVEL file"
-        );
+        assert_eq!(verdict("2.3.0", "2.3.0"), Verdict::Consistent);
+        assert_eq!(verdict("v2.3.0", "2.3.0"), Verdict::Consistent);
+        assert_eq!(verdict("2.3.0", "2.2.0"), Verdict::Mismatch);
+        assert_eq!(verdict("unknown", "2.3.0"), Verdict::Unknown);
+        assert_eq!(verdict("", "2.3.0"), Verdict::Unknown);
     }
 }

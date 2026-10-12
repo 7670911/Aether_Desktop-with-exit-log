@@ -226,7 +226,11 @@ fn netsh(args: &[&str]) -> bool {
     #[cfg(windows)]
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-    let mut cmd = Command::new("netsh");
+    let mut cmd = Command::new(
+        std::path::Path::new(&std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()))
+            .join("System32")
+            .join("netsh.exe"),
+    );
     cmd.args(args);
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);

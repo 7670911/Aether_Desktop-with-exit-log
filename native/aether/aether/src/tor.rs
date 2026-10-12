@@ -43,6 +43,14 @@ pub fn listen_address() -> SocketAddr {
         .unwrap_or_else(|| "127.0.0.1:1820".parse().expect("a literal address"))
 }
 
+pub fn http_listen_address() -> Option<SocketAddr> {
+    std::env::var("AETHER_TOR_HTTP")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty() && value != "off")
+        .and_then(|value| value.parse().ok())
+}
+
 pub fn state_dir(base_config: &str) -> PathBuf {
     if let Some(dir) = std::env::var("AETHER_TOR_DIR")
         .ok()
@@ -70,9 +78,69 @@ pub enum Bridges {
     Auto { forced: bool },
 }
 
+pub fn bridges_from_file() -> Vec<String> {
+    let path = match std::env::var("AETHER_TOR_BRIDGE_FILE") {
+        Ok(value) if !value.trim().is_empty() => value.trim().to_string(),
+        _ => return Vec::new(),
+    };
+
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) => {
+            log::warn!("[-] cannot read the bridge file {path}: {e}");
+            return Vec::new();
+        }
+    };
+
+    let lines = read_bridge_lines(&text);
+    if lines.is_empty() {
+        log::warn!("[-] the bridge file {path} held no bridge line");
+    } else {
+        log::info!("[+] {} bridge(s) read from {path}", lines.len());
+    }
+    lines
+}
+
+pub fn read_bridge_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| {
+            line.strip_prefix("Bridge ")
+                .or_else(|| line.strip_prefix("bridge "))
+                .unwrap_or(line)
+                .trim()
+                .to_string()
+        })
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
 pub fn bridges() -> Bridges {
+    let from_file = bridges_from_file();
     let raw = std::env::var("AETHER_TOR_BRIDGES").unwrap_or_default();
     let trimmed = raw.trim();
+
+    if !from_file.is_empty() {
+        let mut lines = from_file;
+        if !matches!(
+            trimmed.to_lowercase().as_str(),
+            "" | "off"
+                | "no"
+                | "0"
+                | "false"
+                | "none"
+                | "auto"
+                | "on"
+                | "1"
+                | "yes"
+                | "true"
+                | "force"
+        ) {
+            lines.extend(read_bridge_lines(&trimmed.replace(';', "\n")));
+        }
+        return Bridges::Manual(lines);
+    }
 
     match trimmed.to_lowercase().as_str() {
         "" => Bridges::Auto { forced: false },
@@ -170,11 +238,6 @@ mod with_tor {
     const STALL_CHECK: Duration = Duration::from_secs(5);
     const PROOF_LIMIT: Duration = Duration::from_secs(45);
     const WAVE_TRIES: usize = 2;
-    // >>> AETHER-APP-PATCH tor-headway-is-a-whole-step
-    /// Vielfaches des No-Headway-Limits, nach dem eine Sprosse in jedem Fall
-    /// faellt -- auch wenn arti weiter Fortschritt meldet.
-    const HARD_STALL_FACTOR: u32 = 3;
-    // <<< AETHER-APP-PATCH tor-headway-is-a-whole-step
     const FOREVER: usize = usize::MAX;
 
     fn init_tracing() {
@@ -260,9 +323,9 @@ mod with_tor {
         }
     }
 
-    async fn auto_plan(state: &Path) -> Plan {
-        let (lines, source) = crate::bridges::fetch(state).await;
-        let lines = crate::bridges::keep_reachable(lines).await;
+    async fn auto_plan(state: &Path, through: Option<SocketAddr>) -> Plan {
+        let (lines, source) = crate::bridges::fetch(state, through).await;
+        let lines = crate::bridges::keep_reachable(lines, through).await;
         let plan = crate::bridges::plan(lines, source, manual_transports());
         announce(&plan);
         plan
@@ -293,11 +356,18 @@ mod with_tor {
             .storage()
             .state_dir(CfgPath::new(data.to_string_lossy().to_string()));
 
-        if let Some(proxy) = through {
+        // Without a tunnel to dial through, tor leaves through the upstream proxy, if there is one.
+        if let Some(proxy) = through.or_else(upstream_socks) {
             let parsed: ProxyProtocol = format!("socks5://{proxy}")
                 .parse()
                 .map_err(|e| AetherError::Other(format!("tor cannot dial through {proxy}: {e}")))?;
             builder.channel().outbound_proxy(parsed);
+        } else if let Some(proxy) = crate::upstream::configured() {
+            // Connecting directly would leave outside the proxy aether was told to dial through.
+            return Err(AetherError::Other(format!(
+                "tor cannot dial through the upstream proxy at {}: it takes a socks5 address without a password",
+                proxy.endpoint()
+            )));
         }
 
         if let Some(plan) = plan {
@@ -350,79 +420,6 @@ mod with_tor {
         }
     }
 
-    // >>> AETHER-APP-PATCH tor-wave-own-runtime
-    /// Haelt die Laufzeit einer Sprosse und gibt sie ausserhalb des
-    /// async-Kontexts frei.
-    ///
-    /// Die einzige Kopie ausser der des Clients. Der Client faellt zuerst und
-    /// ist deshalb nie der Letzte; dieser Waechter faellt zuletzt und reicht
-    /// seine Kopie an einen Thread weiter, wo Blockieren erlaubt ist.
-    struct OwnRuntime(Option<PreferredRuntime>);
-
-    impl OwnRuntime {
-        /// Gebaut auf einem Thread OHNE Laufzeit -- niemals hier im async-Kontext.
-        ///
-        /// # Warum nicht einfach `PreferredRuntime::create()`
-        ///
-        /// Weil das aus einer async-Funktion heraus garantiert panikt, und zwar
-        /// nicht bei uns, sondern eine Ebene tiefer. `create()` geht auf
-        /// `tor_rtcompat::impls::tokio::create_runtime()`, und dort steht in
-        /// 0.46.0:
-        ///
-        /// ```text
-        /// impl From<async_executors::TokioTp> for TokioRuntimeHandle {
-        ///     fn from(owner: async_executors::TokioTp) -> TokioRuntimeHandle {
-        ///         let handle = owner.block_on(async { Handle::current() });
-        /// ```
-        ///
-        /// `owner` ist die frisch gebaute Multi-Thread-Laufzeit, und
-        /// `Runtime::block_on` auf einem Thread, der schon eine Laufzeit
-        /// treibt, ist genau die Panik aus dem Log vom 2026-09-17:
-        /// "Cannot start a runtime from within a runtime" bei
-        /// `multi_thread/mod.rs:91`. Sie traf `Aether → Tor`, `Tor → Aether`
-        /// und jede Sprosse dazwischen -- vier Versuche, vier Paniken, kein
-        /// einziges Prozent Bootstrap.
-        ///
-        /// Ein eigener Thread hat keine Laufzeit betreten, dort ist
-        /// `block_on` erlaubt. Die Laufzeit selbst gehoert danach dem
-        /// zurueckgegebenen Handle, nicht dem Thread, der sie gebaut hat --
-        /// der darf sofort sterben.
-        async fn new() -> Result<Self> {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            std::thread::Builder::new()
-                .name("tor-runtime-birth".to_string())
-                .spawn(move || {
-                    let made = PreferredRuntime::create()
-                        .map_err(|e| AetherError::Other(format!("tor runtime: {e}")));
-                    let _ = tx.send(made);
-                })
-                .map_err(|e| AetherError::Other(format!("tor runtime thread: {e}")))?;
-
-            let runtime = rx.await.map_err(|_| {
-                AetherError::Other("tor runtime: the thread that builds it vanished".to_string())
-            })??;
-            Ok(Self(Some(runtime)))
-        }
-
-        fn handle(&self) -> PreferredRuntime {
-            self.0.clone().expect("the runtime is taken only in Drop")
-        }
-    }
-
-    impl Drop for OwnRuntime {
-        fn drop(&mut self) {
-            if let Some(runtime) = self.0.take() {
-                let sent = std::thread::Builder::new()
-                    .name("tor-runtime-teardown".to_string())
-                    .spawn(move || drop(runtime));
-                if let Err(e) = sent {
-                    log::warn!("[-] could not hand the tor runtime to a thread: {e}");
-                }
-            }
-        }
-    }
-    // <<< AETHER-APP-PATCH tor-wave-own-runtime
-
     struct Sleeper {
         client: Client,
         keep: bool,
@@ -440,11 +437,6 @@ mod with_tor {
         client: Client,
         label: &'static str,
         seen: std::sync::Arc<std::sync::atomic::AtomicU64>,
-        // >>> AETHER-APP-PATCH tor-headway-is-a-whole-step
-        // Die letzte erreichte ganze Stufe, damit die Fehlermeldung sagen kann,
-        // WO es haengen blieb ("stuck at 15%") statt nur dass es haengt.
-        stuck: std::sync::Arc<std::sync::atomic::AtomicU64>,
-        // <<< AETHER-APP-PATCH tor-headway-is-a-whole-step
         started: std::time::Instant,
     ) -> AbortOnDrop {
         let task = tokio::spawn(async move {
@@ -456,25 +448,11 @@ mod with_tor {
             let mut best = 0u64;
 
             while let Some(status) = events.next().await {
-                // >>> AETHER-APP-PATCH tor-headway-is-a-whole-step
-                // Fortschritt ist ein GANZER Prozentpunkt, kein Epsilon.
-                //
-                // Vorher stand hier `* 1000.0`, also zaehlte jede Nachkomma-
-                // regung von `as_frac()` als Fortschritt und setzte den
-                // Waechter zurueck. Genau das passiert bei einem Consensus,
-                // der nur teilweise ankommt ("Partial response" im Log vom
-                // 2026-09-16): jedes Bruchstueck hebt den Bruch minimal, die
-                // angezeigte Stufe bleibt "15%: connecting successfully", der
-                // Log bleibt still -- und die Sprosse haengt ewig statt nach
-                // 40 s zu fallen. Mit ganzen Prozent zaehlt nur echtes
-                // Vorankommen.
-                let reached = (status.as_frac().max(0.0) * 100.0).floor() as u64;
+                let reached = (status.as_frac().max(0.0) * 1000.0).round() as u64;
                 if reached > best {
                     best = reached;
                     seen.store(started.elapsed().as_secs(), Ordering::Relaxed);
-                    stuck.store(reached, Ordering::Relaxed);
                 }
-                // <<< AETHER-APP-PATCH tor-headway-is-a-whole-step
 
                 let line = status.to_string();
                 if line == shown {
@@ -500,43 +478,14 @@ mod with_tor {
     ) -> Result<Client> {
         use std::sync::atomic::{AtomicU64, Ordering};
 
-        // >>> AETHER-APP-PATCH tor-wave-own-runtime
-        // Eigene Laufzeit, damit diese Sprosse restlos verschwinden kann.
-        //
-        // Das Log vom 2026-09-16 zeigt fuenf `Memory quota tracking
-        // initialised max=4.30 GiB` auf einer Maschine mit 5865 MB, drei
-        // gleichzeitige Consensus-Zustandsmaschinen, und 43 Sekunden nach dem
-        // Ende der snowflake-Sprosse noch deren `Rejected 2/2 as down` --
-        // mitten in der obfs4-Sprosse, die sechs Bruecken hat.
-        //
-        // `set_dormant(Soft)` konnte das nicht verhindern; arti-client 0.46.0
-        // beschreibt die Variante selbst als "Background tasks are suspended
-        // ... Attempts to use the client will wake it back up again", und
-        // einen laufenden Verzeichnis-Download weckt sie sofort wieder. Einen
-        // echten Abschalter hat der Client in dieser Version nicht. Die
-        // Laufzeit hat einen: tor-rtcompat 0.46.0 sagt zu `create()`, der
-        // Rueckgabewert "will own the underlying Tokio runtime object, which
-        // will be dropped when the last copy of this handle is freed".
-        let grave = OwnRuntime::new().await?;
-
-        // `create_unbootstrapped` (sync) wartet mit `std::thread::sleep` auf die
-        // Dateisperren des Zustandsverzeichnisses und blockiert damit einen
-        // Worker; die async-Variante tut dasselbe, ohne den Thread anzuhalten.
-        // Bei drei Sprossen hintereinander auf demselben Verzeichnis ist das
-        // kein Detail.
-        let client = TorClient::with_runtime(grave.handle())
+        let client = TorClient::builder()
             .config(config)
-            .create_unbootstrapped_async()
-            .await
+            .create_unbootstrapped()
             .map_err(|e| AetherError::Other(format!("tor client: {e}")))?;
-        // <<< AETHER-APP-PATCH tor-wave-own-runtime
 
         let started = std::time::Instant::now();
         let seen = std::sync::Arc::new(AtomicU64::new(0));
-        // >>> AETHER-APP-PATCH tor-headway-is-a-whole-step
-        let stuck = std::sync::Arc::new(AtomicU64::new(0));
-        let _watcher = watch_progress(client.clone(), label, seen.clone(), stuck.clone(), started);
-        // <<< AETHER-APP-PATCH tor-headway-is-a-whole-step
+        let _watcher = watch_progress(client.clone(), label, seen.clone(), started);
         let mut sleeper = Sleeper {
             client: client.clone(),
             keep: false,
@@ -562,66 +511,18 @@ mod with_tor {
                                 .elapsed()
                                 .as_secs()
                                 .saturating_sub(seen.load(Ordering::Relaxed));
-                            // >>> AETHER-APP-PATCH tor-headway-is-a-whole-step
-                            let at = stuck.load(Ordering::Relaxed);
-
-                            // >>> AETHER-APP-PATCH tor-stall-check-speaks
-                            // Damit Stille im Log etwas bedeutet. Alle 15s
-                            // eine Zeile: laeuft diese Schleife noch, steht
-                            // sie da. Steht sie nicht da, laeuft die Schleife
-                            // nicht -- und dann ist es nicht das Netz.
-                            let running_for = started.elapsed().as_secs();
-                            if running_for % 15 < STALL_CHECK.as_secs() {
-                                log::info!(
-                                    "[i] tor {label}: still at {at}%, {quiet}s without a step, \
-                                     {running_for}s in this attempt (falls at {}s, hard stop at {}s)",
-                                    limit.as_secs(),
-                                    limit.saturating_mul(HARD_STALL_FACTOR).as_secs()
-                                );
-                            }
-                            // <<< AETHER-APP-PATCH tor-stall-check-speaks
 
                             if quiet >= limit.as_secs() {
-                                break Err(AetherError::Other(format!(
-                                    "no headway for {quiet}s (stuck at {at}%)"
-                                )));
+                                break Err(AetherError::Other(format!("no headway for {quiet}s")));
                             }
-
-                            // Absolute Obergrenze, unabhaengig vom Fortschritts-
-                            // signal. Der Waechter oben glaubt dem Bruch, den
-                            // arti meldet; diese Grenze glaubt niemandem. Ohne
-                            // sie konnte eine einzige Sprosse -- im Log vom
-                            // 2026-09-16 obfs4 "go 1 of 2" -- das komplette
-                            // Bruecken-Budget halten, sodass Sprosse 2 und
-                            // snowflake nie an die Reihe kamen und die App fuenf
-                            // Minuten lang stumm auf 15% stand.
-                            if started.elapsed() >= limit.saturating_mul(HARD_STALL_FACTOR) {
-                                break Err(AetherError::Other(format!(
-                                    "no usable directory in {}s (stuck at {at}%)",
-                                    started.elapsed().as_secs()
-                                )));
-                            }
-                            // <<< AETHER-APP-PATCH tor-headway-is-a-whole-step
                         }
                     }
                 }
             }
         };
 
-        // >>> AETHER-APP-PATCH tor-wave-own-runtime
-        // Ab hier gibt es zwei Wege, und nur einer behaelt den Client.
-        let outcome = match booted {
-            Ok(()) => prove(&client, label).await,
-            Err(e) => Err(e),
-        };
-
-        if let Err(e) = outcome {
-            // Freigegeben wird nicht hier, sondern wenn `grave` faellt -- das
-            // passiert auch dann, wenn dieses Future von aussen abgebrochen
-            // wird und diese Zeile nie erreicht.
-            log::info!("[i] tor {label}: this attempt is closed, its runtime goes with it");
-            return Err(e);
-        }
+        booted?;
+        prove(&client, label).await?;
 
         sleeper.keep = true;
         Ok(client)
@@ -751,10 +652,13 @@ mod with_tor {
         }
 
         if through.is_some() {
-            log::warn!("[-] a pluggable transport dials for itself, outside the tunnel");
+            log::warn!(
+                "[-] a pluggable transport dials for itself, outside the tunnel; plain bridges go \
+                 through it, so they are the ones that work on a network which blocks tor outright"
+            );
         }
 
-        let plan = auto_plan(state).await;
+        let plan = auto_plan(state, through).await;
         if plan.is_empty() {
             return Err(AetherError::Other(format!(
                 "tor is blocked on this network and no pluggable transport is installed, so no \
@@ -802,13 +706,7 @@ mod with_tor {
         plan: &Plan,
     ) -> Result<Option<Client>> {
         let worked = crate::bridges::recall(state);
-        // >>> AETHER-APP-PATCH bridge-order-per-country
-        let waves = crate::bridges::waves(
-            plan,
-            worked.as_deref(),
-            crate::bridges::last_country().as_deref(),
-        );
-        // <<< AETHER-APP-PATCH bridge-order-per-country
+        let waves = crate::bridges::waves(plan, worked.as_deref());
         if waves.is_empty() {
             return Ok(None);
         }
@@ -816,30 +714,6 @@ mod with_tor {
         let deadline = bridge_probe();
         let names: Vec<&str> = waves.iter().map(|(name, _)| name.as_str()).collect();
         log::info!("[*] tor will try {} in turn", names.join(", then "));
-
-        // >>> AETHER-APP-PATCH tor-attempt-isolation
-        // هر تلاش با یک state تازه شروع می‌شود.
-        //
-        // چیزی که لاگ ۲۰۲۶-۰۹-۱۶ نشان داد: پلهٔ snowflake که فقط **۲** پل دارد
-        // گفت `No usable guards. Rejected 6/6 as down` — آن ۶ تا پل‌های obfs4ِ
-        // پلهٔ قبل بودند. و پیش از آن:
-        //
-        //     tor_dirmgr: Another process is bootstrapping the directory.
-        //                 Waiting till it finishes or exits.
-        //
-        // یعنی state میان تلاش‌ها مشترک بود: گاردهایی که یک تلاش «down» علامت
-        // زده بود تلاش بعد را پیش از هر dial رد می‌کردند، و قفلِ دایرکتوریِ
-        // کلاینتِ قبلی پلهٔ بعد را ~۳۰ ثانیه بی‌کار نگه می‌داشت. پاک‌کردن
-        // پوشهٔ attempts در شروع، قفل و علامتِ جامانده از نشست قبلی را هم
-        // برمی‌دارد. دانشِ مفید — «کدام ترانسپورت جواب داد» — در
-        // bridges::remember/recall می‌ماند و دست‌نخورده است.
-        let scratch = state.join("attempts");
-        if scratch.exists() {
-            if let Err(e) = std::fs::remove_dir_all(&scratch) {
-                log::debug!("[i] could not clear {}: {e}", scratch.display());
-            }
-        }
-        // <<< AETHER-APP-PATCH tor-attempt-isolation
 
         for (name, wave) in &waves {
             for round in 1..=WAVE_TRIES {
@@ -872,14 +746,7 @@ mod with_tor {
                     1,
                     Some(deadline),
                     Some(stall_limit()),
-                    // >>> AETHER-APP-PATCH tor-attempt-isolation
-                    // اسلات شاملِ شمارهٔ دور است، نه فقط نام ترانسپورت: دو دورِ
-                    // یک ترانسپورت هم نباید state همدیگر را ببینند، وگرنه دورِ
-                    // دوم همان ۶ گاردِ «down»‌شدهٔ دورِ اول را تحویل می‌گیرد و
-                    // بی‌آنکه چیزی dial کند رد می‌شود — همان چیزی که در لاگ
-                    // به‌صورت «Rejected 6/6 as down» دیده شد.
-                    Some(&format!("{name}-{round}")),
-                    // <<< AETHER-APP-PATCH tor-attempt-isolation
+                    Some(name.as_str()),
                 )
                 .await;
 
@@ -898,8 +765,14 @@ mod with_tor {
         Ok(None)
     }
 
+    fn announce_exit(proxy: SocketAddr, what: &'static str) {
+        tokio::spawn(async move {
+            crate::exitloc::report_through_socks(proxy, what).await;
+        });
+    }
+
     async fn serve(listener: TcpListener, client: Client, kind: &'static str) -> Result<()> {
-        crate::socks::serve_connector(listener, kind, move |host, port| {
+        let connector = move |host: String, port: u16| {
             let client = client.clone();
             async move {
                 client
@@ -911,8 +784,58 @@ mod with_tor {
                     })
                     .map_err(std::io::Error::other)
             }
-        })
-        .await
+        };
+
+        let http_task = match http_listen_address() {
+            Some(address) => {
+                let http_listener = crate::socks::bind_listener("tor http proxy", address).await?;
+                let connector = connector.clone();
+                Some(tokio::spawn(async move {
+                    if let Err(e) = crate::socks::serve_http_connector(
+                        http_listener,
+                        "tor http proxy",
+                        connector,
+                    )
+                    .await
+                    {
+                        log::error!("[-] the tor http proxy stopped: {e}");
+                    }
+                }))
+            }
+            None => None,
+        };
+
+        let outcome = crate::socks::serve_connector(listener, kind, connector).await;
+
+        if let Some(task) = http_task {
+            task.abort();
+        }
+
+        outcome
+    }
+
+    /// The upstream proxy tor dials through when no tunnel carries it, see
+    /// [crate::upstream::Upstream::socks_address].
+    fn upstream_socks() -> Option<SocketAddr> {
+        crate::upstream::configured()?.socks_address()
+    }
+
+    /// Says how tor reaches the network when no tunnel carries it: through the upstream proxy, or
+    /// directly when there is none; with one tor cannot dial through, tor does not start.
+    fn announce_upstream() {
+        let Some(proxy) = crate::upstream::configured() else {
+            return;
+        };
+        match proxy.socks_address() {
+            Some(address) => {
+                log::info!("[*] tor dials out through the upstream proxy at {address}")
+            }
+            None => log::warn!(
+                "[-] tor cannot dial through the upstream proxy at {}, which is no socks5 address \
+                 without a password; it does not connect directly instead",
+                proxy.endpoint()
+            ),
+        }
     }
 
     async fn wait_for_proxy(through: SocketAddr) {
@@ -939,6 +862,7 @@ mod with_tor {
 
         let client = establish(&state, Some(through), FOREVER).await?;
         log::info!("[+] tor is ready; {listen} leaves through tor, carried by the tunnel");
+        announce_exit(listen, "tor through the tunnel");
 
         serve(listener, client, "tor socks5").await
     }
@@ -948,9 +872,11 @@ mod with_tor {
         let listener = crate::socks::bind_listener("tor socks5", listen).await?;
 
         log::info!("[*] bootstrapping tor with no tunnel underneath it");
+        announce_upstream();
 
         let client = establish(&state, None, FOREVER).await?;
         log::info!("[+] tor is ready; {listen} leaves through tor");
+        announce_exit(listen, "tor");
 
         serve(listener, client, "tor socks5").await
     }
@@ -961,9 +887,12 @@ mod with_tor {
         let listener = crate::socks::bind_listener("tor socks5", listen).await?;
 
         log::info!("[*] bootstrapping tor; the tunnel will be dialled through it");
+        // The upstream is still the proxy aether was given: the caller points it at tor once tor is up.
+        announce_upstream();
 
         let client = establish(&state, None, REVERSE_ATTEMPTS).await?;
         log::info!("[+] tor is ready; the tunnel goes out through {listen}");
+        announce_exit(listen, "tor");
 
         tokio::spawn(async move {
             if let Err(e) = serve(listener, client, "tor socks5").await {
@@ -993,6 +922,30 @@ mod with_tor {
 mod tests {
     use super::*;
 
+    /// The hold on the tor settings of a test: the variables are the whole process's, and the
+    /// tests run side by side, so each test holds them first, or one clearing them would wipe a
+    /// value another had just set. They start out clear, and are cleared again as the hold is
+    /// let go, also by a test that failed half way.
+    struct SettingsHeld(std::sync::MutexGuard<'static, ()>);
+
+    impl Drop for SettingsHeld {
+        fn drop(&mut self) {
+            clear();
+        }
+    }
+
+    /// Waits for the hold on the tor settings, see `SettingsHeld`. A test that failed while it
+    /// held them poisoned the lock, but cleared them all the same, so the lock is taken anyway.
+    fn hold_settings() -> SettingsHeld {
+        static SETTINGS: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        let held = SETTINGS
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear();
+        SettingsHeld(held)
+    }
+
     fn clear() {
         std::env::remove_var("AETHER_TOR");
         std::env::remove_var("AETHER_TOR_DIR");
@@ -1003,7 +956,7 @@ mod tests {
 
     #[test]
     fn every_mode_has_a_spelling() {
-        clear();
+        let _settings = hold_settings();
         assert_eq!(mode(), Mode::Off);
         for written in ["1", "on", "chain", "yes"] {
             std::env::set_var("AETHER_TOR", written);
@@ -1021,12 +974,11 @@ mod tests {
             std::env::set_var("AETHER_TOR", written);
             assert_eq!(mode(), Mode::Off, "{written}");
         }
-        clear();
     }
 
     #[test]
     fn the_state_dir_sits_beside_the_identity_file() {
-        clear();
+        let _settings = hold_settings();
         assert_eq!(state_dir("aether.toml"), PathBuf::from("aether-tor"));
         assert_eq!(
             state_dir("/etc/aether/aether.toml"),
@@ -1037,21 +989,19 @@ mod tests {
             state_dir("aether.toml"),
             PathBuf::from("/var/lib/aether-tor")
         );
-        clear();
     }
 
     #[test]
     fn the_tor_listener_has_a_default_of_its_own() {
-        clear();
+        let _settings = hold_settings();
         assert_eq!(listen_address(), "127.0.0.1:1820".parse().unwrap());
         std::env::set_var("AETHER_TOR_BIND", "127.0.0.1:9150");
         assert_eq!(listen_address(), "127.0.0.1:9150".parse().unwrap());
-        clear();
     }
 
     #[test]
     fn bridges_are_read_one_per_entry() {
-        clear();
+        let _settings = hold_settings();
         assert!(bridge_lines().is_empty());
         std::env::set_var(
             "AETHER_TOR_BRIDGES",
@@ -1061,12 +1011,11 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines[0].starts_with("obfs4 192.0.2.55"));
         assert!(lines[1].starts_with("obfs4 198.51.100.25"));
-        clear();
     }
 
     #[test]
     fn a_transport_may_be_named_or_assumed_to_be_obfs4() {
-        clear();
+        let _settings = hold_settings();
         assert!(transports().is_empty());
         std::env::set_var("AETHER_TOR_PT", "/usr/bin/lyrebird");
         assert_eq!(
@@ -1087,6 +1036,31 @@ mod tests {
                 ),
             ]
         );
-        clear();
+    }
+}
+
+#[cfg(test)]
+mod bridge_file_tests {
+    use super::*;
+
+    #[test]
+    fn a_torrc_shaped_file_reads_line_by_line() {
+        let text = "\
+# my bridges
+Bridge obfs4 1.2.3.4:443 ABCD cert=xx iat-mode=0
+
+bridge obfs4 5.6.7.8:80 EF01 cert=yy iat-mode=0
+9.9.9.9:443 0123456789012345678901234567890123456789
+";
+        let lines = read_bridge_lines(text);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].starts_with("obfs4 1.2.3.4:443"));
+        assert!(lines[1].starts_with("obfs4 5.6.7.8:80"));
+        assert!(lines[2].starts_with("9.9.9.9:443"));
+    }
+
+    #[test]
+    fn comments_and_blank_lines_carry_nothing() {
+        assert!(read_bridge_lines("\n  \n# only a comment\n").is_empty());
     }
 }

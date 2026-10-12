@@ -11,7 +11,7 @@
 //!    (همان ترتیب ترجیح SmartAuto.kt).
 
 use crate::log::DiagnosticsLog;
-use crate::profile::{ConnectionProfile, IpVersion, Noize, Protocol, ScanMode, TorMode};
+use crate::profile::{ConnectionProfile, GoolMode, IpVersion, Noize, Protocol, ScanMode, TorMode};
 
 const TAG: &str = "auto";
 
@@ -158,7 +158,14 @@ fn harden(p: &ConnectionProfile, fp: NetFingerprint) -> ConnectionProfile {
     if rides_masque_carrier(h.protocol) {
         h.masque_http2 = p.masque_http2 || !fp.quic_ok;
         h.fragment = true;
-        h.ech = true;
+        // >>> AETHER-APP-FIX ech-only-where-sni-is-filtered
+        // Mobile parity (`SmartAuto.kt`): ECH is part of the MASQUE rung only in
+        // SNI_FILTERING / UDP_THROTTLED / HOSTILE — never on an OPEN network.
+        // Field log 2026-10-08 (OPEN): the hardened MASQUE rung was started with
+        // `--ech auto`, the engine could not fetch an ECH key ("udp://1.1.1.1:53
+        // did not answer") and exited after 12 s — a rung that could not work.
+        h.ech = p.ech || fp.dpi_class() != DpiClass::Open;
+        // <<< AETHER-APP-FIX ech-only-where-sni-is-filtered
     }
     h
 }
@@ -464,9 +471,27 @@ fn tor_plan(user: &ConnectionProfile) -> Option<Vec<Candidate>> {
                 "Tor \u{2192} Aether: MASQUE over HTTP/2 is the only transport Tor can carry \
                  — one attempt, on a bootstrap-sized budget.",
             );
+            // >>> AETHER-APP-PATCH tor-reverse-short-scan (port of mobile 1.4.0 `reversePlan`)
+            // تا اینجا فقط ترابرد قفل می‌شد. موبایل ۱.۴.۰ نشان داد این کافی نیست:
+            // لاگِ میدانی `scan mode=turbo candidates=896 … budget=45s` از داخلِ
+            // یک مدارِ تور بود، با بازه‌هایی که اثرانگشتِ DPI روی مسیرِ *مستقیم*
+            // ساخته بود. آنچه یک خروجیِ تور می‌تواند برسد هیچ ربطی به آن بازه‌ها
+            // ندارد. پس سه چیز این‌جا پین می‌شود، دقیقاً مثل موبایل:
+            //   * Turbo — کوتاه‌ترین اسکنِ موتور: اولین پاسخ برنده است و
+            //     گیت‌وی‌های شناخته‌شدهٔ کلادفلر (MASQUE_SEEDS) اول پروب می‌شوند؛
+            //   * endpoint_mode = Auto و manual_range خالی — بازه‌های مسیرِ مستقیم
+            //     به اسکنِ داخلِ تور نمی‌رسند؛
+            //   * بودجهٔ هم‌اندازهٔ bootstrapِ تور (پایین‌تر، `tor_budget`).
+            // یک peerِ دستی هم عمداً کنار می‌رود: همان دلیل، یک نشانیِ اندازه‌گیری‌شده
+            // روی مسیرِ مستقیم.
             let mut p = user.clone();
             p.protocol = Protocol::Masque;
             p.masque_http2 = true;
+            p.scan_mode = ScanMode::Turbo;
+            p.endpoint_mode = crate::profile::EndpointMode::Auto;
+            p.manual_range = String::new();
+            p.manual_peer = String::new();
+            // <<< AETHER-APP-PATCH tor-reverse-short-scan
             Some(vec![Candidate {
                 profile: p,
                 timeout_ms: tor_budget(user),
@@ -536,6 +561,7 @@ mod tests {
     fn a_manual_protocol_keeps_the_users_own_scan_mode() {
         let user = ConnectionProfile {
             protocol: Protocol::Wireguard,
+            gool_mode: GoolMode::Modern,
             ..Default::default()
         };
         let plan = build_plan(&user, NetFingerprint::default());
@@ -563,6 +589,7 @@ mod tests {
     fn explicit_protocol_is_respected() {
         let p = ConnectionProfile {
             protocol: Protocol::Wireguard,
+            gool_mode: GoolMode::Modern,
             ..Default::default()
         };
         assert_eq!(pick(&p), Protocol::Wireguard);
@@ -578,6 +605,7 @@ mod tests {
         let p = ConnectionProfile {
             backend: TransportBackend::Tor,
             protocol: Protocol::Smart,
+            gool_mode: GoolMode::Modern,
             tor_bridges: crate::profile::TorBridges::Off,
             ..Default::default()
         };
@@ -639,6 +667,31 @@ mod tests {
         }
     }
 
+    /// Mobile 1.4.0 `reversePlan`: through Tor the engine runs its SHORTEST scan,
+    /// and nothing measured on the direct path (a pinned range or peer) may narrow
+    /// it. The field log that motivated this scanned 896 candidates on two /24s
+    /// from a direct-path DPI fingerprint, through one Tor circuit, in 45 s.
+    #[test]
+    fn the_reverse_chain_scans_turbo_and_drops_direct_path_ranges() {
+        let p = ConnectionProfile {
+            backend: TransportBackend::TorAether,
+            scan_mode: ScanMode::Ironclad,
+            endpoint_mode: crate::profile::EndpointMode::ManualRange,
+            manual_range: "188.114.97.0/24".into(),
+            manual_peer: "162.159.198.1:443".into(),
+            ..Default::default()
+        };
+        let plan = build_plan(&p, NetFingerprint::default());
+        assert_eq!(plan.len(), 1);
+        let rung = &plan[0].profile;
+        assert_eq!(rung.scan_mode, ScanMode::Turbo);
+        assert_eq!(rung.endpoint_mode, crate::profile::EndpointMode::Auto);
+        assert!(rung.manual_range.is_empty());
+        assert!(!rung.has_manual_peer());
+        assert!(!rung.to_env().contains_key("AETHER_SCAN_CIDRS"));
+        assert!(rung.to_args().iter().any(|a| a == "--turbo"));
+    }
+
     /// The ordinary chain is deliberately NOT gated: stage 1 there is a full WARP
     /// tunnel with Tor started afterwards and through it, so it wants the same
     /// fingerprinting and anti-DPI hardening as any other session. Its Tor budget
@@ -648,6 +701,7 @@ mod tests {
         let plain = build_plan(
             &ConnectionProfile {
                 protocol: Protocol::Smart,
+                gool_mode: GoolMode::Modern,
                 ..Default::default()
             },
             NetFingerprint::default(),
@@ -656,6 +710,7 @@ mod tests {
             &ConnectionProfile {
                 backend: TransportBackend::AetherTor,
                 protocol: Protocol::Smart,
+                gool_mode: GoolMode::Modern,
                 ..Default::default()
             },
             NetFingerprint::default(),
@@ -774,6 +829,7 @@ mod tests {
         };
         let user = ConnectionProfile {
             protocol: Protocol::Mim,
+            gool_mode: GoolMode::Modern,
             ..Default::default()
         };
         assert!(!user.masque_http2, "کاربر هیچ تیکی نزده است");
@@ -945,6 +1001,7 @@ mod tests {
     fn direct_plan_has_a_hardened_second_pass() {
         let p = ConnectionProfile {
             protocol: Protocol::Gool,
+            gool_mode: GoolMode::Modern,
             ..Default::default()
         };
         let plan = build_plan(&p, NetFingerprint::default());
@@ -953,6 +1010,29 @@ mod tests {
         assert_eq!(plan[1].profile.noize, Noize::Firewall);
         assert_eq!(plan[0].profile.protocol, plan[1].profile.protocol);
     }
+
+    // >>> AETHER-APP-FIX ech-only-where-sni-is-filtered
+    /// OPEN network: no rung asks for ECH (mobile `SmartAuto.kt` OPEN ladder);
+    /// a filtered one still gets it on its hardened MASQUE rungs.
+    #[test]
+    fn ech_is_only_used_where_the_network_filters_sni() {
+        let p = ConnectionProfile::default();
+        let open = NetFingerprint {
+            filtered: false,
+            udp_ok: true,
+            quic_ok: true,
+        };
+        assert!(build_plan(&p, open).iter().all(|c| !c.profile.ech));
+        let filtered = NetFingerprint {
+            filtered: true,
+            udp_ok: true,
+            quic_ok: true,
+        };
+        assert!(build_plan(&p, filtered)
+            .iter()
+            .any(|c| c.profile.ech && c.profile.protocol == Protocol::Masque));
+    }
+    // <<< AETHER-APP-FIX ech-only-where-sni-is-filtered
 
     // >>> AETHER-APP-FIX plain-pass-goes-last-on-a-filtered-network
     /// این تست همان ۷۵ ثانیه‌ای را می‌بندد که کاربر پای دکمهٔ Connect نشست.

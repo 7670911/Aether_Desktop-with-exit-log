@@ -14,6 +14,19 @@ import { toast } from '../ui/toast.js'
 
 const KEY_URL = 'https://aistudio.google.com/apikey'
 
+// Text and tiers from Aether Mobile 1.4.0: AiModelPolicy.tier and
+// values[-fa]/strings.xml (ai_model_desc_default/fast/alt).
+export function modelDescription(id) {
+  const name = id?.replace(/^models\//, '')
+  if (name === 'gemini-3.1-flash-lite')
+    return t('Default · highest daily limit, best for continuous everyday use')
+  if (['gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.5-flash-lite'].includes(name))
+    return t('Very fast · reaches the free daily limit sooner')
+  if (['gemini-3.1-flash-lite-preview', 'gemini-flash-lite-latest'].includes(name))
+    return t('Flash-Lite family · high daily limit (alias/preview build)')
+  return null
+}
+
 function section(title) {
   const box = document.createElement('section')
   box.className = 'card ai__section'
@@ -186,7 +199,11 @@ function modelSection() {
   box.appendChild(refresh)
 
   const sync = () => {
+    // Cached models are not evidence that this session is connected. Keep the
+    // picker hidden until a key exists AND the current tunnel is up.
+    box.hidden = !ai.hasKey || !ai.tunnelConnected
     list.replaceChildren()
+    if (box.hidden) return
     if (!ai.models.length) {
       const empty = document.createElement('p')
       empty.className = 'ai__note'
@@ -203,13 +220,29 @@ function modelSection() {
       const name = document.createElement('span')
       name.className = 'ai__modelname ltr'
       name.textContent = model.id
-      row.appendChild(name)
-      if (model.outputTokenLimit) {
-        const limit = document.createElement('span')
-        limit.className = 'ai__modelmeta ltr'
-        limit.textContent = `${model.outputTokenLimit} out`
-        row.appendChild(limit)
+      const detail = document.createElement('span')
+      detail.className = 'ai__modeldetail'
+      detail.appendChild(name)
+      const description = modelDescription(model.id)
+      if (description) {
+        const caption = document.createElement('span')
+        caption.className = 'ai__modelmeta'
+        caption.textContent = description
+        detail.appendChild(caption)
       }
+      // API token capacities are shown only when returned by Google; cached
+      // entries carry zero and must not invent a limit. Keep the mobile's daily
+      // quota guidance above verbatim (it is not a token capacity).
+      if (model.inputTokenLimit || model.outputTokenLimit) {
+        const limits = document.createElement('span')
+        limits.className = 'ai__modellimits ltr'
+        limits.textContent = [
+          model.inputTokenLimit ? `${model.inputTokenLimit} in` : '',
+          model.outputTokenLimit ? `${model.outputTokenLimit} out` : '',
+        ].filter(Boolean).join(' · ')
+        detail.appendChild(limits)
+      }
+      row.appendChild(detail)
       row.addEventListener('click', () => selectModel(model.id).catch(() => {}))
       list.appendChild(row)
     }
@@ -376,3 +409,4 @@ export function renderAssistant() {
   sync()
   return root
 }
+

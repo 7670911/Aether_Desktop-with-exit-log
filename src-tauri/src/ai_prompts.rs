@@ -67,6 +67,50 @@ Rules you must follow:\n\
     )
 }
 
+/// ۱.۴.۰-r4 (پورت از `AiPrompts.GROUNDING`): مدل پیش از هر توصیه چطور فکر کند.
+///
+/// شکایتِ میدانی‌ای که این را لازم کرد: دستیار تنظیمی را «پیشنهاد» می‌داد که
+/// کاربر از قبل داشت — «MTU را ۱۲۸۰ کن» به کسی که ۱۲۸۰ داشت. بلوکِ تنظیمات همیشه
+/// در پرامپت بود؛ هیچ چیز به مدل نمی‌گفت با آن **مقایسه کند**. پس مقایسه حالا یک
+/// رویهٔ صریح و مرتب است (بی‌صدا انجام می‌شود و فقط نتیجه‌اش گفته می‌شود)، و
+/// برنامه نتیجه را دوباره در کد می‌سنجد ([`crate::ai_patch::verification_feedback`]
+/// + یک دور خوداصلاحی در [`crate::ai_session`]). پرامپت خطِ اولِ دفاع است، نه تنها خط.
+pub const GROUNDING: &str =
+    "HOW TO THINK BEFORE YOU ANSWER (do this silently; show only the result):
+1. Read THE USER'S CURRENT SETTINGS below. They are the ground truth about this device right now. \
+Each line says whether the value is the app's default or was changed by the user.
+2. Work out the most likely cause from what the user said (and the log, if one is given). Rank \
+candidate fixes by how likely they are to help.
+3. For EVERY candidate change, compare it with the current value. If the user already has that \
+value, it is NOT a fix - drop it. If it was your best idea, say plainly that it is already set \
+(e.g. \"your MTU is already 1280, so that is not the cause\") and move on to the next candidate.
+4. Check the candidate actually applies to the current mode (backend and protocol): do not \
+recommend a knob that has no effect in that mode. If you are not sure whether it applies, say so \
+instead of guessing.
+5. Prefer ONE or TWO changes at a time, most likely first, and say how the user will know whether \
+it helped. Changing five things at once makes it impossible to learn what worked.
+6. Never invent settings, values, menu names, features, numbers or facts. If the information \
+needed is not here, say what you would need to know, or ask ONE short clarifying question.
+7. If everything relevant already looks right, say so honestly and suggest the next diagnostic \
+step instead of inventing a change.";
+
+/// ۱.۴.۰-r4 (پورت از `AiPrompts.FORMAT`): قالبِ پاسخ، به سبکِ خودِ اپ Gemini.
+///
+/// رابط کاربری این Markdown را رندر می‌کند (`src/ui/markdown.js`)، پس ساختار
+/// خوش‌آمد است — ولی فقط زیرمجموعه‌ای که در یک حبابِ چت خوب درمی‌آید.
+pub const FORMAT: &str = "FORMATTING (the app renders Markdown like the Gemini app does):
+- Open with a direct one- or two-sentence answer. No preamble, no \"Great question\", no restating \
+the question.
+- For anything longer, use short sections with a \"### \" title, or a bold mini-title on its own \
+line (**Like this**), then one to three sentences.
+- Use \"- \" bullets for options or facts and \"1. \" numbered steps for things to do in order. One \
+level of nesting at most.
+- Put setting names and key values in **bold**; put exact values the user types (1280, \
+X25519:P-256) in `backticks`.
+- Short paragraphs (one to three sentences). A blank line between blocks.
+- No tables unless you are comparing three or more options side by side.
+- Never wrap the whole answer in a code block; no emoji clutter; no closing sign-off.";
+
 /// دستور سیستمی برای «این تنظیم چه کار می‌کند؟».
 pub fn explain_system(lang: Lang) -> String {
     format!(
@@ -109,29 +153,97 @@ pub struct ProposedChange {
 }
 
 /// دستور سیستمی برای چت آزاد.
-pub fn chat_system(lang: Lang, profile_snapshot: &str) -> String {
+///
+/// ۱.۴.۰-r4: `GROUNDING` و `FORMAT` اضافه شدند، و دو زمینهٔ تازه:
+///  - `model` — نامِ مدلی که دارد جواب می‌دهد، تا «تو کدام مدلی؟» جوابِ درست بگیرد؛
+///  - `connection_status` — وضعیتِ **زندهٔ** اتصال («connected»،
+///    «reconnecting» …). بدون آن، مدل به کاربری که همین حالا قطع است می‌گفت
+///    «اتصالت را قطع و وصل کن» و نمی‌دانست تنظیمِ اعمال‌شده کِی اثر می‌کند.
+///
+/// بلوکِ پیشنهاد هم دیگر فقط «وقتی کاربر خواست» نیست (همان موبایل): هر بار که
+/// مدل یک تغییرِ مشخص را **توصیه** می‌کند، بلوک می‌آید — کاربر هنوز باید دکمه
+/// را بزند و برنامه هر مورد را با تنظیماتِ فعلی می‌سنجد.
+pub fn chat_system(
+    lang: Lang,
+    profile_snapshot: &str,
+    model: &str,
+    connection_status: &str,
+) -> String {
+    let model_line = if model.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" You are {}.", model.trim())
+    };
+    let status_line = if connection_status.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nConnection status right now: {}.",
+            connection_status.trim()
+        )
+    };
     format!(
-        "{}\n\nYou are in a chat with the user about this app, their connection, and censorship \
-circumvention in general. Keep answers under 180 words unless the user asks for detail.\n\n\
-THE USER CAN ASK YOU TO CHANGE SETTINGS. When - and only when - the user asks for a change, \
-append at the very END of your reply one fenced block:\n\n\
+        "{}\n\n{}\n\n{}\n\nYou are in a chat with the user about this app, their connection, and censorship \
+circumvention in general.{} Be useful, precise and brief: keep answers under 180 words unless the \
+user asks for detail. Stay consistent with what you said earlier in this conversation; if you got \
+something wrong before, correct it explicitly.{}\n\n\
+SETTING CHANGES. Whenever you recommend a concrete change to one of the settings listed below - \
+whether or not the user asked for it - append at the very END of your reply one fenced block with \
+exactly those changes:\n\n\
 ```{}\n\
 {{\"changes\":[{{\"key\":\"mtu\",\"value\":\"1380\",\"why\":\"short reason\"}}]}}\n\
 ```\n\n\
 - Put your normal answer above the block. The app strips the block out and turns it into a button \
-the user has to press. You are PROPOSING; never say you already changed anything.\n\
+the user has to press, and checks each change against the current settings. You are PROPOSING; \
+never say you already changed anything.\n\
 - Only these keys and values are possible:\n{}\n\
 - Anything else - the network backend, the upstream proxy, routing rules, split tunnelling, a manual \
 endpoint, LAN sharing, the kill switch, organization credentials - you CANNOT change, by design, \
 because those decide which traffic is protected and where it goes. If the user asks for one of \
 those, explain where to change it by hand instead: Settings, then the relevant page.\n\
 - Tunnel settings are handed to the engine when it starts, so an applied change takes effect on the \
-NEXT connect. Say so when it matters.\n\n\
+NEXT connect. Say so when it matters.\n\
+- Never put a change in the block whose value equals the current one. Do not add the block at all \
+when you are only explaining something.\n\n\
 THE USER'S CURRENT SETTINGS:\n{}",
         base_rules(lang),
+        GROUNDING,
+        FORMAT,
+        model_line,
+        status_line,
         APPLY_FENCE,
         ai_patch::chat_keys_for_prompt(),
         profile_snapshot,
+    )
+}
+
+/// ۱.۴.۰-r4 (پورت از `AiPrompts.chatRevision`): نوبتِ خوداصلاحی.
+///
+/// وقتی پاسخِ تازه از بررسیِ خودِ برنامه رد شد (مقداری که کاربر از قبل دارد،
+/// مقداری که گزینه نمی‌پذیرد، کلیدی که مدل اجازه ندارد) — **نادیدنی برای کاربر** —
+/// فرستاده می‌شود. مدل کلِ پاسخ را با واقعیت‌های سنجیده‌شده جلوی چشمش بازنویسی
+/// می‌کند تا متنی که کاربر می‌خواند هرگز چیزی را توصیه نکند که دکمهٔ زیرش رد
+/// می‌کند. فقط یک دور: پاسخِ دوم هر چه بگوید نشان داده می‌شود، با همان فیلترِ کد.
+pub fn chat_revision(feedback: &str) -> String {
+    format!(
+        "AUTOMATIC CHECK BY THE APP (not written by the user): your previous reply failed verification \
+against the user's real settings:\n{feedback}\n\n\
+Rewrite your whole reply for the user now. Keep the same language and format. Do not mention this \
+check or apologise for it. Do not recommend anything the user already has - where it matters, state \
+that it is already set - and offer the next most likely fix instead, or say honestly that the \
+settings already look right. Only include the fenced `{APPLY_FENCE}` block if a valid, non-redundant \
+change remains."
+    )
+}
+
+/// ۱.۴.۰-r4 (پورت از `AiPrompts.advisorRevision`): همان خوداصلاحی برای پاسخِ JSONِ مشاور.
+pub fn advisor_revision(feedback: &str) -> String {
+    format!(
+        "AUTOMATIC CHECK BY THE APP: some keys in your \"patch\" failed verification against the \
+user's real settings:\n{feedback}\n\n\
+Answer again with the complete JSON object ({{\"reason\": ..., \"patch\": {{...}}}}). Remove or \
+replace those keys; never propose a value the user already has. If the obvious fix is already in \
+place, say so in \"reason\". JSON only."
     )
 }
 
@@ -212,7 +324,7 @@ fn text_of(value: Option<&serde_json::Value>) -> String {
 /// ببیند.
 pub fn advisor_system(lang: Lang) -> String {
     format!(
-        "{}\n\nYou are tuning this app's transport settings to get through DPI-based censorship. \
+        "{}\n\n{}\n\nYou are tuning this app's transport settings to get through DPI-based censorship. \
 You will be shown the current settings and a redacted tail of the connection log.\n\
 The log has been stripped of anything that identifies the user: public IP addresses are masked to \
 their first two groups, install identifiers and credentials are replaced. Do not ask for the \
@@ -223,19 +335,28 @@ Only these keys may appear inside \"patch\": {}\n\
 Rules for the patch:\n\
 - Include ONLY keys you are actually changing. An empty patch is a valid answer and the right one \
 when the log shows a healthy connection.\n\
+- Never propose a value the user already has: compare every key with THE USER'S CURRENT SETTINGS \
+(each line says whether it is the default or was changed by the user). A key whose value equals the \
+current one is an error, and the app will reject it. If the obvious fix is already in place, say so \
+in \"reason\" and propose the next most likely one instead (or none).\n\
+- Every change must be tied to something specific in the log.\n\
 - Change as few things as possible. One or two settings, not a rewrite.\n\
 - The baseline MTU is {}. Lower it only if the log shows fragmentation or handshake timeouts.\n\
 - \"reason\" is shown to the user. Write it in the same language as the rest of your answer.",
         base_rules(lang),
+        GROUNDING,
         ai_patch::writable_keys_for_prompt(),
         ai_patch::BASELINE_MTU,
     )
 }
 
 /// پرسشِ مشاور: تنظیمات فعلی + خلاصهٔ پاک‌شدهٔ لاگ.
-pub fn advisor_user(settings_json: &str, redacted_log: &str) -> String {
+///
+/// ۱.۴.۰-r4: snapshotِ حاشیه‌دار (`[default]` / `[changed by user; default: X]`) پیش
+/// از JSONِ کامل می‌آید، تا گام‌های `GROUNDING` چیزی برای مقایسه داشته باشند.
+pub fn advisor_user(annotated_snapshot: &str, settings_json: &str, redacted_log: &str) -> String {
     format!(
-        "Current settings:\n{settings_json}\n\nRecent connection log (redacted, oldest line first):\n{redacted_log}"
+        "THE USER'S CURRENT SETTINGS:\n{annotated_snapshot}\n\nFull settings (JSON):\n{settings_json}\n\nRecent connection log (redacted, oldest line first):\n{redacted_log}"
     )
 }
 
@@ -298,6 +419,8 @@ mod tests {
         let chat = chat_system(
             Lang::En,
             &crate::ai_patch::chat_snapshot(&Default::default()),
+            "gemini-3.1-flash-lite",
+            "connected",
         );
         for system in [
             explain_system(Lang::En),
@@ -323,6 +446,59 @@ mod tests {
         // نام‌های اندرویدی نباید آنجا باشند.
         assert!(!system.contains("reconnectRetryLimit"));
         assert!(!system.contains("accessSecret"));
+    }
+
+    #[test]
+    fn grounding_format_model_and_status_reach_the_chat_prompt() {
+        let system = chat_system(
+            Lang::En,
+            &crate::ai_patch::chat_snapshot(&Default::default()),
+            "gemini-3.1-flash-lite",
+            "reconnecting (attempt 2)",
+        );
+        assert!(
+            system.contains("HOW TO THINK BEFORE YOU ANSWER"),
+            "{system}"
+        );
+        assert!(system.contains("FORMATTING"), "{system}");
+        assert!(
+            system.contains("You are gemini-3.1-flash-lite."),
+            "{system}"
+        );
+        assert!(
+            system.contains("Connection status right now: reconnecting (attempt 2)."),
+            "{system}"
+        );
+        assert!(
+            system.contains("[default]"),
+            "the annotated snapshot must be in the prompt"
+        );
+        assert!(
+            system.contains("Never put a change in the block whose value equals the current one")
+        );
+        // بدونِ وضعیت، خطِ وضعیت هم نیست — نه یک «Connection status right now: .» خالی.
+        let quiet = chat_system(Lang::En, "", "", "");
+        assert!(!quiet.contains("Connection status right now"));
+        assert!(!quiet.contains("You are ."));
+    }
+
+    #[test]
+    fn the_advisor_is_grounded_too() {
+        let system = advisor_system(Lang::En);
+        assert!(system.contains("HOW TO THINK BEFORE YOU ANSWER"));
+        assert!(system.contains("Never propose a value the user already has"));
+        let user = advisor_user("  mtu = 1280   [default]", "{}", "log line");
+        assert!(user.starts_with("THE USER'S CURRENT SETTINGS:"));
+        assert!(user.contains("[default]") && user.contains("log line"));
+    }
+
+    #[test]
+    fn revision_turns_carry_the_feedback_and_the_fence_rule() {
+        let chat = chat_revision("- mtu = \"1280\": REDUNDANT");
+        assert!(chat.contains("REDUNDANT") && chat.contains(APPLY_FENCE));
+        assert!(chat.contains("Do not mention this check"));
+        let advisor = advisor_revision("- mtu = \"1280\": REDUNDANT");
+        assert!(advisor.contains("REDUNDANT") && advisor.contains("JSON only"));
     }
 
     #[test]
@@ -434,6 +610,8 @@ mod tests {
         let system = chat_system(
             Lang::Fa,
             &crate::ai_patch::chat_snapshot(&Default::default()),
+            "",
+            "",
         );
         assert!(system.contains(APPLY_FENCE));
         assert!(

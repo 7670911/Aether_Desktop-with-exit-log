@@ -30,6 +30,7 @@ export const ai = {
   gate: 'NO_KEY',
   gateCode: 'NO_KEY',
   hasKey: false,
+  tunnelConnected: false,
   keyHint: '',
   models: [],
   selectedModel: '',
@@ -60,6 +61,8 @@ function emitAi() {
 }
 
 function absorb(next) {
+  // An AI event is newer than any snapshot request already in flight.
+  ++refreshSeq
   Object.assign(ai, next)
   emitAi()
 }
@@ -75,13 +78,32 @@ export const applyAiSnapshot = absorb
 
 /** یک بار در بوت صدا زده می‌شود. */
 export async function initAi() {
-  try {
-    absorb(await invoke('ai_snapshot'))
-  } catch (e) {
-    console.error('ai_snapshot failed', e)
-  }
+  // Subscribe before reading the initial state so a connection transition during
+  // startup cannot be overwritten by an older DISCONNECTED snapshot.
   await listen('aether://ai', (event) => absorb(event.payload))
+  await refreshAi()
 }
+
+/**
+ * >>> AETHER-APP-PATCH ai-gate-follows-tunnel (1.3.0)
+ *
+ * دروازهٔ هوش مصنوعی (`gateCode`) به حالت تونل وابسته است، ولی Rust فقط بعد از
+ * کارهای خودِ دستیار `aether://ai` می‌فرستاد — نه وقتی تونل وصل/قطع می‌شد. نتیجه:
+ * کاربر وصل می‌شد و چت همچنان «تونل وصل نیست» نشان می‌داد. این تابع snapshot را
+ * دوباره می‌گیرد؛ main.js آن را با هر تغییر حالت اتصال و هر ذخیرهٔ پروفایل صدا
+ * می‌زند. پاسخ‌های قدیمی‌تر از درخواست بعدی دور ریخته می‌شوند.
+ */
+let refreshSeq = 0
+export async function refreshAi() {
+  const seq = ++refreshSeq
+  try {
+    const next = await invoke('ai_snapshot')
+    if (seq === refreshSeq && next && typeof next === 'object') absorb(next)
+  } catch (e) {
+    console.error('ai_snapshot refresh failed', e)
+  }
+}
+// <<< AETHER-APP-PATCH ai-gate-follows-tunnel
 
 // ------------------------------------------------------------- دروازه
 

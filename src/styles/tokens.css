@@ -57,6 +57,27 @@
   --ambient-fill: var(--navy-900);
 }
 
+/* ۱.۳.۰ — پنجرهٔ «تازه‌ها» و بایگانیِ پیام‌ها (پورت از اندروید ۱.۵.۰) */
+:root {
+  --news-bg:            #0d1527;
+  --news-bg-2:          #101b33;
+  --news-border:        #1e2b4a;
+  --news-divider:       #1a2640;
+  --news-text:          #ffffff;
+  --news-text-2:        #cbd5e1;
+  --news-note:          #94a3b8;
+  --news-accent:        #38bdf8;
+  --news-accent-2:      #60a5fa;
+  --news-on-accent:     #0d1527;
+  --news-warn-bg:       rgba(234, 179, 8, 0.15);
+  --news-warn-bar:      #eab308;
+  --news-scroll-track:  rgba(148, 163, 184, 0.10);
+  --news-scroll-thumb:  rgba(56, 189, 248, 0.55);
+  --news-scroll-hover:  #38bdf8;
+  --news-check-idle:    #64748b;
+  --news-scrim:         rgba(3, 7, 15, 0.72);
+}
+
 /* ==========================================================================
    تطبیق با دسکتاپ: طراحی عیناً همان است، فقط مقیاس و چیدمان تغییر می‌کند.
    موبایل: تک‌ستونی با Drawer رویی.

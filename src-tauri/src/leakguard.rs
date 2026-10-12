@@ -441,17 +441,28 @@ impl LeakGuard {
 
     /// بازگرداندن همه‌چیز به حالت قبل — در قطع اتصال، خطا و خروج برنامه.
     pub fn release(&mut self) {
-        if self.rules > 0 {
-            delete_firewall_rules();
-        }
-        // Explicit disconnect/exit restores the user's network. Automatic
-        // reconnect uses release_for_reconnect() and intentionally preserves it.
-        if self.kill_rules > 0 {
-            delete_kill_switch_rules();
-        }
+        // >>> AETHER-APP-FIX instant-disconnect
+        // هر `netsh advfirewall` روی ویندوز نیم تا دو ثانیه می‌گیرد و قطعِ اتصال
+        // دو تا از آن‌ها را پشتِ هم، به‌اضافهٔ بازگردانیِ رجیستری، صبر می‌کرد.
+        // سه کار مستقل‌اند (نامِ قاعده‌ها جداست)، پس هم‌زمان اجرا می‌شوند و این
+        // تابع هنوز فقط پس از پایانِ همه برمی‌گردد — اتصالِ بعدی هرگز قاعده‌ای
+        // نمی‌سازد که یک حذفِ در-راه پاکش کند.
+        let (rules, kill_rules) = (self.rules > 0, self.kill_rules > 0);
+        let edits = std::mem::take(&mut self.edits);
+        let had_edits = !edits.is_empty();
+        std::thread::scope(|scope| {
+            if rules {
+                scope.spawn(delete_firewall_rules);
+            }
+            // Explicit disconnect/exit restores the user's network. Automatic
+            // reconnect uses release_for_reconnect() and intentionally preserves it.
+            if kill_rules {
+                scope.spawn(delete_kill_switch_rules);
+            }
+            restore_policies(edits);
+        });
+        // <<< AETHER-APP-FIX instant-disconnect
         self.kill_rules = 0;
-        let had_edits = !self.edits.is_empty();
-        restore_policies(std::mem::take(&mut self.edits));
         let had_rules = self.rules > 0;
         self.rules = 0;
         *status_cell().lock() = GuardStatus::default();
@@ -474,8 +485,12 @@ impl Drop for LeakGuard {
 /// می‌شود که نشانهٔ AetherLeakGuardManaged داشته باشد، پس سیاست سازمانی خود
 /// کاربر هرگز قربانی نمی‌شود.
 pub fn purge_stale() {
-    delete_firewall_rules();
-    delete_kill_switch_rules();
+    // دو `netsh` مستقل (نام‌های جدا) هم‌زمان؛ پیش از هر اتصالِ توری روی مسیرِ
+    // Connect اجرا می‌شود و پشتِ هم چند ثانیه می‌گرفت.
+    std::thread::scope(|scope| {
+        scope.spawn(delete_kill_switch_rules);
+        delete_firewall_rules();
+    });
     let mut cleaned = 0;
     for key in CHROMIUM_POLICY_KEYS {
         if reg_read(key, SENTINEL_NAME).is_some() {
@@ -500,6 +515,65 @@ pub fn purge_stale() {
     *status_cell().lock() = GuardStatus::default();
 }
 
+// >>> AETHER-APP-FIX psiphon-wsaeacces-hint
+/// پس از نخستین WSAEACCESِ سایفون (روی رشتهٔ جدا): آیا قاعده‌ای از اتر مانده؟
+/// اگر هیچ گاردی درگیر نیست، باقی‌مانده پاک می‌شود؛ وگرنه علت بیرون از اتر است
+/// (فایروالِ دیگری، یا سیاستِ «BlockOutbound» در پروفایلِ ویندوز).
+pub fn diagnose_access_denied() {
+    let present = |name: &str| {
+        netsh(&[
+            "advfirewall".into(),
+            "firewall".into(),
+            "show".into(),
+            "rule".into(),
+            format!("name={name}"),
+        ])
+    };
+    let kill = present(KILL_RULE);
+    let guard = present(FW_RULE);
+    let engaged = status().engaged;
+    if (kill || guard) && !engaged {
+        purge_stale();
+        DiagnosticsLog::w(
+            TAG,
+            "Leftover Aether firewall rules were still installed with no session owning them (a previous session was killed) — removed. Psiphon retries on its own.",
+        );
+    } else if kill || guard {
+        DiagnosticsLog::i(
+            TAG,
+            "Aether's own firewall rules are active for this session; their STUN/TURN and IPv6 blocks are scoped to browsers in Psiphon chains.",
+        );
+    } else {
+        let outbound_blocked = netsh_output(&["advfirewall", "show", "currentprofile"])
+            .map(|t| t.contains("BlockOutbound"))
+            .unwrap_or(false);
+        DiagnosticsLog::w(
+            TAG,
+            &format!(
+                "No Aether firewall rule is installed, so the refusal comes from outside Aether{} — allow psiphon-tunnel-core.exe in %LOCALAPPDATA%\\studio.cluvex.aether.desktop\\engine in that firewall/antivirus, or use Config → Psiphon, where Psiphon only talks to 127.0.0.1.",
+                if outbound_blocked {
+                    " (the active Windows Firewall profile blocks outbound connections by default)"
+                } else {
+                    " (another firewall, VPN kill switch or antivirus)"
+                }
+            ),
+        );
+    }
+}
+
+fn netsh_output(args: &[&str]) -> Option<String> {
+    let mut cmd = Command::new(
+        std::path::Path::new(&std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()))
+            .join("System32")
+            .join("netsh.exe"),
+    );
+    cmd.args(args);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd.output().ok().map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+}
+// <<< AETHER-APP-FIX psiphon-wsaeacces-hint
+
 // ---------------------------------------------------------------------------
 //  کمکی‌ها
 // ---------------------------------------------------------------------------
@@ -512,8 +586,33 @@ pub fn purge_stale() {
 /// قاعدهٔ سیستم‌گسترده می‌ماند — کمترین تغییر در پوششِ امنیتی، فقط
 /// جایی که باید.
 pub(crate) fn needs_pluggable_transport_egress(profile: &ConnectionProfile) -> bool {
-    profile.backend.uses_tor() && profile.tor_bridges != crate::profile::TorBridges::Off
+    (profile.backend.uses_tor() && profile.tor_bridges != crate::profile::TorBridges::Off)
+        // AETHER-APP-PATCH custom-configs
+        || CUSTOM_EGRESS.load(std::sync::atomic::Ordering::Relaxed)
 }
+
+// >>> AETHER-APP-PATCH custom-configs
+/// کانفیگِ سفارشی‌ای که Xray مستقیم به آن dial می‌کند (تنها یا هاپِ اول) و
+/// سرورش روی IPv6 یا یکی از پورت‌های STUN/TURN است. همان باریک‌سازیِ تور:
+/// بلوک‌های STUN و IPv6 فقط روی مرورگرها می‌نشینند، وگرنه خودِ Xray هم بسته
+/// می‌شد. پیش‌فرض `false` = همان قاعدهٔ سیستم‌گسترده.
+static CUSTOM_EGRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_custom_egress(on: bool) {
+    CUSTOM_EGRESS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// آیا `port` داخلِ [`STUN_TURN_PORTS`] است؟
+pub(crate) fn port_is_stun(port: u16) -> bool {
+    STUN_TURN_PORTS.split(',').any(|part| match part.split_once('-') {
+        Some((a, b)) => match (a.parse::<u16>(), b.parse::<u16>()) {
+            (Ok(a), Ok(b)) => (a..=b).contains(&port),
+            _ => false,
+        },
+        None => part.parse::<u16>().ok() == Some(port),
+    })
+}
+// <<< AETHER-APP-PATCH custom-configs
 // <<< AETHER-APP-FIX pt-egress-not-blocked
 
 fn fw_add(args: &[&str], program: Option<&str>) -> bool {
@@ -559,7 +658,11 @@ fn delete_kill_switch_rules() {
 }
 
 fn netsh(args: &[String]) -> bool {
-    let mut cmd = Command::new("netsh");
+    let mut cmd = Command::new(
+        std::path::Path::new(&std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()))
+            .join("System32")
+            .join("netsh.exe"),
+    );
     cmd.args(args);
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
@@ -592,7 +695,11 @@ fn restore_policies(edits: Vec<PolicyEdit>) {
 
 /// مثل `reg`، ولی منتظر نمی‌ماند.
 fn reg_spawn(args: &[&str]) -> Option<std::process::Child> {
-    let mut cmd = Command::new("reg");
+    let mut cmd = Command::new(
+        std::path::Path::new(&std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()))
+            .join("System32")
+            .join("reg.exe"),
+    );
     cmd.args(args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -639,7 +746,11 @@ fn parse_reg_value(output: &str, name: &str) -> Option<String> {
 }
 
 fn reg(args: &[&str]) -> Option<String> {
-    let mut cmd = Command::new("reg");
+    let mut cmd = Command::new(
+        std::path::Path::new(&std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()))
+            .join("System32")
+            .join("reg.exe"),
+    );
     cmd.args(args);
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
@@ -742,6 +853,14 @@ mod tests {
 
     /// قرارداد امنیتی: پورت‌هایی که ابزارهای نشت‌سنجی عمومی از آن‌ها استفاده
     /// می‌کنند باید در فهرست مسدودی باشند.
+    #[test]
+    fn custom_egress_port_matcher() {
+        assert!(port_is_stun(3478));
+        assert!(port_is_stun(19305));
+        assert!(!port_is_stun(443));
+        assert!(!port_is_stun(19310));
+    }
+
     #[test]
     fn stun_port_list_covers_the_public_test_servers() {
         for p in ["3478", "5349", "19302-19309"] {

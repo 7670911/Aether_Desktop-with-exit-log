@@ -54,6 +54,22 @@
 
 **A16: a third-party transport binary in the bundle, contained with a remaining duty (1.2.5).** `obfs4` needs lyrebird, which means shipping a foreign executable next to the engine. It is compiled from source at a pinned tag rather than fetched as a binary, its version is recorded next to it, and its absence degrades to "bridges unavailable" instead of breaking the release. The remaining duty is explicit: the source is pinned by tag, not by commit hash, and the checkout is not signature-verified — a tag can be moved. A commit-hash pin belongs in the build before the next release, and in this pass the binary was neither compiled nor executed.
 
+## 1.3.0 addendum: Custom configs (Xray child process)
+
+**Scope of this addendum:** the *Custom configs* feature ported from Android 1.5.0 (`src-tauri/src/custom/`, `state_custom.rs`, `custom_commands.rs`, `src/views/customconfigs.js`). Verified here: 48 Rust unit tests for the parser, `.npvt` codec, Xray config builder, store and importer (including `xray run -test` against the real Xray 25.12.8 binary on Linux for the generated configs), the frontend jsdom suites, and `cargo check --target x86_64-pc-windows-msvc`. **Not verified here:** any Windows runtime — no chain was connected, no leak test was run.
+
+**A17: a second network binary, pinned (1.3.0).** `xray.exe` (Xray-core v25.12.8, MPL-2.0, licence text shipped next to it in `engine/xray/LICENSE`) is downloaded by `scripts/stage-xray.ps1` from the official GitHub release; both the zip and the extracted `xray.exe` are pinned by SHA-256 for x64 and x86 (the zip digests equal the `.dgst` files published with the release). A digest mismatch always fails the build; a failed download only skips the step, and the publish gate refuses a build without the core. v26 is deliberately not used: it rejects `allowInsecure` and the mKCP `seed`, which existing configs still carry.
+
+**A18: process containment (1.3.0).** xray runs hidden (`CREATE_NO_WINDOW`), is adopted into the app's kill-on-close Job Object (procguard), inherits no proxy environment variables, listens only on `127.0.0.1` on a port chosen away from the app's own ports, and its generated config (which contains the server credentials) lives in the data folder only while it runs and is deleted on stop. Its stdout/stderr are drained into the rotating log with public IPv4 addresses redacted. Restarts are capped (5, reset after 120 s healthy); a port that stays dead is reported as a reconnect instead of a silent green tunnel.
+
+**A19: stored configs and `.npvt` locks (1.3.0).** The saved list is sealed with DPAPI (`custom_configs.bin`), like the AI key; a copy on another account or machine does not open. The web UI receives a view without the raw outbound. `.npvt` author locks are enforced the way Android does: device-bound, expired and *mobile only* files are rejected, password-protected files need the password, and the raw link of a locked config is never returned to the UI (copy/edit refused in Rust, not only hidden). Subscription downloads are `https://` only, at most 5 redirects, 2 MB and 20 s, and go through the tunnel while connected.
+
+**A20: DNS and egress scoping (1.3.0).** Sniffing is disabled in every generated config (with `destOverride: tls` Xray rewrote each destination to the TLS SNI, which broke Tor's fake-SNI link handshake — the `Config → Tor` stall at 93 %); unit tests pin it for all three positions. When xray dials through the engine or Tor, the server name is passed unresolved to the SOCKS listener, so it is resolved at the far end. The leak guard opens the additional egress xray needs only while a custom config is running (`CUSTOM_EGRESS`), and it is cleared on disconnect. With the feature off, none of this code path runs: split tunnelling stays off by default and MTU 1280 is unchanged.
+
+**A21: Tor behind a config, fixed at the root (1.3.0 build fix).** Disabling client-side sniffing (A20) was not enough: the config *server's* sniffer (3x-ui/Marzban default) still read Tor's fake SNI and replaced the relay address, so `Config → Tor…` chains stalled at 10 %. The hop that carries `tor.exe` now splits the ClientHello into 100–200 byte TLS records (`xray::TOR_LINK_FRAGMENT`) inside the config's own tunnel — the Android 1.5.0 equivalent is an Arti link without SNI. Nothing new leaves the machine; measured with the sample configs: Tor 100 % in 9–12 s, `IsTor: true`. The full bilingual 0–100 comparison with Android 1.5.0 is in `release-notes.md` (Windows 90.70 ≈ 91, Android 91.96 ≈ 92).
+
+**No score change.** Like 1.2.5, a feature reviewed in source but not measured at runtime does not earn a point. The release gate additionally requires, on real Windows hardware: `Config`, `Config → Tor`, `Tor → Config` and `Config → Tor → Psiphon` connected, a DNS/WebRTC/IPv6 leak test in at least one FIRST and one LAST mode, and a run with `engine\xray\xray.exe` removed, which must fail with "core not found" while the six regular modes keep working.
+
 ## Deductions (why 90 and not 100)
 
 * **−4 — the system proxy is not a universal VPN route.** HTTP/HTTPS and SOCKS-aware applications are covered; an arbitrary UDP application is not. This is a deliberate Windows design decision, documented in the README, not an oversight.
@@ -115,5 +131,21 @@ PowerShell). آزمون نفوذ نیست. در این نوبت **هیچ بای�
 باید روی **هر چهار بک‌اند تور** تکرار شود، به‌همراه یک اتصالِ پل با lyrebirdِ
 همراه و یک اجرای عمدی بی ترابر، که باید به «پل در دسترس نیست» تنزل کند و اتصال
 را نشکند.
+
+**افزودهٔ ۱.۳.۰ — کانفیگ‌های سفارشی:** xray.exe (Xray v25.12.8، مجوز MPL-2.0) با
+دایجستِ SHA-256ِ پین‌شده برای zip و باینریِ هر دو معماری دانلود می‌شود، پنهان و
+داخلِ Job Objectِ برنامه اجرا می‌شود، فقط روی 127.0.0.1 گوش می‌دهد و فایلِ
+کانفیگش با توقف پاک می‌شود. فهرستِ کانفیگ‌ها با DPAPI رمز می‌شود، قفلِ فایل‌های
+npvt (دستگاه، انقضا، «فقط موبایل»، رمز) رعایت می‌شود و لینکِ خامِ کانفیگِ قفل‌دار
+هرگز به رابط نمی‌رسد. sniffing خاموش است (علتِ گیرِ Config → Tor) و گاردِ نشت فقط
+هنگامِ اجرای کانفیگِ سفارشی راهِ خروجیِ اضافه را باز می‌کند. امتیاز تغییر نکرد:
+این مسیر روی ویندوزِ واقعی آزموده نشده است.
+
+**افزودهٔ A21 — تورِ پشتِ کانفیگ از ریشه درست شد:** خاموش‌کردنِ sniffingِ سمتِ
+برنامه کافی نبود؛ sniffingِ سمتِ *سرورِ* کانفیگ هنوز SNIِ ساختگیِ تور را می‌خواند و
+زنجیره‌های Config → Tor روی ۱۰٪ می‌ماندند. هاپِ حاملِ tor.exe حالا ClientHello را
+داخلِ تونلِ خودِ کانفیگ به رکوردهای ۱۰۰ تا ۲۰۰ بایتی می‌شکند (معادلِ لینکِ بی‌SNIِ
+Arti در اندروید ۱.۵.۰). خروجیِ تازه‌ای ساخته نمی‌شود. جدولِ کاملِ مقایسهٔ ۰ تا ۱۰۰
+با اندروید ۱.۵.۰ در release-notes.md است (ویندوز ۹۱، اندروید ۹۲).
 
 </div>

@@ -38,6 +38,16 @@ pub enum Protocol {
     Mim,
 }
 
+/// Core 2.3.0 GOOL variant. Modern is the new default (`--gool`), while
+/// Classic preserves the older WireGuard-inside-WireGuard path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum GoolMode {
+    #[default]
+    Modern,
+    Classic,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum ScanMode {
@@ -441,16 +451,23 @@ pub struct ConnectionProfile {
     pub backend: TransportBackend,
     /// کد ISO کشور خروج برای استیج ۲. `""` = خودکار.
     ///
-    /// فیلتر **سخت** Psiphon است؛ `psiphon.rs` اگر در آن کشور سروری نبود به
-    /// خروجی خودکار برمی‌گردد، نه اینکه معلق بماند.
+    /// فیلتر **سخت** Psiphon است؛ اگر خروجی آن کشور موجود نباشد
+    /// هسته برای آن انتخاب متصل نمی‌شود. حالت خالی انتخاب خودکار است.
     #[serde(default)]
     pub exit_region: String,
     pub protocol: Protocol,
+    #[serde(default)]
+    pub gool_mode: GoolMode,
     pub scan_mode: ScanMode,
     pub ip_version: IpVersion,
     pub quick_reconnect: bool,
+    /// بازاستفاده از اندپوینتِ کش‌شده فقط در صورتی که همچنان سریع باشد (پیش‌فرض خاموش).
+    pub fast_endpoint_only: bool,
+    /// پیکربندی سفارشی ECH (یک ECHConfigList با فرمت base64). خالی = خودکار.
+    pub ech_config: String,
     pub masque_http2: bool,
     /// اشتراک تونل با دستگاه‌های دیگر روی همان شبکه (پورت‌های 10810/10811).
+    #[serde(default)]
     pub lan_share: bool,
     /// v1.2.0 — هنگام قطع تونل، ترافیک مستقیم مرورگرها را قطع می‌کند.
     pub kill_switch: bool,
@@ -503,6 +520,15 @@ pub struct ConnectionProfile {
     /// قوانین مسیریابی: مقصدهایی که از مسیر مستقیم (نه تونل) می‌روند
     /// (`--route-direct`) — برای بانک، سرویس‌های LAN و سایت‌های داخلی.
     pub route_direct: Vec<String>,
+
+    /// ۱.۴.۰ (#66) — «دور زدن سایت‌های ایرانی»: هر نام `.ir`، سرویس‌های شناختهٔ
+    /// ایرانی روی دامنه‌های دیگر و همهٔ بلوک‌های IPv4 ایران مستقیم بیرون
+    /// می‌روند، نه از تونل. در اشتراکِ LAN اعمال نمی‌شود. پیش‌فرض خاموش.
+    #[serde(default)]
+    pub bypass_iran: bool,
+    /// ۱.۴.۰ (#67) — «مسدودسازی تبلیغات و ردیاب‌ها» در همهٔ حالت‌ها. پیش‌فرض خاموش.
+    #[serde(default)]
+    pub block_ads: bool,
 
     /// DNS داخل تونل (`--dns`). خالی = پیش‌فرض هسته.
     pub dns: Vec<String>,
@@ -613,6 +639,7 @@ impl Default for ConnectionProfile {
             backend: TransportBackend::Aether,
             exit_region: String::new(),
             protocol: Protocol::Smart,
+            gool_mode: GoolMode::Modern,
             // 1.2.5: BALANCED, byte for byte the mobile 1.3.0 default.
             //
             // Turbo used to sit here to imitate the mobile ladder, which scans
@@ -625,6 +652,8 @@ impl Default for ConnectionProfile {
             scan_mode: ScanMode::Balanced,
             ip_version: IpVersion::V4,
             quick_reconnect: true,
+            fast_endpoint_only: false,
+            ech_config: String::new(),
             masque_http2: false,
             lan_share: false,
             kill_switch: true,
@@ -650,6 +679,8 @@ impl Default for ConnectionProfile {
             gateway: false,
             route_block: Vec::new(),
             route_direct: Vec::new(),
+            bypass_iran: false,
+            block_ads: false,
             dns: Vec::new(),
             upstream: String::new(),
             route_sniff: true,
@@ -798,6 +829,16 @@ impl ConnectionProfile {
             TransportBackend::Aether
         };
         stage.lan_share = false;
+        // >>> AETHER-APP-PATCH psiphon-stage-has-no-routing-rules (mobile 1.4.0 `connectAetherStage`)
+        // در حالت Psiphon موتورِ استیج ۱ فقط اتصال‌های Psiphon به سرورهایش را
+        // می‌بیند؛ قواعد block/direct آن‌جا یا بی‌اثرند یا — بدتر — یک سرورِ
+        // Psiphon را مستقیم بیرون می‌فرستند. همهٔ قواعد در پل اعمال می‌شوند
+        // (`smart_lists::front_rules` → `smart_routes::set_front`).
+        stage.route_block.clear();
+        stage.route_direct.clear();
+        stage.bypass_iran = false;
+        stage.block_ads = false;
+        // <<< AETHER-APP-PATCH psiphon-stage-has-no-routing-rules
         stage
     }
 
@@ -884,6 +925,16 @@ impl ConnectionProfile {
                 }
             }
         }
+        if self.backend.is_chained() {
+            args.push("--psiphon".into());
+            args.push("--psiphon-bind".into());
+            args.push(format!("127.0.0.1:{}", crate::engine::CHAIN_SOCKS_PORT));
+            let region = self.exit_region.trim().to_ascii_uppercase();
+            if region.len() == 2 && region.bytes().all(|b| b.is_ascii_alphabetic()) {
+                args.push("--psiphon-region".into());
+                args.push(region);
+            }
+        }
         if !self.backend.uses_warp() && tor_mode.is_some() {
             // تورِ تنها: resolverها هنوز اثر دارند (همان چیزی‌اند که SOCKS
             // خودِ موتور تحویل می‌دهد)، ولی هیچ‌چیز دیگری از این تابع نه.
@@ -903,7 +954,13 @@ impl ConnectionProfile {
             Protocol::Smart => {}
             Protocol::Masque => args.push("--masque".into()),
             Protocol::Wireguard => args.push("--wg".into()),
-            Protocol::Gool => args.push("--gool".into()),
+            Protocol::Gool => args.push(
+                match self.gool_mode {
+                    GoolMode::Modern => "--gool",
+                    GoolMode::Classic => "--gool-classic",
+                }
+                .into(),
+            ),
             Protocol::Mim => {
                 if caps.mim {
                     args.push("--mim".into())
@@ -964,7 +1021,12 @@ impl ConnectionProfile {
         }
         if self.ech {
             args.push("--ech".into());
-            args.push("auto".into());
+            let pasted = self.ech_config.trim();
+            if !pasted.is_empty() && looks_like_base64(pasted) {
+                args.push(pasted.to_string());
+            } else {
+                args.push("auto".into());
+            }
         }
         if self.keepalive > 0 {
             args.push("--keepalive".into());
@@ -1154,6 +1216,24 @@ impl ConnectionProfile {
             }
         }
 
+        // ----- بودجه‌ی سنجش اندپوینت کش‌شده (fast_endpoint_only) ---------
+        // معادل دقیق نسخه موبایل ۱.۴.۰: فقط اگر کاربر سوییچ را روشن کرده باشد
+        // ارسال می‌شود تا هسته در حالت پیش‌فرض اندپوینت سالم را دوباره استفاده کند.
+        if self.fast_endpoint_only {
+            let is_chained = self.backend.is_chained();
+            let rtt_budget = if is_chained { "1200" } else { "2000" };
+            let hs_budget = if is_chained { "3500" } else { "5000" };
+            env.insert(
+                "AETHER_QUICK_RECONNECT_MAX_RTT_MS".into(),
+                rtt_budget.into(),
+            );
+            env.insert(
+                "AETHER_QUICK_RECONNECT_MAX_HANDSHAKE_MS".into(),
+                hs_budget.into(),
+            );
+            env.insert("AETHER_SCAN_GOOD_RTT_MS".into(), rtt_budget.into());
+        }
+
         env
     }
 
@@ -1176,7 +1256,7 @@ impl ConnectionProfile {
 /// (`AETHER_TOR_STALL_SECS`). پیش‌فرضِ موتور ۷۵ ثانیه است و با آن، دومین
 /// ترانسپورت پیش از ثانیهٔ ۱۵۰ نوبت نمی‌گیرد. مفصل در
 /// [ConnectionProfile::to_env_with_caps].
-pub const TOR_BRIDGE_STALL_SECS: u32 = 40;
+pub const TOR_BRIDGE_STALL_SECS: u32 = 75;
 
 /// بیشترین تعداد سطر پلی که به موتور می‌رود — همان عددِ نسخهٔ موبایل.
 pub const MAX_BRIDGE_LINES: usize = 12;
@@ -1247,6 +1327,7 @@ mod tests {
     fn mim_uses_core_2_0_flag_and_is_gated_before_it() {
         let p = ConnectionProfile {
             protocol: Protocol::Mim,
+            gool_mode: GoolMode::Modern,
             ..Default::default()
         };
         assert!(p
@@ -1322,6 +1403,7 @@ mod tests {
             endpoint_mode: EndpointMode::ManualPeer,
             manual_peer: "188.114.96.1:2408".into(),
             protocol: Protocol::Masque,
+            gool_mode: GoolMode::Modern,
             ..Default::default()
         };
         // 1.2.3: `--noize` is ALWAYS sent, `off` included (see `to_args_with_caps`).
@@ -1346,6 +1428,7 @@ mod tests {
     fn noize_and_hardening_flags() {
         let p = ConnectionProfile {
             protocol: Protocol::Wireguard,
+            gool_mode: GoolMode::Modern,
             noize: Noize::Gfw,
             fragment: true,
             ech: true,
@@ -1613,19 +1696,31 @@ mod tests {
         assert!(!stage.lan_share);
     }
 
-    /// زنجیره یک لایهٔ سمتِ ویندوز است: هیچ فلگ یا متغیر تازه‌ای به موتور
-    /// نمی‌رود، پس قرارداد اندروید بایت‌به‌بایت همان می‌ماند.
+    /// Both chains ask core 2.1.0 to own the Psiphon process and its listener.
     #[test]
-    fn the_chained_backend_never_changes_the_engine_contract() {
+    fn chained_backends_enable_core_managed_psiphon() {
+        for backend in [
+            TransportBackend::AetherPsiphon,
+            TransportBackend::TorPsiphon,
+        ] {
+            let p = ConnectionProfile {
+                backend,
+                exit_region: "NL".into(),
+                ..Default::default()
+            };
+            let args = p.to_args();
+            assert!(args.contains(&"--psiphon".to_string()));
+            assert!(args
+                .windows(2)
+                .any(|v| v == ["--psiphon-bind", "127.0.0.1:1825"]));
+            assert!(args.windows(2).any(|v| v == ["--psiphon-region", "NL"]));
+            assert_eq!(
+                backend == TransportBackend::TorPsiphon,
+                args.contains(&"--tor-only".to_string())
+            );
+        }
         let plain = ConnectionProfile::default();
-        let chained = ConnectionProfile {
-            backend: TransportBackend::AetherPsiphon,
-            exit_region: "NL".into(),
-            ..Default::default()
-        };
-        assert_eq!(plain.to_args(), chained.to_args());
-        assert_eq!(plain.to_env(), chained.to_env());
-        assert!(!chained.to_args().iter().any(|a| a.contains("psiphon")));
+        assert!(!plain.to_args().contains(&"--psiphon".to_string()));
     }
 
     /// The chained tile has to read exactly like the mobile edition's, arrow and
@@ -1740,6 +1835,7 @@ mod tests {
         let p = ConnectionProfile {
             backend: TransportBackend::TorAether,
             protocol: Protocol::Wireguard,
+            gool_mode: GoolMode::Modern,
             ..Default::default()
         };
         assert_eq!(p.effective_protocol(), Protocol::Masque);
@@ -1877,7 +1973,7 @@ mod tests {
                 .to_env_with_caps(caps)
                 .get("AETHER_TOR_STALL_SECS")
                 .map(String::as_str),
-            Some("40"),
+            Some("75"),
         );
 
         let no_bridges = ConnectionProfile {
@@ -1952,6 +2048,7 @@ mod tests {
         assert_eq!(stage.backend, TransportBackend::Tor);
         assert!(!stage.lan_share);
         assert_eq!(stage.to_args()[0], "--tor-only");
+        assert!(!stage.to_args().contains(&"--psiphon".to_string()));
         // و خروجیِ زنجیره همان لیسنر Psiphon است.
         assert_eq!(
             TransportBackend::TorPsiphon.exposed_socks_port(),
@@ -1968,4 +2065,11 @@ mod tests {
         assert!(p.to_env().keys().all(|k| !k.starts_with("AETHER_TOR")));
         assert_eq!(p.effective_protocol(), p.protocol);
     }
+}
+
+fn looks_like_base64(text: &str) -> bool {
+    text.len() >= 4
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
 }

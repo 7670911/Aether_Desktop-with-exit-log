@@ -14,6 +14,7 @@
 //!   DiagnosticsLog           -> log.rs
 //!   ai/AiSession + GeminiClient -> ai_session.rs + ai_client.rs (+ ai_* siblings)
 //!   data/SecretStore         -> secret_store.rs (DPAPI instead of Keystore)
+//!   custom/* (1.5.0)          -> custom/*.rs + state_custom.rs + custom_commands.rs (Xray as engine\xray\xray.exe; no QR)
 
 mod ai_client;
 mod ai_gate;
@@ -27,6 +28,7 @@ mod ai_topic;
 mod diagnostics;
 mod engine;
 mod exit_regions;
+mod filedrop;
 // >>> AETHER-APP-PATCH endpoint-is-the-first-hop
 mod firsthop;
 // >>> AETHER-APP-PATCH the-flag-is-already-on-disk
@@ -34,25 +36,37 @@ mod geoip;
 // <<< AETHER-APP-PATCH the-flag-is-already-on-disk
 // <<< AETHER-APP-PATCH endpoint-is-the-first-hop
 mod budgets;
+// >>> AETHER-APP-PATCH custom-configs (mobile 1.5.0 `custom/*`, no QR on Windows)
+mod custom;
+mod custom_commands;
+// <<< AETHER-APP-PATCH custom-configs
 mod leakguard;
 mod log;
+mod login_code;
+mod mini_https;
 mod ping;
 mod probe;
+mod procguard;
 mod profile;
 mod provenance;
-mod psiphon;
-mod psiphon_health;
 mod pt;
 mod secret_store;
 mod share;
+mod share_guard;
+mod share_pages;
 mod smart_auto;
+mod smart_lists;
+mod smart_routes;
 mod state;
 mod store;
 mod sysproxy;
 mod tor_bootstrap;
+mod zt_signin;
+mod zt_web;
 // >>> AETHER-APP-PATCH tor-native-carrier
 // tor.exe رسمی به‌عنوان فرزندِ نظارت‌شده؛ دلیلش در سرِ خودِ ماژول.
 mod tor_native;
+mod tor_relay;
 // <<< AETHER-APP-PATCH tor-native-carrier
 mod tun;
 mod window;
@@ -116,7 +130,9 @@ const UI_MIN_INTERVAL: Duration = Duration::from_millis(500);
 /// تغییرِ دیگری — حالت، خطا، اندپوینت، پروتکل، تأخیر، آی‌پی، گارد نشتی، درصد
 /// تور — «معنادار» است و فوراً می‌رود.
 fn only_counters_changed(previous: Option<&Snapshot>, next: &Snapshot) -> bool {
-    let Some(previous) = previous else { return false };
+    let Some(previous) = previous else {
+        return false;
+    };
     let strip = |s: &Snapshot| {
         let mut c = s.clone();
         c.uptime_secs = 0;
@@ -332,6 +348,82 @@ fn core_version() -> String {
 // طول بکشد و قفل را داشته باشد، کل برنامه را برای ۴۰ ثانیه می‌خواباند. پس یک
 // کپی از پروفایل گرفته می‌شود، قفل رها می‌شود، و بعد شبکه.
 
+// >>> AETHER-APP-PATCH ui-lang-on-disk (1.3.0)
+/// کلیدِ زبان رابط در `prefs.json`.
+const UI_LANG_KEY: &str = "ui.lang";
+
+/// زبان رابط کاربری، از `prefs.json` کنار پروفایل.
+///
+/// زبان قبلاً فقط در `localStorage` وب‌ویو می‌ماند. WebView2 آن را با تأخیر روی
+/// دیسک می‌نویسد، پس بستن برنامه کمی بعد از انتخاب زبان (یا پاک‌شدن پوشهٔ
+/// `EBWebView` با نصب/به‌روزرسانی) آن را از بین می‌برد و برنامه انگلیسی باز
+/// می‌شد. حالا منبعِ حقیقت فایلِ خودِ برنامه است و `localStorage` فقط کش.
+#[tauri::command]
+fn get_ui_lang(app: AppHandle) -> Option<String> {
+    let dir = app.path().app_local_data_dir().ok()?;
+    store::PrefsStore::new(&dir)
+        .get_string(UI_LANG_KEY)
+        .filter(|v| v == "fa" || v == "en")
+}
+
+#[tauri::command]
+fn set_ui_lang(app: AppHandle, lang: String) -> Result<(), String> {
+    let lang = if lang == "fa" { "fa" } else { "en" };
+    let dir = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    store::PrefsStore::new(&dir)
+        .set_string(UI_LANG_KEY, lang)
+        .map_err(|e| e.to_string())
+}
+// <<< AETHER-APP-PATCH ui-lang-on-disk
+
+// >>> AETHER-APP-PATCH whats-new (1.3.0)
+/// نسخه‌ای که برنامه آخرین بار با آن اجرا شد — در `prefs.json`.
+const NEWS_LAST_LAUNCHED_KEY: &str = "news.last_launched";
+/// نسخه‌ای که کاربر برایش «دیگر این پیام را نمایش نده» را زد.
+const NEWS_SUPPRESSED_KEY: &str = "news.suppressed";
+
+/// وضعیتِ پنجرهٔ «تازه‌ها» (What's New).
+///
+/// به همان دلیلِ `get_ui_lang` روی دیسکِ خودِ برنامه می‌ماند و نه فقط در
+/// `localStorage`: WebView2 دیر می‌نویسد و نصب/به‌روزرسانی ممکن است پوشهٔ
+/// `EBWebView` را پاک کند؛ آن‌وقت تیکِ «دیگر نمایش نده» گم می‌شد و پنجره
+/// دوباره مزاحم می‌شد.
+#[tauri::command]
+fn news_state(app: AppHandle) -> serde_json::Value {
+    let prefs = app
+        .path()
+        .app_local_data_dir()
+        .ok()
+        .map(|dir| store::PrefsStore::new(&dir));
+    let read = |key: &str| prefs.as_ref().and_then(|p| p.get_string(key));
+    serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "lastLaunched": read(NEWS_LAST_LAUNCHED_KEY),
+        "suppressed": read(NEWS_SUPPRESSED_KEY),
+    })
+}
+
+/// اجرای این نسخه را ثبت می‌کند و اگر `suppress` باشد، پنجره را فقط برای
+/// **همین** نسخه ساکت می‌کند (آپدیتِ بعدی دوباره نشانش می‌دهد).
+#[tauri::command]
+fn news_mark(app: AppHandle, suppress: bool) -> Result<(), String> {
+    let dir = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let prefs = store::PrefsStore::new(&dir);
+    let version = env!("CARGO_PKG_VERSION");
+    prefs
+        .set_string(NEWS_LAST_LAUNCHED_KEY, version)
+        .map_err(|e| e.to_string())?;
+    if suppress {
+        prefs
+            .set_string(NEWS_SUPPRESSED_KEY, version)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+// <<< AETHER-APP-PATCH whats-new
+
 /// وضعیت دیدنیِ لایهٔ هوش مصنوعی. همگام و ارزان — هیچ I/O شبکه‌ای.
 #[tauri::command]
 fn ai_snapshot(app: State<'_, AppState>) -> AiSnapshot {
@@ -379,6 +471,339 @@ fn profile_copy(app: &AppHandle) -> ConnectionProfile {
     // که قفل را پیش از رفتن به شبکه رها کند.
     let profile = state.controller.lock().unwrap().profile();
     profile
+}
+
+// ===========================================================================
+//  ۱.۴.۰ — ورودِ Zero Trust پیش از اتصال، و فهرست‌های هوشمند
+// ===========================================================================
+//
+// همان قاعدهٔ فرمان‌های جمینای: کارِ شبکه با spawn_blocking، و قفلِ کنترلر
+// فقط برای برداشتنِ مسیرها و پروفایل، پیش از رفتن به شبکه.
+
+fn zt_paths(app: &AppHandle) -> (std::path::PathBuf, Vec<std::path::PathBuf>) {
+    let state: State<'_, AppState> = app.state();
+    let guard = state.controller.lock().unwrap();
+    let out = (guard.data_dir().to_path_buf(), guard.identity_dirs());
+    drop(guard);
+    out
+}
+
+fn zt_status_now(app: &AppHandle, team: &str, email: &str) -> zt_signin::Status {
+    let (data_dir, dirs) = zt_paths(app);
+    let refs: Vec<&std::path::Path> = dirs.iter().map(|d| d.as_path()).collect();
+    zt_signin::status(&data_dir, &refs, team, email)
+}
+
+/// وضعیتِ ورود برای تیم/ایمیلِ فعلیِ تنظیمات. هرگز خودِ توکن.
+#[tauri::command]
+fn zt_status(app: AppHandle) -> zt_signin::Status {
+    let p = profile_copy(&app);
+    zt_status_now(&app, &p.team, &p.access_email)
+}
+
+/// ۱.۵.۰ — خطای ساختاریافتهٔ Zero Trust، تا رابط کاربری جملهٔ دقیقِ موبایل را
+/// (به هر دو زبان) بسازد: `kind` + کدِ HTTP / جزئیاتِ شبکه / میزبانِ تیم.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ZtProblem {
+    kind: &'static str,
+    status: Option<u16>,
+    detail: Option<String>,
+    host: String,
+}
+
+impl ZtProblem {
+    fn of(failure: &zt_signin::Failure, raw_team: &str) -> Self {
+        use zt_signin::Failure as F;
+        let (kind, status, detail) = match failure {
+            F::BadTeam => ("badTeam", None, None),
+            F::BadEmail => ("badEmail", None, None),
+            F::NoEmailCode => ("noEmailCode", None, None),
+            F::Refused(code) => ("refused", Some(*code), None),
+            F::NoNonce => ("noNonce", None, None),
+            F::NoSession => ("noSession", None, None),
+            F::NoToken(code) => ("noToken", Some(*code), None),
+            F::Network(d) => ("network", None, Some(d.clone())),
+        };
+        Self::bare(kind, raw_team).with(status, detail)
+    }
+
+    fn bare(kind: &'static str, raw_team: &str) -> Self {
+        let host = zt_web::normalize_team(raw_team)
+            .map(|t| zt_web::team_host(&t))
+            .unwrap_or_else(|| raw_team.trim().to_string());
+        Self {
+            kind,
+            status: None,
+            detail: None,
+            host,
+        }
+    }
+
+    fn with(mut self, status: Option<u16>, detail: Option<String>) -> Self {
+        self.status = status;
+        self.detail = detail;
+        self
+    }
+}
+
+fn zt_thread_died(raw_team: &str) -> ZtProblem {
+    ZtProblem::bare("network", raw_team)
+        .with(None, Some("the request thread stopped unexpectedly".into()))
+}
+
+/// گام ۱: صفحهٔ ثبت‌نامِ تیم باز و کدِ ایمیلی درخواست می‌شود (شبکهٔ مستقیم).
+#[tauri::command]
+async fn zt_request_code(app: AppHandle) -> Result<zt_signin::Status, ZtProblem> {
+    let p = profile_copy(&app);
+    let (team, email) = (p.team.clone(), p.access_email.clone());
+    let session =
+        tauri::async_runtime::spawn_blocking(move || zt_signin::request_code(&team, &email))
+            .await
+            .map_err(|_| zt_thread_died(&p.team))?
+            .map_err(|f| ZtProblem::of(&f, &p.team))?;
+    *zt_signin::pending().lock() = Some(session);
+    Ok(zt_status_now(&app, &p.team, &p.access_email))
+}
+
+#[tauri::command]
+async fn zt_resend_code(app: AppHandle) -> Result<zt_signin::Status, ZtProblem> {
+    let p = profile_copy(&app);
+    let mut session = zt_signin::pending()
+        .lock()
+        .clone()
+        .ok_or_else(|| ZtProblem::of(&zt_signin::Failure::NoSession, &p.team))?;
+    let session = tauri::async_runtime::spawn_blocking(move || {
+        zt_signin::resend_code(&mut session).map(|_| session)
+    })
+    .await
+    .map_err(|_| zt_thread_died(&p.team))?
+    .map_err(|f| ZtProblem::of(&f, &p.team))?;
+    *zt_signin::pending().lock() = Some(session);
+    Ok(zt_status_now(&app, &p.team, &p.access_email))
+}
+
+/// گام ۲: کدِ ایمیل → JWT، مهرشده با DPAPI ذخیره می‌شود.
+///
+/// مثل `store()` در دیالوگِ موبایل: توکنی که همین حالا منقضی است ذخیره نمی‌شود
+/// (`expiredOnArrival` — ساعتِ ویندوز را بررسی کنید)، و ذخیره فقط وقتی موفق
+/// حساب می‌شود که خواندنِ دوباره همان توکن را برگرداند (`storeFailed`).
+#[tauri::command]
+async fn zt_submit_code(app: AppHandle, code: String) -> Result<zt_signin::Status, ZtProblem> {
+    let p = profile_copy(&app);
+    let mut session = zt_signin::pending()
+        .lock()
+        .clone()
+        .ok_or_else(|| ZtProblem::of(&zt_signin::Failure::NoSession, &p.team))?;
+    let (outcome, session) = tauri::async_runtime::spawn_blocking(move || {
+        let r = zt_signin::submit_code(&mut session, &code);
+        (r, session)
+    })
+    .await
+    .map_err(|_| zt_thread_died(&p.team))?;
+    match outcome.map_err(|f| ZtProblem::of(&f, &p.team))? {
+        zt_signin::CodeOutcome::Token(token) => {
+            let now = zt_signin::now_secs();
+            if !matches!(zt_web::inspect(&token, now), zt_web::Verdict::Usable(_)) {
+                *zt_signin::pending().lock() = Some(session);
+                return Err(ZtProblem::bare("expiredOnArrival", &p.team));
+            }
+            let (data_dir, _) = zt_paths(&app);
+            let record = zt_signin::Record::of(&session.team, &session.email, &token, now)
+                .ok_or_else(|| ZtProblem::of(&zt_signin::Failure::BadTeam, &p.team))?;
+            zt_signin::save_record(&data_dir, Some(&record));
+            *zt_signin::pending().lock() = None;
+            if zt_signin::load_record(&data_dir).as_ref() != Some(&record) {
+                return Err(ZtProblem::bare("storeFailed", &p.team));
+            }
+            Ok(zt_status_now(&app, &p.team, &p.access_email))
+        }
+        zt_signin::CodeOutcome::Rejected(code) => {
+            // نشست می‌ماند تا کاربر کد را دوباره وارد کند یا کدِ تازه بخواهد.
+            *zt_signin::pending().lock() = Some(session);
+            Err(ZtProblem::bare("rejected", &p.team).with(Some(code), None))
+        }
+    }
+}
+
+/// ۱.۵.۰ — عضویتِ همین دستگاه، جدا از هر ورودِ ذخیره‌شده (`TeamMembership.isEnrolled`).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ZtMembership {
+    /// نامِ نرمال‌شدهٔ تیم، یا `None` وقتی نامِ بالا معتبر نیست.
+    team: Option<String>,
+    enrolled: bool,
+    /// اتصال خاموش است و می‌شود وارد شد یا عضویت را تغییر داد.
+    editable: bool,
+    /// روشِ ورود: "EMAIL" | "SERVICE_TOKEN" | "TOKEN"
+    mode: String,
+    /// برای «آزمایش توکن سرویس»: شناسه و رازِ کلاینت هر دو هست؟
+    service_complete: bool,
+}
+
+fn zt_editable(app: &AppHandle) -> bool {
+    !connection_state(app).is_active()
+}
+
+// ===========================================================================
+//  ۱.۵.۰ — رمزِ اختیاریِ اشتراک LAN (مهرشده با DPAPI)
+// ===========================================================================
+
+#[tauri::command]
+fn share_info(app: AppHandle) -> share::ShareCredentials {
+    let (data_dir, _) = zt_paths(&app);
+    share::load_credentials(&data_dir)
+}
+
+#[tauri::command]
+fn share_set_auth(app: AppHandle, required: bool) -> Result<share::ShareCredentials, String> {
+    let (data_dir, _) = zt_paths(&app);
+    share::set_auth_required(&data_dir, required).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn share_set_credentials(
+    app: AppHandle,
+    user: String,
+    password: String,
+) -> Result<share::ShareCredentials, String> {
+    let (data_dir, _) = zt_paths(&app);
+    share::set_credentials(&data_dir, &user, &password)
+}
+
+#[tauri::command]
+fn share_rotate_password(app: AppHandle) -> Result<share::ShareCredentials, String> {
+    let (data_dir, _) = zt_paths(&app);
+    share::rotate_password(&data_dir).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn zt_membership(app: AppHandle) -> ZtMembership {
+    let p = profile_copy(&app);
+    let team = zt_web::normalize_team(&p.team);
+    let (_, dirs) = zt_paths(&app);
+    let refs: Vec<&std::path::Path> = dirs.iter().map(|d| d.as_path()).collect();
+    let enrolled = team
+        .as_deref()
+        .is_some_and(|t| zt_signin::is_enrolled(&refs, t));
+    let mode = serde_json::to_value(p.access_mode)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default();
+    ZtMembership {
+        team,
+        enrolled,
+        editable: zt_editable(&app),
+        mode,
+        service_complete: !p.access_id.trim().is_empty() && !p.access_secret.trim().is_empty(),
+    }
+}
+
+/// «حذف عضویت این دستگاه» — فقط برای همین تیم، و هرگز وقتی تونل روشن است.
+#[tauri::command]
+fn zt_forget_membership(app: AppHandle) -> Result<usize, ZtProblem> {
+    let p = profile_copy(&app);
+    if !zt_editable(&app) {
+        return Err(ZtProblem::bare("busy", &p.team));
+    }
+    let team = zt_web::normalize_team(&p.team)
+        .ok_or_else(|| ZtProblem::of(&zt_signin::Failure::BadTeam, &p.team))?;
+    let (_, dirs) = zt_paths(&app);
+    let refs: Vec<&std::path::Path> = dirs.iter().map(|d| d.as_path()).collect();
+    Ok(zt_signin::forget_membership(&refs, &team))
+}
+
+/// «آزمایش توکن سرویس» — همان مبادلهٔ موتور؛ چیزی ذخیره نمی‌شود.
+#[tauri::command]
+async fn zt_test_service_token(app: AppHandle) -> Result<(), ZtProblem> {
+    let p = profile_copy(&app);
+    let (team, id, secret) = (p.team.clone(), p.access_id.clone(), p.access_secret.clone());
+    tauri::async_runtime::spawn_blocking(move || zt_signin::test_service_token(&team, &id, &secret))
+        .await
+        .map_err(|_| zt_thread_died(&p.team))?
+        .map_err(|f| ZtProblem::of(&f, &p.team))
+}
+
+/// ۱.۵.۰ — بررسیِ توکنِ عضویت هنگامِ چسباندن (`AccessToken.inspect`):
+/// توکن است یا نه، و تا کی معتبر است. امضا بررسی نمی‌شود و نمی‌تواند بشود.
+/// `raw` خالی یعنی «توکنِ ذخیره‌شده در حافظه» — خودِ توکن هرگز برنمی‌گردد.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TokenCheck {
+    /// "empty" | "malformed" | "expired" | "usable"
+    verdict: &'static str,
+    seconds_left: Option<i64>,
+}
+
+#[tauri::command]
+fn zt_inspect_token(app: AppHandle, raw: Option<String>) -> TokenCheck {
+    let typed = raw.unwrap_or_default();
+    let token = if typed.trim().is_empty() {
+        profile_copy(&app).access_token
+    } else {
+        typed
+    };
+    let now = zt_signin::now_secs();
+    let verdict = match zt_web::inspect(&token, now) {
+        zt_web::Verdict::Empty => "empty",
+        zt_web::Verdict::Malformed => "malformed",
+        zt_web::Verdict::Expired => "expired",
+        zt_web::Verdict::Usable(_) => "usable",
+    };
+    TokenCheck {
+        verdict,
+        seconds_left: (verdict == "usable")
+            .then(|| zt_web::expiry_seconds(token.trim()).map(|exp| exp - now))
+            .flatten(),
+    }
+}
+
+/// کدِ ورودی که هسته وسطِ اتصال خواست (`LoginCodePrompt.submit`).
+#[tauri::command]
+fn zt_login_code_submit(code: String) -> bool {
+    login_code::submit(&code)
+}
+
+/// «حالا نه» — اتصال همین حالا متوقف می‌شود.
+#[tauri::command]
+fn zt_login_code_dismiss() {
+    login_code::dismiss();
+}
+
+/// ورودِ ذخیره‌شده و نشستِ نیمه‌کاره فراموش می‌شوند.
+#[tauri::command]
+fn zt_forget(app: AppHandle) -> zt_signin::Status {
+    let (data_dir, _) = zt_paths(&app);
+    zt_signin::save_record(&data_dir, None);
+    *zt_signin::pending().lock() = None;
+    let p = profile_copy(&app);
+    zt_status_now(&app, &p.team, &p.access_email)
+}
+
+/// نشستِ نیمه‌کارهٔ «کد فرستاده شد» کنار گذاشته می‌شود؛ ورودِ ذخیره‌شده دست نمی‌خورد.
+/// (دکمهٔ «انصراف» پنل — `zt_forget` آن را هم پاک می‌کرد.)
+#[tauri::command]
+fn zt_cancel(app: AppHandle) -> zt_signin::Status {
+    *zt_signin::pending().lock() = None;
+    let p = profile_copy(&app);
+    zt_status_now(&app, &p.team, &p.access_email)
+}
+
+/// شمارِ ورودی‌های فهرست‌های داخلی، برای زیرنویسِ دو کلید در تنظیمات.
+#[tauri::command]
+fn smart_list_counts(app: AppHandle) -> smart_lists::ListCounts {
+    let (data_dir, _) = zt_paths(&app);
+    smart_lists::counts(&data_dir)
+}
+
+/// وضعیتِ زندهٔ اتصال برای پرامپتِ چت (۱.۴.۰-r4).
+///
+/// از همان آخرین snapshotی خوانده می‌شود که رابط کاربری می‌بیند، پس مدل و کاربر
+/// یک وضعیت را می‌بینند. ارزان است: یک قفلِ کوتاه و یک کپیِ `Copy`.
+fn connection_state(app: &AppHandle) -> state::ConnectionState {
+    let state: State<'_, AppState> = app.state();
+    let current = state.latest.lock().as_ref().state;
+    current
 }
 
 fn ai_handle(app: &AppHandle) -> Arc<AiSession> {
@@ -495,10 +920,11 @@ async fn ai_explain(
 async fn ai_send_chat(app: AppHandle, lang: String, text: String) -> Result<(), String> {
     let session = ai_handle(&app);
     let profile = profile_copy(&app);
+    let status = connection_state(&app);
     let prompt = session.append_user_message(&text)?;
     publish_ai(&app);
     let handle = tauri::async_runtime::spawn_blocking(move || {
-        session.ask_existing(&profile, &lang, &prompt)
+        session.ask_existing(&profile, status, &lang, &prompt)
     });
     let result = handle
         .await
@@ -516,10 +942,11 @@ async fn ai_send_chat(app: AppHandle, lang: String, text: String) -> Result<(), 
 async fn ai_retry(app: AppHandle, lang: String, id: u64) -> Result<(), String> {
     let session = ai_handle(&app);
     let profile = profile_copy(&app);
+    let status = connection_state(&app);
     let prompt = session.take_failed_prompt(id)?;
     publish_ai(&app);
     let handle = tauri::async_runtime::spawn_blocking(move || {
-        session.ask_existing(&profile, &lang, &prompt)
+        session.ask_existing(&profile, status, &lang, &prompt)
     });
     let result = handle
         .await
@@ -538,9 +965,10 @@ async fn ai_edit_message(
 ) -> Result<(), String> {
     let session = ai_handle(&app);
     let profile = profile_copy(&app);
+    let status = connection_state(&app);
     let echo = app.clone();
     let handle = tauri::async_runtime::spawn_blocking(move || {
-        session.edit_message(&profile, &lang, id, &text)
+        session.edit_message(&profile, status, &lang, id, &text)
     });
     publish_ai(&echo);
     let result = handle
@@ -773,6 +1201,9 @@ fn main() {
             let data_dir = app.path().app_local_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
             log::DiagnosticsLog::init(&data_dir);
+            // AETHER-APP-PATCH custom-configs: انبارِ مهرشدهٔ کانفیگ‌ها، پیش از
+            // کنترلر (اتصالِ اول ممکن است همان لحظه آن را بخواهد).
+            custom::store::init(&data_dir);
 
             let controller = AetherController::new(&data_dir);
             let first = controller.snapshot();
@@ -783,6 +1214,8 @@ fn main() {
             // جهشِ اندازه ببیند.
             if let Some(win) = app.get_webview_window("main") {
                 restore_window_geometry(&win, &prefs);
+                // رها کردنِ فایلِ کانفیگ از Explorer روی پنجرهٔ ارتقایافته — filedrop.rs.
+                filedrop::install(&win);
                 let prefs_for_events = prefs.clone();
                 let watched = win.clone();
                 win.on_window_event(move |event| match event {
@@ -819,6 +1252,13 @@ fn main() {
             std::thread::spawn(move || {
                 let mut last: Option<Arc<Snapshot>> = None;
                 let mut last_emit_at: Option<Instant> = None;
+                // >>> AETHER-APP-PATCH ai-gate-follows-tunnel (1.3.0)
+                // دروازهٔ هوش مصنوعی به حالت اتصال وابسته است ولی `aether://ai`
+                // فقط بعد از کارهای دستیار منتشر می‌شد؛ پس بعد از وصل‌شدن، چت
+                // همچنان «تونل وصل نیست» می‌گفت. با هر تغییر *حالت* یک انتشار
+                // تازه — روی رشتهٔ جدا، تا قفلِ کنترلر هرگز این تیک را نگه ندارد.
+                let mut last_gate_state: Option<state::ConnectionState> = None;
+                // <<< AETHER-APP-PATCH ai-gate-follows-tunnel
                 loop {
                     let began = Instant::now();
                     let st: State<'_, AppState> = handle.state();
@@ -835,7 +1275,15 @@ fn main() {
                         }
                     };
                     if let Some(snapshot) = snapshot {
+                        let current_state = snapshot.state;
                         publish(&handle, &st, snapshot, &mut last, &mut last_emit_at);
+                        // >>> AETHER-APP-PATCH ai-gate-follows-tunnel
+                        if last_gate_state != Some(current_state) {
+                            last_gate_state = Some(current_state);
+                            let ai_handle = handle.clone();
+                            std::thread::spawn(move || publish_ai(&ai_handle));
+                        }
+                        // <<< AETHER-APP-PATCH ai-gate-follows-tunnel
                     }
                     // Sleep the REMAINDER of the beat. A tick that took 900ms must
                     // not then wait another 200ms before the next one.
@@ -846,6 +1294,24 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            custom_commands::cc_state,
+            custom_commands::cc_import_text,
+            custom_commands::cc_import_file,
+            custom_commands::cc_import_path,
+            custom_commands::cc_select,
+            custom_commands::cc_set_mode,
+            custom_commands::cc_set_enabled,
+            custom_commands::cc_rename,
+            custom_commands::cc_get_raw,
+            custom_commands::cc_edit,
+            custom_commands::cc_delete,
+            custom_commands::cc_delete_all,
+            custom_commands::cc_ping,
+            custom_commands::cc_ping_all,
+            share_info,
+            share_set_auth,
+            share_set_credentials,
+            share_rotate_password,
             get_snapshot,
             get_profile,
             set_profile,
@@ -861,6 +1327,10 @@ fn main() {
             about_info,
             core_caps,
             ai_snapshot,
+            get_ui_lang,
+            set_ui_lang,
+            news_state,
+            news_mark,
             ai_set_key,
             ai_test_key,
             ai_select_model,
@@ -876,6 +1346,19 @@ fn main() {
             ai_clear_chat,
             ai_dismiss_error,
             ai_dismiss_advisor,
+            zt_status,
+            zt_request_code,
+            zt_resend_code,
+            zt_submit_code,
+            zt_forget,
+            zt_cancel,
+            zt_membership,
+            zt_forget_membership,
+            zt_test_service_token,
+            zt_inspect_token,
+            zt_login_code_submit,
+            zt_login_code_dismiss,
+            smart_list_counts,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Aether");

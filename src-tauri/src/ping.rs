@@ -21,9 +21,9 @@
 //!    the failure it reports is worse than no diagnostic.
 //!
 //! 3. **It probed a fresh dial on port 80 and every refusal was scored against
-//!    the exit.** `psiphon_health` counts refused destinations as evidence of
-//!    filtering, so the app's own probe helped convict a working server and
-//!    trigger a rotation that killed every live flow.
+//!    the exit.** The old desktop Psiphon scorer treated refusals as evidence
+//!    of filtering and could rotate a working server; scoring was removed
+//!    when the engine took ownership of the child.
 //!
 //! 4. **The first sample after connecting was the self-test's own HTTP fetch**,
 //!    timed during the busiest second of the session, and it then never changed
@@ -38,8 +38,8 @@
 //!   about the control path, and it is not the ping.
 //! * Port **443**, not 53 and not 80: 443 is the one port an exit cannot refuse
 //!   and still be an exit. Every target is also registered with
-//!   [`crate::psiphon_health`] as a self-probe, so a refusal can never again be
-//!   read as evidence about the server.
+//!   The desktop no longer scores Psiphon servers; that lifecycle belongs
+//!   to the engine's child supervisor.
 //! * The **first** round trip on a freshly dialled session is not a ping either
 //!   (it rides a connection whose own handshake just queued behind everything
 //!   the tunnel was carrying), so a re-warm takes a confirming sample and
@@ -84,16 +84,18 @@ pub struct Target {
     pub port: u16,
     /// Wrap the SOCKS5 stream in TLS before speaking HTTP.
     tls: bool,
-    /// Verify the certificate against the host *name*.
+    /// The name the TLS certificate is verified against (and sent as SNI and
+    /// `Host`). Always fully verified — chain **and** host name.
     ///
-    /// False for the IP-literal targets. Cloudflare, Google and Quad9 all carry
-    /// their resolver IP in the certificate SAN, but Windows SChannel will not
-    /// put an IP literal in SNI, so name verification is not a check that can
-    /// succeed here. The certificate **chain** is still verified either way, and
-    /// this connection carries nothing but a bodyless `HEAD` — it is a stopwatch,
-    /// not a data path. The named target below keeps full verification and is
-    /// tried before anything is given up on.
-    strict_hostname: bool,
+    /// 1.3.0 security fix: the IP-literal targets used to set
+    /// the native-tls "accept invalid host names" switch, because SChannel will not put an IP
+    /// literal in SNI. That accepted *any* valid certificate for *any* name, so
+    /// whoever sat on the path could answer the probe. The resolvers' own
+    /// certificates carry their service names (`one.one.one.one`, `dns.google`,
+    /// `dns.quad9.net`), so the TCP dial still goes to the same IP literal (no
+    /// DNS lookup, the same anycast path as before) and the handshake verifies
+    /// that name in full.
+    tls_name: &'static str,
 }
 
 /// Probe destinations, in the order they are tried.
@@ -108,31 +110,31 @@ pub const TARGETS: [Target; 5] = [
         host: "1.1.1.1",
         port: 443,
         tls: true,
-        strict_hostname: false,
+        tls_name: "one.one.one.one",
     },
     Target {
         host: "8.8.8.8",
         port: 443,
         tls: true,
-        strict_hostname: false,
+        tls_name: "dns.google",
     },
     Target {
         host: "9.9.9.9",
         port: 443,
         tls: true,
-        strict_hostname: false,
+        tls_name: "dns.quad9.net",
     },
     Target {
         host: "www.cloudflare.com",
         port: 443,
         tls: true,
-        strict_hostname: true,
+        tls_name: "www.cloudflare.com",
     },
     Target {
         host: "1.1.1.1",
         port: 80,
         tls: false,
-        strict_hostname: false,
+        tls_name: "",
     },
 ];
 
@@ -150,6 +152,8 @@ impl<T: Read + Write + Send> Io for T {}
 struct Warm {
     io: Box<dyn Io>,
     host: &'static str,
+    /// `Host:` header — the verified TLS name, or the address for plain HTTP.
+    name: &'static str,
     port: u16,
 }
 
@@ -216,12 +220,9 @@ fn open_warm(target: &Target) -> Option<Warm> {
     plain.set_write_timeout(Some(TIMEOUT)).ok()?;
 
     let io: Box<dyn Io> = if target.tls {
-        let mut builder = native_tls::TlsConnector::builder();
-        if !target.strict_hostname {
-            builder.danger_accept_invalid_hostnames(true);
-        }
-        let connector = builder.build().ok()?;
-        Box::new(connector.connect(target.host, plain).ok()?)
+        // Full verification: no `danger_*` switch anywhere in this module.
+        let connector = native_tls::TlsConnector::builder().build().ok()?;
+        Box::new(connector.connect(target.tls_name, plain).ok()?)
     } else {
         Box::new(plain)
     };
@@ -230,6 +231,7 @@ fn open_warm(target: &Target) -> Option<Warm> {
     Some(Warm {
         io,
         host: target.host,
+        name: if target.tls { target.tls_name } else { target.host },
         port: target.port,
     })
 }
@@ -245,7 +247,7 @@ fn open_warm(target: &Target) -> Option<Warm> {
 fn round_trip(w: &mut Warm) -> Option<u64> {
     let request = format!(
         "HEAD / HTTP/1.1\r\nHost: {}\r\nUser-Agent: aether-ping\r\nAccept: */*\r\nConnection: keep-alive\r\n\r\n",
-        w.host
+        w.name
     );
     w.io.write_all(request.as_bytes()).ok()?;
     w.io.flush().ok()?;
@@ -466,14 +468,17 @@ mod tests {
         assert_eq!(probe_targets().count(), TARGETS.len());
     }
 
-    /// Only the named target may rely on host-name verification; the IP literals
-    /// cannot, because SChannel will not put an address in SNI.
+    /// 1.3.0: every TLS target verifies a real host name — no IP literal is
+    /// ever handed to the verifier, and no target may skip verification.
     #[test]
-    fn only_the_named_target_verifies_the_hostname() {
-        for t in TARGETS.iter().filter(|t| t.strict_hostname) {
-            assert!(t.host.contains('.'));
-            assert!(t.host.parse::<std::net::Ipv4Addr>().is_err());
+    fn every_tls_target_verifies_a_host_name() {
+        for t in TARGETS.iter().filter(|t| t.tls) {
+            assert!(t.tls_name.contains('.'), "{}", t.host);
+            assert!(t.tls_name.parse::<std::net::IpAddr>().is_err(), "{}", t.host);
         }
+        let src = include_str!("ping.rs");
+        let needle = ["danger", "_accept_invalid"].concat();
+        assert!(!src.contains(&needle));
     }
 
     #[test]

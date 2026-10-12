@@ -247,8 +247,8 @@ mutate <<'EOF'
 from pathlib import Path
 p = Path("src-tauri/src/diagnostics.rs"); s = b = p.read_text(encoding="utf-8")
 s = s.replace(
-    "    if !STAGE_ONE_TARGETS\n        .iter()\n        .any(|(host, dest)| probe::tcp_via_proxy_on(port, host, *dest))\n    {",
-    '    if !probe::tcp_via_proxy_on(port, "1.1.1.1", 80) {',
+    "            if probe::tcp_via_proxy_on(port, host, *dest) {",
+    '            if probe::tcp_via_proxy_on(port, "1.1.1.1", 80) {',
     1,
 )
 assert s != b, "جهش نگرفت"

@@ -1,11 +1,25 @@
 #!/usr/bin/env bash
 # بازرسی روی خودِ ZIP، از حالت استخراج‌شده — نه روی پوشهٔ کاری.
 # چیزی که تحویل می‌شود همین است، پس همین سنجیده می‌شود.
+#
+# استفاده:  bash scripts/verify-package.sh [path/to/Aether_Windows_V1.3.0.zip]
+#   مسیرِ ZIP از آرگومانِ اول یا متغیرِ AETHER_ZIP می‌آید (پیش‌فرض:
+#   dist/Aether_Windows_V1.3.0.zip کنارِ ریشهٔ مخزن). پوشهٔ بالاییِ ZIP خودکار
+#   پیدا می‌شود؛ هیچ مسیرِ ثابتی از محیطِ دیگری فرض نمی‌شود.
 set -u
-V=/tmp/verify
+EXPECT_VERSION="1.3.0"
+EXPECT_CORE="2.3.0"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ZIP="${1:-${AETHER_ZIP:-$REPO_ROOT/dist/Aether_Windows_V${EXPECT_VERSION}.zip}}"
+[ -f "$ZIP" ] || { echo "✗ ZIP پیدا نشد: $ZIP"; exit 1; }
+ZIP="$(cd "$(dirname "$ZIP")" && pwd)/$(basename "$ZIP")"
+V="${VERIFY_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/aether-verify.XXXXXX")}"
 rm -rf "$V" && mkdir -p "$V"
-unzip -q /mnt/user-data/outputs/AetherDesktop-1.2.5.zip -d "$V"
-cd "$V/Aether_Desktop-main" || exit 1
+unzip -q "$ZIP" -d "$V" || { echo "✗ ZIP باز نشد: $ZIP"; exit 1; }
+TOP=$(find "$V" -mindepth 1 -maxdepth 2 -name package.json -path '*/package.json' | head -1)
+[ -n "$TOP" ] || { echo "✗ package.json در ZIP نیست"; exit 1; }
+cd "$(dirname "$TOP")" || exit 1
+echo "ZIP: $ZIP"
 fail=0
 ok()   { echo "  ✓ $1"; }
 bad()  { echo "  ✗ $1"; fail=1; }
@@ -17,13 +31,13 @@ fnbody() { sed -n "/$2/,/^}/p" "$1"; }
 echo "── نسخه"
 for f in package.json src-tauri/tauri.conf.json; do
   v=$(python3 -c "import json;print(json.load(open('$f'))['version'])")
-  [ "$v" = "1.2.5" ] && ok "$f = $v" || bad "$f = $v"
+  [ "$v" = "$EXPECT_VERSION" ] && ok "$f = $v" || bad "$f = $v"
 done
-v=$(grep -m1 '^version' src-tauri/Cargo.toml | cut -d'"' -f2); [ "$v" = "1.2.5" ] && ok "Cargo.toml = $v" || bad "Cargo.toml = $v"
-v=$(grep -m1 'define MyAppVersion' installer/aether.iss | cut -d'"' -f2); [ "$v" = "1.2.5" ] && ok "installer = $v" || bad "installer = $v"
-v=$(grep -oE 'assemblyIdentity version="[0-9.]+"' src-tauri/windows-manifest.xml | head -1 | cut -d'"' -f2); [ "$v" = "1.2.5.0" ] && ok "manifest = $v" || bad "manifest = $v"
-v=$(sed -n '/name = "aether-desktop"/,+1p' src-tauri/Cargo.lock | grep -m1 '^version' | cut -d'"' -f2); [ "$v" = "1.2.5" ] && ok "Cargo.lock = $v" || bad "Cargo.lock = $v"
-[ "$(cat CORE_VERSION)" = "2.0.0" ] && ok "CORE_VERSION = 2.0.0" || bad "CORE_VERSION = $(cat CORE_VERSION)"
+v=$(grep -m1 '^version' src-tauri/Cargo.toml | cut -d'"' -f2); [ "$v" = "$EXPECT_VERSION" ] && ok "Cargo.toml = $v" || bad "Cargo.toml = $v"
+v=$(grep -m1 'define MyAppVersion' installer/aether.iss | cut -d'"' -f2); [ "$v" = "$EXPECT_VERSION" ] && ok "installer = $v" || bad "installer = $v"
+v=$(grep -oE 'assemblyIdentity version="[0-9.]+"' src-tauri/windows-manifest.xml | head -1 | cut -d'"' -f2); [ "$v" = "$EXPECT_VERSION.0" ] && ok "manifest = $v" || bad "manifest = $v"
+v=$(sed -n '/name = "aether-desktop"/,+1p' src-tauri/Cargo.lock | grep -m1 '^version' | cut -d'"' -f2); [ "$v" = "$EXPECT_VERSION" ] && ok "Cargo.lock = $v" || bad "Cargo.lock = $v"
+[ "$(tr -d '\r\n' < CORE_VERSION)" = "$EXPECT_CORE" ] && ok "CORE_VERSION = $EXPECT_CORE" || bad "CORE_VERSION = $(cat CORE_VERSION)"
 
 echo "── مورد ۱: تور روی فلگ‌های خودِ هسته می‌نشیند"
 have src-tauri/src/profile.rs 'pub enum TorMode' 'profile: TorMode هست'
@@ -168,124 +182,24 @@ sys.exit(0 if (read != -1 and write != -1 and read < write) else 1)
 PY
 then ok "saveProfile اول می‌خواند بعد می‌نویسد"; else bad "saveProfile روی کپیِ محلی می‌نویسد"; fi
 
-echo "── ردمی‌ها: فقط تازه‌های ۱.۲.۵، بی‌تاریخِ آزمون‌وخطا"
-for f in README.md README.fa.md .github/release-notes.md UPGRADE-1.2.5.md; do
+echo "── اسناد ۱.۳.۰ (هستهٔ دست‌نخوردهٔ 2.3.0)"
+for f in README.md README.fa.md release-notes.md .github/release-notes.md; do
   if grep -qiE 'اصلاحیهٔ p[0-9]|correction p[0-9]|چرا بیلد قبلی سبز نشد' "$f"; then
     bad "$f: رد پای اصلاحیه‌های ما"
   else
     ok "$f: پاک"
   fi
+  have "$f" 'Aether Core 2.3.0' "$f: هستهٔ 2.3.0 را معرفی می‌کند"
 done
-have README.md 'Tor, ported from Aether Mobile 1.3.0' 'README.md: تور نوشته شده'
-have README.md 'Bridges, only where they mean something' 'README.md: دامنهٔ پل نوشته شده'
-have README.fa.md 'پرسشِ بی‌رمزِ کشورِ خروج' 'README.fa.md: اصلاحِ A14 در ممیزی نوشته شده'
-have README.md 'cleartext exit-country lookup' 'README.md: اصلاحِ A14 در ممیزی نوشته شده'
-# جدولِ نمرهٔ ۰–۱۰۰ داخلِ همان زیربخشِ ممیزی است، نه زیربخشِ سوم — و باید در هر
-# سه سند بماند، وگرنه ادعای «ممیزیِ کامل» بی‌پشتوانه می‌شود.
-have README.md 'Overall audit score: 83 / 100' 'README.md: جدولِ نمرهٔ ممیزی هست'
-have README.fa.md 'نمرهٔ کلیِ ممیزی: ۸۳ از ۱۰۰' 'README.fa.md: جدولِ نمرهٔ ممیزی هست'
-have .github/release-notes.md 'Overall audit score: 83 / 100' 'release-notes: جدولِ نمرهٔ ممیزی (انگلیسی)'
-have .github/release-notes.md 'نمرهٔ کلیِ ممیزی: ۸۳ از ۱۰۰' 'release-notes: جدولِ نمرهٔ ممیزی (فارسی)'
-# و هیچ ردمی‌ای نباید روایتِ اشکالِ رفع‌شده داشته باشد؛ فقط امکانات و ممیزی.
-for f in README.md README.fa.md .github/release-notes.md; do
-  if grep -qF 'kept showing the old value' "$f" || grep -qF 'used to run before the network was ready' "$f" \
-     || grep -qF 'پیش از موعد شکست نمی‌خورد' "$f"; then
-    bad "$f: روایتِ اشکالِ رفع‌شده هنوز هست"
-  else
-    ok "$f: فقط زبانِ امکانات"
-  fi
-done
-have .github/release-notes.md 'تازه‌های نسخهٔ ۱.۲.۵' 'release-notes: بخشِ فارسی هست'
-# قاعدهٔ متنِ انتشار: بخشِ این نسخه فقط دو زیربخش دارد — «امکانات جدید» و
-# «خلاصهٔ ممیزی امنیتی». نه شمارشِ آزمون، نه روایتِ اینکه کار چطور پیش رفت.
-# سنجه هم وجودِ آن دو را می‌خواهد و هم غیابِ بقیه، وگرنه متن بی‌صدا برمی‌گردد.
-if python3 - <<'PY'
-import re, sys
-
-def section(path, start, end=None):
-    s = open(path, encoding='utf-8').read()
-    i = s.index(start)
-    j = s.index(end, i + len(start)) if end else len(s)
-    return s[i:j]
-
-problems = []
-BANNED = [
-    'How this release was verified', 'How this was verified', 'چگونه سنجیده شد',
-    'unit tests, 0 failures', 'آزمون واحد،', 'jsdom assertions', 'سنجهٔ jsdom',
-    'was **not** verified', 'سنجیده **نشد**', 'the worst kind of failure',
-    'did bake it in', 'silent traps', 'تلهٔ خاموش', 'بدترین شکلِ شکست',
-]
-targets = [
-    ('README.md', "## What's new in 1.2.5", '<details>',
-     ['### New in this release', '### Security audit summary']),
-    ('README.fa.md', '## تازه‌های نسخهٔ ۱.۲.۵', '## تازه‌های نسخهٔ ۱.۲.۴',
-     ['### امکانات جدید', '### خلاصهٔ ممیزی امنیتی']),
-    ('.github/release-notes.md', '# Aether Desktop 1.2.5', None,
-     ['### New in this release', '### Security audit summary',
-      '### امکانات جدید', '### خلاصهٔ ممیزی امنیتی']),
-]
-for path, start, end, required in targets:
-    body = section(path, start, end)
-    for want in required:
-        if want not in body:
-            problems.append(f'{path}: زیربخشِ «{want}» نیست')
-    for bad_text in BANNED:
-        if bad_text in body:
-            problems.append(f'{path}: «{bad_text}» هنوز هست')
-    # هیچ زیربخشِ سومی نباید باشد.
-    heads = [h for h in re.findall(r'^### .+$', body, re.M)]
-    extra = [h for h in heads if h.strip() not in required]
-    if extra:
-        problems.append(f'{path}: زیربخشِ اضافه — {extra[0].strip()}')
-for x in problems:
-    print('    ' + x)
-sys.exit(1 if problems else 0)
-PY
-then ok "ردمی‌ها و release-notes: فقط «امکانات جدید» + «ممیزی امنیتی»"
-else bad "ردمی‌ها/release-notes: ساختارِ متن همان نیست که خواسته شد"; fi
-# و ادعایی که با گیتِ تازهٔ CI نادرست شد نباید هیچ‌جای اسناد بمانَد.
-if grep -rqF 'No path through that step can hold a release' --include='*.md' . 2>/dev/null \
-   || grep -rqF 'انتشار را نمی‌کشد' --include='*.md' . 2>/dev/null; then
-  bad "اسناد: ادعای «هیچ مسیری انتشار را نمی‌کشد» با گیتِ ترابر نمی‌خوانَد"
-else
-  ok "اسناد: ادعای کهنه دربارهٔ lyrebird اصلاح شده"
-fi
-# و قابلیت‌های تازهٔ همین دور باید در متنِ کاربر نوشته شده باشند.
-have README.md 'a published build cannot go out without it' 'README.md: گیتِ ترابر نوشته شده'
-have README.md 'names the cause that fits that attempt' 'README.md: پیامِ علت‌محور نوشته شده'
-have README.md 'gives up on a budget instead of retrying forever' 'README.md: بودجهٔ تلاش نوشته شده'
-have README.fa.md 'بستهٔ منتشرشده بی آن بیرون نمی‌رود' 'README.fa.md: گیتِ ترابر نوشته شده'
-have README.fa.md 'علتی را می‌گوید که به همان تلاش می‌خورد' 'README.fa.md: پیامِ علت‌محور نوشته شده'
-have README.fa.md 'با بودجه تسلیم می‌شود' 'README.fa.md: بودجهٔ تلاش نوشته شده'
-# بخشِ نسخهٔ قبلی نباید در release-notes باشد. این سنجه با python نوشته می‌شود و
-# نه grep: locale این محیط POSIX است، پس یک کلاسِ ارقام فارسی مثل [۰-۴] روی
-# UTF-8 بی‌معنا می‌شود و «۵» را هم می‌گیرد، چون بایتِ اولش مشترک است.
-if python3 - <<'PY'
-import re, sys, unicodedata
-def older_heading(path):
-    for line in open(path, encoding='utf-8'):
-        if not re.match(r'^#{2,3} ', line):
-            continue
-        norm = ''.join(str(unicodedata.digit(c)) if c.isdigit() else c for c in line)
-        for m in re.finditer(r'(\d+)\.(\d+)\.(\d+)', norm):
-            if tuple(map(int, m.groups())) < (1, 2, 5):
-                return line.strip(), m.group(0)
-    return None
-hit = older_heading('.github/release-notes.md')
-if hit:
-    print(f'    {hit[1]} در تیترِ: {hit[0]}')
-    sys.exit(1)
-sys.exit(0)
-PY
-then
-  ok "release-notes: هیچ بخشی برای نسخه‌های قبلی ندارد"
-else
-  bad "release-notes: بخشِ نسخهٔ قبلی دارد"
-fi
-if grep -qE '^#{2,3} .*(1\.2\.[0-4])' UPGRADE-1.2.5.md; then bad "UPGRADE: بخشِ نسخهٔ قبلی"; else ok "UPGRADE-1.2.5.md: فقط همین نسخه"; fi
-# ردمیِ فارسی عمداً فقط دو نسخه را نگه می‌دارد: همین و قبلی.
-n=$(grep -cE '^## تازه‌های نسخهٔ' README.fa.md)
-[ "$n" = "2" ] && ok "README.fa.md: دو بخشِ نسخه (این و قبلی)" || bad "README.fa.md: $n بخشِ نسخه"
+have README.md "## What's new in 1.3.0" 'README.md: بخشِ ۱.۳.۰ هست'
+have README.fa.md 'تازه‌های نسخهٔ ویندوز ۱.۳.۰' 'README.fa.md: بخشِ ۱.۳.۰ هست'
+have release-notes.md '# Aether Desktop 1.3.0' 'release-notes.md: تیترِ ۱.۳.۰'
+have .github/release-notes.md '# Aether Desktop 1.3.0' '.github/release-notes.md: تیترِ ۱.۳.۰'
+have release-notes.md 'Tor → Psiphon' 'release-notes: رفعِ برچسبِ SMART نوشته شده'
+# هیچ سندی نباید نسخهٔ ۱.۲.۵ را «نسخهٔ فعلی» معرفی کند.
+if grep -qE '^# Aether Desktop 1\.2\.5' README.md release-notes.md .github/release-notes.md; then
+  bad "اسناد: تیترِ اصلی هنوز ۱.۲.۵ است"
+else ok "اسناد: تیترِ اصلی ۱.۲.۵ نیست"; fi
 
 # Neue Sonden für 1.2.5-p2 -- werden in verify-package.sh eingesetzt.
 echo "── مورد ۶ (۱.۲.۵-p2): ترابرِ تور از وجودِ فایل تشخیص داده می‌شود"
@@ -569,81 +483,28 @@ rung = min(60_000, first)
 sys.exit(0 if max(rung - reserve, floor) >= turbo else 1)
 PY
 
-echo "── مورد ۱۴ (۱.۲.۵): مهرِ ساختِ موتور، و اینکه لاگ دربارهٔ آن دروغ نگوید"
-[ "$(tr -d '\r\n' < PATCHLEVEL)" = "1.2.5" ] && ok "PATCHLEVEL = 1.2.5" || bad "PATCHLEVEL = $(cat PATCHLEVEL 2>/dev/null)"
-have native/aether/aether/build.rs 'AETHER-BUILD-STAMP:{patchlevel}' 'stamp: هسته مهر را در باینری می‌کارد'
-have native/aether/aether/build.rs 'unstamped' 'stamp: نبودِ PATCHLEVEL نسخهٔ ساختگی نمی‌سازد'
-have native/aether/aether/src/lib.rs 'env!("AETHER_BUILD_STAMP")' 'stamp: موتور مهر را چاپ می‌کند'
-have src-tauri/build.rs 'AETHER_APP_PATCHLEVEL' 'stamp: برنامه هم سطحِ پچِ خودش را می‌داند'
-have src-tauri/src/provenance.rs 'pub fn stamp_in' 'stamp: خواندنِ مهر از سطرِ موتور'
-have src-tauri/src/provenance.rs 'ENGINE/APP PATCH LEVEL MISMATCH' 'stamp: ناهم‌خوانی فریاد می‌شود'
+echo "── مورد ۱۴ (۱.۳.۰): هستهٔ دست‌نخوردهٔ Aether 2.3.0 و هویتِ موتور"
+[ "$(tr -d '\r\n' < PATCHLEVEL)" = "1.3.0" ] && ok "PATCHLEVEL = 1.3.0" || bad "PATCHLEVEL = $(cat PATCHLEVEL 2>/dev/null)"
+if python3 scripts/check-core-pristine.py >/dev/null 2>&1; then
+  ok "core: native/aether بایت‌به‌بایت همان آپ‌استریم است"
+else bad "core: native/aether با مانیفستِ آپ‌استریم نمی‌خواند"; fi
+[ -f native/aether/aether/build.rs ] && bad "core: build.rsِ اختصاصی برگشته" || ok "core: build.rsِ اختصاصی ندارد"
+[ -d native/aether/.upstream-baseline ] && bad "core: .upstream-baseline برگشته" || ok "core: بی‌.upstream-baseline"
+have src-tauri/src/provenance.rs 'fn banner_version' 'identity: نسخه از بنرِ خودِ موتور خوانده می‌شود'
 if sed -n '/fn spawn_drain/,/^}/p' src-tauri/src/engine.rs | grep -q 'provenance::ingest'; then
-  ok "stamp: خروجیِ موتور واقعاً بازرسی می‌شود"
-else bad "stamp: قلابِ ingest در spawn_drain نیست"; fi
-have src-tauri/src/state.rs 'provenance::log_app_identity' 'stamp: هویتِ برنامه در هر اتصال لاگ می‌شود'
-have src-tauri/src/diagnostics.rs 'Build identity' 'stamp: در گزارشِ محیط هم می‌آید'
-# صداقتِ فهرستِ قابلیت‌ها: اندروید device backpressure و uplink admission دارد،
-# این هسته ندارد. کپیِ آن سطر یعنی لاگی که دربارهٔ مسیرِ داده دروغ می‌گوید —
-# و کلِ هدفِ این مهر همین است که لاگ راست بگوید.
-stampline=$(sed -n '/AETHER_BUILD_STAMP/,+0p;/app patch level {}/,+0p' native/aether/aether/src/lib.rs)
-ctx=$(sed -n '/>>> AETHER-APP-PATCH build-provenance/,/<<< AETHER-APP-PATCH build-provenance/p' native/aether/aether/src/lib.rs)
-if echo "$ctx" | grep -q 'device backpressure=off' && echo "$ctx" | grep -q 'uplink admission=off'; then
-  ok "stamp: فهرستِ قابلیت‌ها راست می‌گوید (سه پچِ اندروید off اعلام شده)"
-elif echo "$ctx" | grep -q 'device backpressure=on'; then
-  bad "stamp: سطرِ مهر ادعای اندروید را کپی کرده — این هسته device backpressure ندارد"
-else
-  bad "stamp: فهرستِ قابلیت‌ها در سطرِ مهر پیدا نشد"
-fi
-# و سه گیتِ CI.
-for g in 'Engine patches must survive the core sync' \
-         'Engine must carry the app patch stamp' \
-         'A published payload must carry the stamped engine'; do
+  ok "identity: خروجیِ موتور واقعاً بازرسی می‌شود"
+else bad "identity: قلابِ ingest در spawn_drain نیست"; fi
+have src-tauri/src/state.rs 'provenance::log_app_identity' 'identity: هویتِ برنامه در هر اتصال لاگ می‌شود'
+have src-tauri/src/diagnostics.rs 'Build identity' 'identity: در گزارشِ محیط هم می‌آید'
+for g in 'Core must be the unmodified upstream source' \
+         'Engine must be the bundled core version' \
+         'A published payload must carry the bundled core version'; do
   have .github/workflows/build.yml "$g" "CI: گیتِ «$g»"
 done
-if sed -n '/Engine patches must survive/,/Upload synced core/p' .github/workflows/build.yml |
-   grep -q 'set_congestion_control(tcp::CongestionControl::Cubic)'; then
-  ok "CI: گیت رفتار را می‌سنجد، نه فقط اسمِ ناحیه را"
-else bad "CI: گیتِ پچ‌ها فقط اسم می‌شمرد"; fi
-if sed -n '/A published payload must carry/,/Build portable ZIP/p' .github/workflows/build.yml |
-   grep -q "github.event_name != 'pull_request'"; then
-  ok "CI: گیتِ payload فقط بیلدِ منتشرشدنی را می‌گیرد"
-else bad "CI: شرطِ گیتِ payload درست نیست"; fi
 
 echo "── مورد ۱۵ (۱.۲.۵): آنچه لاگ ۲۰۲۶-۰۹-۱۶ نشان داد"
-# ۱) نگهبانِ بی‌پیشرفت: پیشرفت باید درصدِ کامل باشد، نه اپسیلون. با ۱۰۰۰
-#    هر تکهٔ consensus («Partial response») تایمر را ریست می‌کرد و پله هرگز
-#    رها نمی‌شد — پنج دقیقه سکوت روی ۱۵٪.
-have native/aether/aether/src/tor.rs '* 100.0).floor()' 'tor: پیشرفت در درصدِ کامل سنجیده می‌شود'
-have native/aether/aether/src/tor.rs 'HARD_STALL_FACTOR' 'tor: سقف مطلقِ هر پله هست'
-have native/aether/aether/src/tor.rs 'saturating_mul(HARD_STALL_FACTOR)' 'tor: سقف مطلق اعمال شده'
-if grep -F '* 1000.0' native/aether/aether/src/tor.rs | grep -qv '^\s*//'; then
-  bad 'tor: سنجشِ پرومیلی برگشته است'
-else
-  ok 'tor: سنجشِ پرومیلی برنگشته'
-fi
-
-# ۲) سطرهای پلِ داخلی: lyrebird فقط front= را می‌فهمد، arti هویت می‌خواهد،
-#    و اگر همهٔ ICE روی ۳۴۷۸ باشد یک پورتِ بسته snowflake را کور می‌کند.
-if python3 scripts/check-bridge-lines.py >/dev/null 2>&1; then
-  ok 'bridges: سطرهای داخلی برای arti خوانا هستند'
-else
-  bad 'bridges: سطرهای داخلی برای arti خوانا نیستند'
-fi
-if grep -qE '^\s*"meek_lite ' native/aether/aether/src/bridges.rs; then
-  bad 'bridges: سطر meek_lite برگشته است'
-else
-  ok 'bridges: سطر meek_liteِ بی‌فینگرپرینت حذف مانده'
-fi
-
-# ۲ب) سطرهای snowflake و ترتیبِ کشور از API رسمی می‌آیند (map، ۲۰۲۶-۰۹-۱۶).
-have native/aether/aether/src/bridges.rs 'BY_COUNTRY' 'bridges: جدولِ ترتیب به تفکیک کشور هست'
-have native/aether/aether/src/bridges.rs 'front=www.phpmyadmin.net,cdn.zk.mk' 'bridges: frontِ رسمیِ snowflake'
-have native/aether/aether/src/bridges.rs 'stun:stun.m-online.net:3478' 'bridges: فهرست ICEِ رسمی'
-have native/aether/aether/src/tor.rs 'last_country()' 'tor: ترتیبِ پله‌ها کشور را می‌بیند'
-have native/aether/aether/src/tor.rs 'TorClient::with_runtime' 'tor: هر سپره رانتایمِ خودش را دارد'
-have native/aether/aether/src/tor.rs 'impl Drop for OwnRuntime' 'tor: آزادسازیِ رانتایم با Drop'
-have native/aether/aether/src/tor.rs 'tor-runtime-teardown' 'tor: آزادسازی روی thread جدا'
-have scripts/check-tor-runtime.py 'OwnRuntime' 'نگهبانِ رانتایمِ سپره هست'
+# (بررسی‌های داخلیِ arti/پل‌های هسته حذف شدند: هسته حالا دست‌نخورده است و
+#  همهٔ حالت‌های تور از tor.exe رسمی می‌گذرند.)
 have src-tauri/src/tor_native.rs 'get_info("status/bootstrap-phase"' 'tor بومی: فازِ bootstrap از پورتِ کنترل پرسیده می‌شود'
 have src-tauri/src/tor_native.rs 'fn parse_log_progress(' 'tor بومی: لاگِ خودِ تور مسیرِ دومِ پیشرفت است'
 have src-tauri/src/tor_native.rs 'fn is_timeout(' 'tor بومی: مهلتِ خواندن معنای شکست ندارد (لاگِ ۱۷ سپتامبر: os error 10060)'
@@ -651,7 +512,6 @@ have src-tauri/src/tor_native.rs 'launch.budget.unwrap_or(BOOTSTRAP_TIMEOUT)' 't
 have src-tauri/src/tor_native.rs 'fn plan_waves(' 'tor بومی: موج‌های ترابر obfs4 → snowflake'
 have src-tauri/src/tor_native.rs 'ClientTransportPlugin {methods} exec {}' 'tor بومی: مسیرِ ترابر بی‌نقل‌قول و روش‌ها از بایناریِ موجود'
 have scripts/stage-tor.ps1 'snowflake-client.exe' 'تدارک: اسنوفلیک از بستهٔ رسمی برداشته می‌شود'
-have native/aether/aether/src/lastconn.rs 'slow_rtt_ms' 'هسته: کشِ کند روی دیسک نشانه می‌گذارد'
 have src-tauri/src/main.rs 'mod tor_native;' 'ماژولِ تورِ بومی ثبت شده'
 have src-tauri/src/state.rs 'self.start_native_tor(&cand)?' 'حالتِ «تور تنها» به tor.exe رسمی وصل است'
 have src-tauri/src/state.rs 'fn carrier_alive(' 'زنده‌بودن از حامل پرسیده می‌شود، نه فقط از موتور'
@@ -668,15 +528,13 @@ if [ "$v" -ge 4 ] 2>/dev/null; then ok "store: SETTINGS_REV = $v (≥ 4)"; else 
 have src-tauri/src/state.rs 'tor.mark_starting()' 'تورِ در حالِ انلاق زنده حساب می‌شود'
 have src-tauri/src/diagnostics.rs 'udp_open_by_design' 'داوریِ نشتی دامنهٔ بلوکِ UDP را می‌خواند'
 have src-tauri/src/leakguard.rs 'fn restore_policies(' 'بازگردانیِ سیاست‌ها موازی است'
-if fnbody src-tauri/src/store.rs 'fn migrate' | grep -qF 'TransportBackend::Aether'; then
-  ok 'store: مهاجرت بک‌اند را به Aether برمی‌گرداند'
+# ۱.۳.۰: انتخابِ ذخیره‌شدهٔ کاربر دیگر در مهاجرت ریست نمی‌شود.
+if fnbody src-tauri/src/store.rs 'fn migrate' | grep -qF 'TransportBackend::'; then
+  bad 'store: مهاجرت بک‌اندِ ذخیره‌شدهٔ کاربر را عوض می‌کند'
 else
-  bad 'store: مهاجرتِ بک‌اند در migrate نیست'
+  ok 'store: مهاجرت بک‌اندِ ذخیره‌شدهٔ کاربر را دست نمی‌زند'
 fi
 
-# ۴) و هر سه در CI گیت شده‌اند.
-have .github/workflows/build.yml 'check-bridge-lines.py' 'CI: گیتِ سطرهای پل'
-have .github/workflows/build.yml 'check-tor-watchdog.py' 'CI: گیتِ نگهبان تور'
 
 echo "── ساختار"
 for f in src-tauri/src/tor_bootstrap.rs src-tauri/src/pt.rs scripts/build-pt.ps1 UPGRADE-1.2.5.md \
@@ -684,6 +542,16 @@ for f in src-tauri/src/tor_bootstrap.rs src-tauri/src/pt.rs scripts/build-pt.ps1
   [ -f "$f" ] && ok "$f هست" || bad "$f غایب"
 done
 [ -d node_modules ] && bad "node_modules داخل بسته است" || ok "بی‌node_modules"
+# >>> AETHER-APP-PATCH custom-configs
+have scripts/stage-xray.ps1 "25.12.8" 'stage-xray: نسخهٔ Xray پین شده'
+have scripts/stage-xray.ps1 "5419794670658e14519409320752329375e0fd8a57089f373b3febe9bf3ec5d5" 'stage-xray: دایجستِ x64 پین شده'
+have scripts/stage-xray.ps1 "b270190001fd9e566b8c1dc5f4bd8dac62d261d26fe23b7e42953e11adcde8f9" 'stage-xray: دایجستِ x86 پین شده'
+have scripts/stage-payload.ps1 'engine/xray' 'stage-payload: Xray در engine/xray بسته می‌شود'
+have .github/workflows/build.yml 'stage-xray.ps1' 'workflow: مرحلهٔ Xray هست'
+have src-tauri/src/state_custom.rs 'fn custom_begin' 'state_custom: ورودِ کانفیگ سفارشی'
+have src-tauri/src/main.rs 'custom::store::init' 'main: مخزنِ کانفیگ‌ها باز می‌شود'
+have src/views/settings.js "'custom'" 'settings: ردیفِ کانفیگ‌های سفارشی'
+# <<< AETHER-APP-PATCH custom-configs
 [ -d src-tauri/target ] && bad "target داخل بسته است" || ok "بی‌target"
 [ -d dist-engine ] && bad "dist-engine داخل بسته است" || ok "بی‌dist-engine"
 
@@ -693,7 +561,7 @@ echo "── و همان فرمان‌های CI روی خودِ بستهٔ اس�
 # این گام SKIP می‌شود و صریح می‌گوید — یک گامِ بی‌صدا که سبز به نظر برسد بدتر است.
 NM=${NODE_MODULES:-}
 if [ -z "$NM" ]; then
-  for c in /home/claude/work/dt/Aether_Desktop-main/node_modules /home/claude/w/Aether_Desktop-main/node_modules; do
+  for c in "$REPO_ROOT/node_modules"; do
     [ -d "$c" ] && NM=$c && break
   done
 fi

@@ -129,24 +129,24 @@ for job_name, job in (wf.get("jobs") or {}).items():
     if job.get("runs-on") == "windows-latest" and grenze > 90:
         fail(f"{job_name}: timeout-minutes={grenze} auf Windows ist mehr als 3 Stunden Kontingent.")
 
-# Und der teuerste Teil des Windows-Jobs darf nicht jedes Mal von null anfangen:
-# psiphon-tunnel-core und lyrebird werden per git clone + go build erzeugt.
+# A successful build must never wait on post-job cache pruning / upload.
+# GitHub Actions runs post steps after the last visible build step, so a job
+# may look successful yet spend tens of minutes at Swatinem/rust-cache@v2.
+# Read-only cache restore is allowed: it has no save hook on cache miss.
 b = (wf.get("jobs") or {}).get("build") or {}
 schritte = b.get("steps") or []
-cache = [x for x in schritte if "actions/cache" in (x.get("uses") or "")
+for step in schritte:
+    uses = step.get("uses") or ""
+    if "rust-cache@" in uses or ("actions/cache@" in uses and "/restore@" not in uses):
+        fail(f"build: {uses} registers a post-job cache save; use restore-only or omit it")
+cache = [x for x in schritte if "actions/cache/restore@" in (x.get("uses") or "")
          and "go" in str(x.get("with", {}).get("key", ""))]
 if not cache:
-    fail(
-        "build: kein Cache für den Go-Modul-/Build-Cache. psiphon-tunnel-core und lyrebird werden "
-        "dann in jedem Lauf neu geklont und übersetzt — auf Windows zum doppelten Minutenpreis."
-    )
+    fail("build: missing version-pinned, restore-only Go cache step")
 schluessel = str(cache[0].get("with", {}).get("key", ""))
 for pin in ("PSIPHON_VERSION", "LYREBIRD_VERSION"):
     if pin not in schluessel:
-        fail(
-            f"build: der Go-Cache-Key nennt {pin} nicht. Dann überlebt der Cache einen "
-            "Versionswechsel und der Lauf baut eine veraltete Binärdatei ein."
-        )
+        fail(f"build: restore-only Go cache key must include {pin}")
 
 trigger = (wf.get(True) or wf.get("on") or {}).get("push") or {}
 if "**/*.md" not in (trigger.get("paths-ignore") or []):
@@ -175,4 +175,4 @@ for job_name, job in (wf.get("jobs") or {}).items():
             fail(f"{job_name}: retention-days={tage} für »{wie}« ist zu lang für 500 MB.")
 
 print("  ✓ workflow: fail-fast test step and resource patch are consistent")
-print("  ✓ workflow: jedes Job hat ein Zeitlimit, Go-Cache an die gepinnten Versionen gebunden")
+print("  ✓ workflow: jedes Job hat ein Zeitlimit; kein Post-Job-Cache-Save, Go-Cache nur lesend")

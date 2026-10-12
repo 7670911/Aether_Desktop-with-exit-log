@@ -37,56 +37,10 @@ fn app_queue() -> usize {
 
 const MAX_INGEST_PER_TICK: usize = 512;
 const MAX_RECV_CHUNKS: usize = 128;
-
-/// Per-pass budget for the app->network direction.
-///
-/// 1.2.3-p1 STARVATION FIX. The loop below is `biased`, so a saturated download
-/// took every `select!` wake-up and this direction only ever ran when the
-/// download paused. It gets a budget of its own on every pass now instead of
-/// competing for a wake-up it could never win.
-const MAX_APP_INGEST_PER_TICK: usize = 512;
-
-/// Per-pass budget for control messages (open a flow, close it, set the
-/// interface address).
-///
-/// Small on purpose - a handful of messages per new connection - but it MUST be
-/// served under load. A starved `cmd` queue is a tunnel in which no new flow can
-/// be opened while an existing one is downloading.
-const MAX_CMD_PER_TICK: usize = 64;
-
 const BACKPRESSURE_RETRY: std::time::Duration = std::time::Duration::from_millis(2);
 const DROP_REPORT_STEP: usize = 512;
 const MAX_IDLE_TICK: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// How much app->network data may sit in ONE flow's overflow queue before that
-/// flow is allowed to push back on the shared `data_in` channel.
-///
-/// 1.2.3-p1 HEAD-OF-LINE FIX. The loop used to hold a single GLOBAL deferred
-/// queue and stopped reading `data_in` entirely while it held anything
-/// (`recv(), if deferred.is_empty()`). One flow that could not take another byte
-/// therefore froze the writes of EVERY other flow through the tunnel, DNS
-/// included - which reads as a download that stalls and a page that never opens
-/// even though the tunnel is up. The backlog is per-flow and ordered now, and it
-/// only gates the shared channel in the extreme case this cap describes.
-const MAX_FLOW_BACKLOG_BYTES: usize = 512 * 1024;
-
-/// Outbound packets held back when the WireGuard writer is momentarily behind.
-///
-/// 1.2.3-p1. `flush_tx` used to TAIL-DROP whatever did not fit, and during a
-/// download most of what does not fit is an ACK. Dropping the ACKs of the flow
-/// you are trying to speed up makes the remote sender halve its window for no
-/// reason at all, and the loss is invisible to any counter in the path. Holding
-/// a burst across a couple of 2 ms retries is the point; holding seconds of it
-/// would be bufferbloat, so it is bounded rather than unbounded.
-const MAX_TX_RETAINED: usize = 256;
-
-/// Keep-alive and dead-peer timeout on every netstack TCP socket.
-///
-/// Without them a flow whose peer disappears mid-transfer stays `Established`
-/// forever, retransmitting into nothing while holding its (now much larger)
-/// receive buffer and its slot in the backlog for the whole session.
-const TCP_KEEPALIVE: smoltcp::time::Duration = smoltcp::time::Duration::from_secs(15);
-const TCP_DEAD_PEER_TIMEOUT: smoltcp::time::Duration = smoltcp::time::Duration::from_secs(90);
 const ORPHAN_LINGER: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn max_tcp_pending() -> usize {
@@ -399,14 +353,6 @@ struct TcpState {
     pending: Vec<u8>,
     established: bool,
     half_closed: bool,
-    /// 1.2.3-p1: this flow's own ordered backlog, drained into `pending` as the
-    /// socket accepts bytes. Before this existed there was one GLOBAL deferred
-    /// queue and a full `pending` on any single flow stopped the stack reading
-    /// the shared `data_in` channel at all - so one stalled connection froze
-    /// every other flow in the tunnel. A TCP stream may not lose or reorder a
-    /// byte, so this is a queue and never a drop.
-    overflow: VecDeque<Vec<u8>>,
-    overflow_bytes: usize,
     orphaned_at: Option<std::time::Instant>,
     aborted: bool,
 }
@@ -620,52 +566,15 @@ async fn run(
             s.device.rx.clear();
             s.device.tx.clear();
         }
-        // 1.2.3-p1 STARVATION FIX. The `select!` below is `biased` with the
-        // inbound (download) arm first, so a saturated download used to take
-        // every wake-up and neither of these queues ran until it paused: no new
-        // flow could be opened and nothing could be written while a download was
-        // in progress. Both get an explicit budget on every pass now.
-        let mut n = 0;
-        while n < MAX_CMD_PER_TICK {
-            match cmd_rx.try_recv() {
-                Ok(cmd) => {
-                    handle_cmd(&mut s, cmd);
-                    n += 1;
-                }
-                Err(_) => break,
-            }
-        }
-        if deferred.is_empty() {
-            let mut n = 0;
-            while n < MAX_APP_INGEST_PER_TICK {
-                match data_in_rx.try_recv() {
-                    Ok(d) => {
-                        n += 1;
-                        if let Some(back) = try_handle_data(&mut s, d) {
-                            deferred.push_back(back);
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
-
         let tcp_busy = service_tcp(&mut s);
         let udp_busy = service_udp(&mut s);
         let dropped = flush_tx(&mut s, &outbound_tx);
-        // Retained packets (see [flush_tx]) must be retried soon, not on the
-        // next idle tick, or holding them instead of dropping them would just be
-        // a slower way of delaying them.
-        let tx_retained = !s.device.tx.is_empty();
 
         if dropped > 0 {
             tx_dropped = tx_dropped.saturating_add(dropped);
             if tx_dropped >= next_drop_report {
                 next_drop_report = tx_dropped + DROP_REPORT_STEP;
-                log::debug!(
-                    "[netstack] dropped {tx_dropped} outbound packets past the {MAX_TX_RETAINED}-packet retain window"
-                );
+                log::debug!("[netstack] dropped {tx_dropped} outbound packets under pressure");
             }
         }
 
@@ -676,7 +585,7 @@ async fn run(
             }
         }
 
-        let delay = if tcp_busy || udp_busy || tx_retained || !deferred.is_empty() {
+        let delay = if tcp_busy || udp_busy || !deferred.is_empty() {
             Some(BACKPRESSURE_RETRY)
         } else {
             let polled = s
@@ -759,42 +668,6 @@ fn handle_cmd(s: &mut NetStack, cmd: Cmd) {
             socket.set_keep_alive(Some(smol_duration(keepalive)));
             socket.set_timeout(Some(smol_duration(keepalive.saturating_mul(3))));
 
-            // ==============================================================
-            // 1.2.3-p1: give this sender a congestion window.
-            //
-            // Until this line existed every flow leaving this PC through the
-            // tunnel ran on smoltcp's `NoControl` controller, because
-            // `Cargo.toml` set `default-features = false` and never re-enabled
-            // `socket-tcp-cubic`. NoControl is not a conservative controller, it
-            // is the ABSENCE of one: no slow start, no congestion window, no
-            // reduction on loss. The sender writes as fast as the peer's window
-            // allows and answers congestion by retransmitting harder.
-            //
-            // Aether TERMINATES TCP here, so this stack - not Windows' own TCP -
-            // owns congestion control for everything the machine sends through
-            // the tunnel. An unthrottled sender builds a standing queue on the
-            // uplink, and the ACKs of the DOWNLOAD direction sit in that same
-            // queue: that is how an upload problem shows up as "the download is
-            // slow". In chained `Aether -> Psiphon` mode the whole PC rides one
-            // SSH connection, so that queue is in front of every flow at once.
-            //
-            // CUBIC rather than Reno: this is a high-RTT, lossy, two-hop path and
-            // CUBIC's window growth is RTT-independent, which is exactly the
-            // regime Reno handles worst. The variant only exists when
-            // `socket-tcp-cubic` is enabled, so a future edit that drops the
-            // feature FAILS THE BUILD instead of quietly shipping this again.
-            // ==============================================================
-            // >>> AETHER-APP-PATCH netstack-congestion-control
-            // ویژگی socket-tcp-cubic در Cargo.toml جفتِ همین خط است؛
-            // بی آن، AnyController::new() به NoControl می‌رسد.
-            socket.set_congestion_control(tcp::CongestionControl::Cubic);
-            // <<< AETHER-APP-PATCH netstack-congestion-control
-            // Without these a flow whose peer vanishes mid-transfer stays
-            // Established forever, retransmitting into nothing and pinning its
-            // buffers for the rest of the session.
-            socket.set_keep_alive(Some(TCP_KEEPALIVE));
-            socket.set_timeout(Some(TCP_DEAD_PEER_TIMEOUT));
-
             let local_port = alloc_port(&mut s.next_port);
             let remote = to_ip_endpoint(dst);
 
@@ -820,8 +693,6 @@ fn handle_cmd(s: &mut NetStack, cmd: Cmd) {
                     pending: Vec::new(),
                     established: false,
                     half_closed: false,
-                    overflow: VecDeque::new(),
-                    overflow_bytes: 0,
                     orphaned_at: None,
                     aborted: false,
                 },
@@ -869,37 +740,21 @@ fn handle_cmd(s: &mut NetStack, cmd: Cmd) {
     }
 }
 
-/// Returns `Some(d)` when the datagram must be deferred on the SHARED channel.
-///
-/// 1.2.3-p1: that now happens only when a single flow has already queued
-/// [`MAX_FLOW_BACKLOG_BYTES`] of its own, i.e. when deferring is genuine memory
-/// backpressure rather than "this one socket is momentarily full". A full
-/// `pending` used to be enough to stop the stack reading `data_in` at all, which
-/// froze every other flow in the tunnel behind one slow connection.
+/// Returns `Some(d)` when the datagram must be deferred (TCP pending full).
 fn try_handle_data(s: &mut NetStack, d: DataIn) -> Option<DataIn> {
     match d {
         DataIn::Tcp(id, data) => {
             if let Some(st) = s.tcp_conns.get_mut(&id) {
                 let max = max_tcp_pending();
-                // Anything already queued for this flow must stay in front of
-                // `data`: a TCP stream may not be reordered.
-                if !st.overflow.is_empty() || st.pending.len() >= max {
-                    if st.overflow_bytes >= MAX_FLOW_BACKLOG_BYTES {
-                        // This flow, and only this flow, pushes back.
-                        return Some(DataIn::Tcp(id, data));
-                    }
-                    st.overflow_bytes += data.len();
-                    st.overflow.push_back(data);
-                    return None;
+                if st.pending.len() >= max {
+                    return Some(DataIn::Tcp(id, data));
                 }
                 let space = max - st.pending.len();
                 if data.len() <= space {
                     st.pending.extend_from_slice(&data);
                 } else {
                     st.pending.extend_from_slice(&data[..space]);
-                    let rest = data[space..].to_vec();
-                    st.overflow_bytes += rest.len();
-                    st.overflow.push_back(rest);
+                    return Some(DataIn::Tcp(id, data[space..].to_vec()));
                 }
             }
             None
@@ -1002,34 +857,11 @@ fn service_tcp(s: &mut NetStack) -> bool {
                         }
                     }
                 }
-                // 1.2.3-p1: refill from this flow's own backlog, in order. This
-                // is what makes the backlog per-flow rather than a shared queue
-                // that any one connection could freeze.
-                let max = max_tcp_pending();
-                while st.pending.len() < max {
-                    let Some(chunk) = st.overflow.pop_front() else {
-                        break;
-                    };
-                    let space = max - st.pending.len();
-                    if chunk.len() <= space {
-                        st.overflow_bytes = st.overflow_bytes.saturating_sub(chunk.len());
-                        st.pending.extend_from_slice(&chunk);
-                    } else {
-                        st.pending.extend_from_slice(&chunk[..space]);
-                        st.overflow_bytes = st.overflow_bytes.saturating_sub(space);
-                        st.overflow.push_front(chunk[space..].to_vec());
-                        break;
-                    }
-                }
-                if !st.overflow.is_empty() {
-                    backpressured = true;
-                }
             }
         }
 
         {
-            let pending_empty =
-                s.tcp_conns[&id].pending.is_empty() && s.tcp_conns[&id].overflow.is_empty();
+            let pending_empty = s.tcp_conns[&id].pending.is_empty();
             let half = s.tcp_conns[&id].half_closed;
             if half && pending_empty {
                 s.sockets.get_mut::<tcp::Socket>(handle).close();
@@ -1090,8 +922,6 @@ fn service_tcp(s: &mut NetStack) -> bool {
             if let Some(st) = s.tcp_conns.get_mut(&id) {
                 st.pending.clear();
                 st.pending.shrink_to_fit();
-                st.overflow.clear();
-                st.overflow_bytes = 0;
             }
         }
         if matches!(st_state, tcp::State::Closed | tcp::State::TimeWait)
@@ -1155,31 +985,12 @@ fn service_udp(s: &mut NetStack) -> bool {
     backpressured
 }
 
-/// Hands the device transmit ring to the WireGuard writer.
-///
-/// 1.2.3-p1: this used to TAIL-DROP everything that did not fit the moment the
-/// writer was momentarily behind. During a download the majority of what does
-/// not fit is an ACK, and silently discarding the ACKs of the flow you are
-/// trying to speed up makes the REMOTE sender halve its window for no reason -
-/// loss that no counter in this process could see and that the congestion
-/// controller on the far side reads as a congested path. The burst is retained
-/// across a couple of [`BACKPRESSURE_RETRY`] passes now, and only what is past
-/// [`MAX_TX_RETAINED`] is dropped, which is what a real link does when its queue
-/// is genuinely full.
 fn flush_tx(s: &mut NetStack, outbound_tx: &mpsc::Sender<Vec<u8>>) -> usize {
     let mut dropped = 0;
     while let Some(pkt) = s.device.tx.pop_front() {
         match outbound_tx.try_send(pkt) {
             Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(pkt)) => {
-                s.device.tx.push_front(pkt);
-                // Bounded, so retaining can never become seconds of hidden queue.
-                while s.device.tx.len() > MAX_TX_RETAINED {
-                    s.device.tx.pop_back();
-                    dropped += 1;
-                }
-                break;
-            }
+            Err(mpsc::error::TrySendError::Full(_)) => dropped += 1,
             Err(mpsc::error::TrySendError::Closed(_)) => break,
         }
     }
@@ -1560,7 +1371,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn flush_tx_retains_the_burst_instead_of_shredding_it() {
+    async fn flush_tx_drops_instead_of_blocking_when_outbound_is_full() {
         let (outbound_tx, outbound_rx) = mpsc::channel::<Vec<u8>>(2);
         let mut stack = NetStack {
             iface: {
@@ -1584,66 +1395,11 @@ mod tests {
 
         let dropped = flush_tx(&mut stack, &outbound_tx);
 
-        // 1.2.3-p1: what does not fit is HELD for the next pass, not discarded.
-        // During a download most of it is an ACK, and dropping those makes the
-        // remote sender halve its window for no reason.
+        assert!(stack.device.tx.is_empty(), "the tx queue must be drained");
+        assert_eq!(
+            dropped, 8,
+            "everything past the channel capacity is dropped"
+        );
         assert_eq!(outbound_rx.len(), 2, "the channel keeps what fits");
-        assert_eq!(
-            dropped, 0,
-            "a burst of 10 is well inside the retain window, so nothing may be dropped"
-        );
-        assert_eq!(
-            stack.device.tx.len(),
-            8,
-            "the rest must still be queued for the next pass"
-        );
-        assert_eq!(
-            outbound_tx.capacity(),
-            0,
-            "sanity: the channel really was full when the burst was retained"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn flush_tx_still_bounds_the_retain_window() {
-        let (outbound_tx, _outbound_rx) = mpsc::channel::<Vec<u8>>(1);
-        let mut stack = NetStack {
-            iface: {
-                let mut device = StackDevice::new(1400);
-                let config = Config::new(HardwareAddress::Ip);
-                Interface::new(config, &mut device, Instant::now())
-            },
-            device: StackDevice::new(1400),
-            sockets: SocketSet::new(Vec::new()),
-            tcp_conns: HashMap::new(),
-            udp_conns: HashMap::new(),
-            next_id: 0,
-            next_port: 40000,
-            data_in_tx: mpsc::channel(1).0,
-            // >>> AETHER-APP-PATCH core-test-target-compiles
-            // این فیلد در دو تستِ دیگر همین فایل (خطوط ۱۵۳۶ و ۱۵۷۸) مقدار
-            // می‌گیرد و اینجا جا افتاده بود، پس `cargo test` روی کرِیت هسته با
-            // E0063 رد می‌شد و **هیچ‌کدام** از تست‌های هسته اجرا نمی‌شدند. این
-            // فقط cfg(test) است، پس باینریِ منتشرشده سالم بود — و همین توضیح
-            // می‌دهد که چطور می‌شد «بیلد درست است» و باز خطا سر برآورد.
-            tcp_limits: TcpLimits::from_env(),
-            // <<< AETHER-APP-PATCH core-test-target-compiles
-        };
-
-        for _ in 0..(MAX_TX_RETAINED + 50) {
-            stack.device.tx.push_back(vec![1, 2, 3]);
-        }
-
-        let dropped = flush_tx(&mut stack, &outbound_tx);
-
-        assert_eq!(
-            stack.device.tx.len(),
-            MAX_TX_RETAINED,
-            "retaining is bounded, so it can never become seconds of hidden queue"
-        );
-        assert_eq!(
-            dropped, 49,
-            "everything past the window is dropped, and counted"
-        );
     }
 }

@@ -25,6 +25,12 @@ for (const m of css.matchAll(/\.(-?[_a-zA-Z][\w-]*)/g)) cssClasses.add(m[1])
 // JS و تست وجود دارند. فهرست صریح است تا مورد تازه سروصدا کند.
 const ALLOWED = new Set([
   'view--advanced', 'view--diagnostics', 'view--share', 'checks--env',
+  'scard-group', 'scard', 'scard--fields', 'scard__block', 'scard__caption', 'scard__footer',
+  'field--pick', 'pick', 'pick__icon', 'pick__text', 'pick__value', 'pick__value-text', 'pick__chev',
+  'sheet', 'sheet__scrim', 'sheet__panel', 'sheet__handle', 'sheet__title', 'is-open',
+  'field--tiles', 'seg--grid', 'seg--sheet', 'seg--odd', 'seg__flag', 'seg__text', 'seg__check',
+  'pnote', 'pnote__icon', 'pnote__text',
+  'model-item', 'model-tier', 'model-description',
   'sethub', 'twin--min', 'twin--max',
 ])
 

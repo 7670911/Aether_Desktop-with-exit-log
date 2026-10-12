@@ -72,6 +72,8 @@ $needed = @('Aether.exe','engine\aether.exe','engine\wintun.dll',
 if ($RequireTor) {
   $needed += @('engine\tor\tor.exe','engine\tor\lyrebird.exe','engine\tor\pt_config.json',
                'engine\tor\geoip','engine\tor\geoip6')
+  # کانفیگ‌های سفارشی بی xray.exe فقط خطای «هسته پیدا نشد» می‌دهند.
+  $needed += @('engine\xray\xray.exe')
 } else {
   Write-Host '==> (بیلدِ بدونِ انتشار: پوشهٔ tor اجباری نیست)'
 }

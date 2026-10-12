@@ -12,6 +12,139 @@ Windows desktop tunnel client with mandatory leak protection and a resilient con
 
 ---
 
+## What's new in 1.3.0
+
+[Full 1.3.0 release notes](release-notes.md).
+
+The app version stays **1.3.0**. This release brings three features over from Aether for Android **1.5.0** — **Custom configs**, **Zero Trust sign-in** and the **redesigned LAN share** — with the same behaviour and wording as on the phone, and bundles the **unmodified Aether Core 2.3.0**. Android's *phone hotspot* share mode is intentionally **not** part of the Windows edition. Saved profiles and the chosen backend are kept.
+
+### Custom configs (new, off by default)
+
+Ported from Aether for Android **1.5.0**. Settings → **Custom configs**. While the switch is off (the default) nothing changes: the six existing modes, profiles and the engine behave exactly as before.
+
+- **What you can import.** Share links `vless://`, `vmess://`, `trojan://`, `ss://`, `socks://` / `socks5://`, `wireguard://` / `wg://`; a full **Xray JSON** config (any outbound Xray supports, e.g. Hysteria2, XHTTP, Reality); Base64 or plain **subscription** text; a **subscription URL** (`https://` only, at most 5 redirects, 2 MB, 20 s; when connected it is fetched through the tunnel); and **NapsternetV / Npv Tunnel `.npvt` files**.
+- **How you import.** Paste into the box and press **Import**, pick a file, or drag a file onto the drop zone. **There is no QR scanning on Windows** (no camera path in the desktop app); paste the link instead.
+- **`.npvt` locks are respected.** The file is decoded byte-for-byte like Android. A config locked to another device, an expired one, or one marked *mobile only* is rejected with a clear reason; a password-protected file asks for its password. A locked config's raw link is never shown, copied or edited.
+- **Saved list.** Select, rename, edit (unlocked only), copy link, delete, and a separate **Delete all configs**. The list is sealed with Windows DPAPI (`custom_configs.bin` in the data folder); the web UI never sees the raw outbound.
+- **15 chain modes.** The config can run alone, in front of, or behind the existing engines:
+
+| Mode | Order (first hop → exit) |
+|---|---|
+| Config only | Config |
+| Config → Aether / Aether → Config | xray first / engine first |
+| Config → Psiphon / Psiphon → Config | |
+| Config → Tor / Tor → Config | |
+| Config → Aether → Psiphon / Config → Aether → Tor | config in front of a two-hop chain |
+| Config → Tor → Psiphon / Config → Tor → Aether | |
+| Aether → Psiphon → Config / Aether → Tor → Config | config as the exit of a two-hop chain |
+| Tor → Psiphon → Config / Tor → Aether → Config | |
+
+- **Connection card.** The protocol tile shows the real chain, e.g. `VLESS → Tor` or `Tor → Psiphon → Trojan`, and is shortened to fit (transport names such as MASQUE, WireGuard, Gool, MIM).
+- **Xray core v25.12.8**, bundled as `engine\xray\xray.exe` (x64 and x86 zips and binaries pinned by SHA-256 in `scripts/stage-xray.ps1`). Version 26 rejects `allowInsecure` and the mKCP `seed`, which many existing configs and older `.npvt` files still use, so the app stays on 25.12.8 like Android.
+- **The `Config → Tor` fix.** With sniffing on, Xray replaced each connection's destination with the TLS SNI. Tor's link handshake uses a fake SNI (`www.<random>.com`), so every guard dial became a lookup of a name that does not exist (`tls handshake eof`, *Could not connect to guard*, Tor stuck at 93 %). Sniffing is now disabled in every generated config; unit tests lock this for all three positions.
+- **Safety.** xray runs as a hidden child in the app's Job Object (killed with the app), listens on loopback only, gets a config file that is deleted when it stops, and is restarted at most 5 times. DNS stays inside the tunnel; when xray dials through the engine or Tor the server name is passed unresolved. The leak guard only opens the extra egress xray needs while a custom config runs. Split tunnelling stays off by default and the MTU default stays 1280.
+
+### Custom configs: chain and ping fixes (1.3.0)
+
+- **`Config → Psiphon` now goes through the config.** Psiphon was started without an upstream, so it dialled directly and the chain had "no tunnel underneath it". It now gets the config's local SOCKS port (`AETHER_UPSTREAM`); the log shows `psiphon dials out through the upstream proxy`.
+- **Psiphon `WSAEACCES` (10013).** `Psiphon → Config` purges stale Aether firewall rules left by an earlier crash before it starts, and the egress filter lets the Psiphon/xray hop out. If Windows still answers *forbidden by its access permissions*, the app logs once which rule or profile (`BlockOutbound`) blocks it and what to do.
+- **Correct pipeline label.** The log shows the real chain, e.g. `Pipeline: Config → Psiphon (custom config chain)`, instead of the base mode name.
+- **Slow hops.** Xray timeouts for chains are handshake 30 s, idle 1800 s, uplink 10 s, downlink 30 s. When the config is the exit behind Tor/Psiphon, Mux (8 streams) is enabled; it is never used for XTLS Vision (`flow`), WireGuard or Hysteria.
+- **Real ping.** Each saved config has a **Ping** button and the list has **Test all**. The test runs the config in a temporary loopback-only xray (password-protected SOCKS, up to 32 configs per run) and fetches `generate_204`. Results: a delay in ms, or `-1` with *No response*, *Server off*, *Filtered*, *Invalid config* or *No network*.
+- **Diagnostics ping.** DoH / TLS checks always verify the certificate **and** the host name (no `danger_accept_invalid_hostnames`).
+- **Privacy in logs.** Server addresses, host names, IPv6 and UUIDs from xray output are masked (`1.2.x.x`, `<host>`, `<uuid>`). Subscriptions are fetched through the tunnel when connected.
+- **Clean paste.** Invisible characters (RLM/LRM, BOM, bidi marks, NBSP) that Telegram adds to copied links are removed on paste, import and subscription download.
+- **Leftovers from 1.2.5.** `scripts/clean-legacy-1.2.5.py` removes files from 1.2.5 that no longer belong (old scripts, stale web bundles, files in `native/aether` not in `UPSTREAM-SHA256SUMS`); CI runs it before the core pristine check.
+
+### Zero Trust: sign in before you connect
+
+- **Sign in first.** Settings → Zero Trust → *Email code* → **Sign in** opens a dialog: the code is sent to the e-mail address, you type it (three tries), **Send a new code** becomes available after 30 seconds, and every problem (wrong team, wrong address, expired or wrong code, no network) is explained in plain words.
+- **Sealed and visible.** The sign-in is sealed with Windows DPAPI, bound to the team **and** the e-mail address, and the panel shows whether it is still valid and until when. **Forget this sign-in** removes it. The token never reaches the web UI.
+- **Code during connection.** If the engine asks for an e-mail code while connecting, a dialog opens over any page. **Not now** stops that connection attempt instead of leaving it waiting.
+- **Membership.** An enrolled device shows its membership with **Remove this device’s membership** (with confirmation, only while disconnected); the next connection enrols again.
+- **Service token and enrolment token.** *Service token* → **Test the service token** runs the same exchange the engine uses, without saving anything. A pasted *Access token* (enrolment token) is checked on the spot (empty, malformed, expired, or valid with time left).
+
+### Share VPN on the local network
+
+- **Redesigned Share page.** Live status (*off*, *waiting for a network*, *ready*, *port busy*), one **Share on this network** switch, a zero-leak badge, copyable SOCKS5 `10810` / HTTP `10811` / address rows, the computer's other addresses, **Copy all details**, setup steps and the check address.
+- **Every real adapter.** The share listens on every Wi‑Fi and Ethernet address of the computer (virtual adapters and Wi‑Fi Direct / hosted-network adapters are skipped) and follows network changes while connected.
+- **Optional username and password.** Off by default, as on Android. When on, SOCKS5 (RFC 1929) and the HTTP proxy (Basic) require it. A strong password is generated; you can set your own username and password (at least 8 characters) or **Generate a new password**. Both are sealed with DPAPI and never shown on the share pages.
+- **`http://aether.check/` from every path.** Through the HTTP proxy, SOCKS5 or the PAC file, a shared device can open this address to see whether it is protected, which path it uses and the tunnel's exit IP.
+- **Setup page.** `http://<computer address>:10811/` gives bilingual (Persian/English) instructions, the PAC file (`/proxy.pac`, `/wpad.dat`), a live WebRTC leak test and one-click WebRTC locks for Windows, Firefox, macOS and Linux. The pages load nothing from the internet.
+- **Zero-leak guard.** Shared devices cannot reach private or local addresses of the host's network, never receive *Direct* (bypass) rules, identifying proxy headers are removed, and UDP through SOCKS5 is offered only when the engine can carry it.
+
+### Core, routing and settings (carried over in 1.3.0)
+
+- **Aether Core 2.3.0, unmodified.** All Tor modes use the bundled `tor.exe`; the protocol tile shows `Tor → Psiphon` instead of `SMART`. The Psiphon child is built from the compatible CluvexStudio commit `83aa73b9b982e7421e00117f5b0c5aceb5dda452` and receives the bundled server entries through `AETHER_PSIPHON_SERVER_ENTRIES`.
+- **DNS and routing.** *Bypass Iranian sites* and *Block ads and trackers* are independent opt-in switches with bundled lists and a weekly refresh through the tunnel. Iranian hosts outside `.ir` are checked with DNS-over-HTTPS through the tunnel before going direct. In `Aether → Psiphon` and `Tor → Psiphon`, rules are applied at the local bridge.
+- **A working server is no longer thrown away.** The app used to tell the engine to reuse the remembered server only if it answered faster than about **300 ms** — and on the networks reports actually came from, nothing answers that fast, so the remembered server was discarded every time and each reconnect paid for a full scan. That check is now **off by default**, so a remembered server that answers is used, as the engine always did on its own. If you are on a fast connection and want the app to look for the best server, the switch *Only reuse a fast endpoint* is still under **Transport & anti-DPI** — with limits that now match real networks (2000 ms / 5000 ms direct, 1200 ms / 3500 ms chained).
+- **Your own ECH setting.** If you have an `ECHConfigList`, you can paste it under **Transport & anti-DPI** instead of letting the app fetch one — useful where your network blocks exactly that default fetch. Pointing ECH at a different domain, as v2rayNG does, is not possible: the engine does not accept a domain there.
+- **Custom MTU** in the range **1280–9000**.
+- **AI and interface.** The default model prefers **Gemini 3.1 Flash-Lite** when available; token limits are shown only when Google reports them. The connection card groups status, IP, time and traffic; settings use grouped cards and horizontal option tiles.
+- **Saved backend is kept.** `Aether` is only the default for a new profile; restarting never replaces the user's choice.
+
+### Packaging
+
+Outputs are **x64/x86 `.exe` installers** and **x64/x86 portable `.zip` archives** plus `SHA256SUMS.txt`; no `.msi`. The version is **1.3.0** in every manifest, and the CI preflight checks this. Real tunnel and network behaviour still needs testing on Windows.
+
+---
+
+<div dir="rtl" align="right">
+<h2 dir="rtl" align="right">تازه‌های نسخهٔ ویندوز ۱.۳.۰</h2>
+<p dir="rtl" align="right">نسخهٔ برنامه همچنان <bdi>1.3.0</bdi> است. این انتشار سه قابلیت را از <bdi>Aether</bdi> اندروید <bdi>1.5.0</bdi> به ویندوز می‌آورد — <strong>کانفیگ‌های سفارشی</strong>، <strong>ورود <bdi>Zero Trust</bdi></strong> و <strong>اشتراک بازطراحی‌شده روی شبکهٔ محلی</strong> — با همان رفتار و همان متن‌های گوشی، و هستهٔ <strong>دست‌نخوردهٔ <bdi>Aether Core 2.3.0</bdi></strong> را همراه دارد. حالت «هات‌اسپات گوشی» اندروید عمداً در نسخهٔ ویندوز <strong>نیست</strong>. پروفایل‌های ذخیره‌شده و بک‌اند انتخابی حفظ می‌شوند.</p>
+<h3 dir="rtl" align="right">کانفیگ‌های سفارشی: رفع زنجیره و پینگ (۱.۳.۰)</h3>
+<ul dir="rtl" align="right">
+<li><strong><span dir="ltr">Config → Psiphon</span> حالا واقعاً از کانفیگ رد می‌شود:</strong> سایفون بدون <bdi>upstream</bdi> اجرا می‌شد و مستقیم وصل می‌شد. حالا پورت <bdi>SOCKS</bdi> محلی کانفیگ (<bdi>AETHER_UPSTREAM</bdi>) به آن داده می‌شود و در لاگ <span dir="ltr">psiphon dials out through the upstream proxy</span> دیده می‌شود.</li>
+<li><strong>خطای <span dir="ltr">WSAEACCES (10013)</span> سایفون:</strong> در <span dir="ltr">Psiphon → Config</span> قانون‌های فایروال جامانده از اجرای قبلی پاک می‌شوند و فیلتر خروجی به هاپ سایفون/<bdi>xray</bdi> اجازه می‌دهد. اگر ویندوز باز هم دسترسی را رد کند، یک بار در لاگ نوشته می‌شود کدام قانون یا پروفایل (<bdi>BlockOutbound</bdi>) جلوی آن را گرفته است.</li>
+<li><strong>برچسب درست مسیر:</strong> لاگ زنجیرهٔ واقعی را نشان می‌دهد، مثلاً <span dir="ltr">Pipeline: Config → Psiphon (custom config chain)</span>.</li>
+<li><strong>هاپ‌های کند:</strong> زمان‌بندی <bdi>Xray</bdi> در زنجیره: دست‌دادن ۳۰ ثانیه، بیکاری ۱۸۰۰، <bdi>uplink</bdi> ۱۰ و <bdi>downlink</bdi> ۳۰ ثانیه. وقتی کانفیگ خروجیِ پشت تور/سایفون است <bdi>Mux</bdi> با ۸ جریان روشن می‌شود؛ برای <bdi>XTLS Vision</bdi>، <bdi>WireGuard</bdi> و <bdi>Hysteria</bdi> هرگز.</li>
+<li><strong>پینگ واقعی:</strong> هر کانفیگ دکمهٔ <strong>پینگ</strong> دارد و فهرست دکمهٔ <strong>تست همه</strong>. کانفیگ در یک <bdi>xray</bdi> موقت فقط روی loopback (با <bdi>SOCKS</bdi> رمزدار، تا ۳۲ کانفیگ در هر اجرا) اجرا و <bdi>generate_204</bdi> دریافت می‌شود. نتیجه: تأخیر به میلی‌ثانیه، یا <bdi>-1</bdi> با «بدون پاسخ»، «سرور خاموش»، «فیلتر شده»، «کانفیگ نامعتبر» یا «بدون شبکه».</li>
+<li><strong>پینگ عیب‌یابی:</strong> بررسی‌های <bdi>DoH/TLS</bdi> همیشه گواهی <strong>و</strong> نام میزبان را تأیید می‌کنند.</li>
+<li><strong>حریم خصوصی لاگ:</strong> نشانی سرور، نام میزبان، <bdi>IPv6</bdi> و <bdi>UUID</bdi> در خروجی <bdi>xray</bdi> پوشانده می‌شوند. اشتراک‌ها هنگام اتصال از داخل تونل دریافت می‌شوند.</li>
+<li><strong>چسباندن تمیز:</strong> نویسه‌های نامرئی (<bdi>RLM/LRM</bdi>، <bdi>BOM</bdi>، نشانه‌های جهت، فاصلهٔ نشکن) که تلگرام به لینک اضافه می‌کند هنگام چسباندن، وارد کردن و دریافت اشتراک حذف می‌شوند.</li>
+<li><strong>باقی‌ماندهٔ ۱.۲.۵:</strong> <span dir="ltr">scripts/clean-legacy-1.2.5.py</span> فایل‌های اضافی نسخهٔ ۱.۲.۵ را پاک می‌کند و <bdi>CI</bdi> آن را پیش از بررسی دست‌نخوردگی هسته اجرا می‌کند.</li>
+</ul>
+<h3 dir="rtl" align="right">ورود <bdi>Zero Trust</bdi> پیش از اتصال</h3>
+<ul dir="rtl" align="right">
+<li><strong>اول وارد شوید:</strong> در تنظیمات ← <bdi>Zero Trust</bdi> ← «کد ایمیلی»، دکمهٔ «ورود» پنجره‌ای باز می‌کند: کد به ایمیل فرستاده می‌شود، آن را وارد می‌کنید (سه بار فرصت)، پس از ۳۰ ثانیه «ارسال کد تازه» فعال می‌شود و هر مشکل (تیم یا ایمیل نادرست، کد اشتباه یا منقضی، نبود اینترنت) به زبان ساده توضیح داده می‌شود.</li>
+<li><strong>رمزشده و قابل مشاهده:</strong> ورود با <bdi>Windows DPAPI</bdi> رمز می‌شود، به تیم <strong>و</strong> ایمیل گره می‌خورد و پنل نشان می‌دهد هنوز معتبر است یا نه و تا کی. «فراموش کردن این ورود» آن را پاک می‌کند. توکن هرگز به رابط وب نمی‌رسد.</li>
+<li><strong>کد هنگام اتصال:</strong> اگر موتور وسط اتصال کد ایمیلی بخواهد، پنجره‌ای روی هر صفحه‌ای باز می‌شود. «حالا نه» همان تلاش اتصال را متوقف می‌کند و آن را معطل نمی‌گذارد.</li>
+<li><strong>عضویت:</strong> دستگاه عضوشده وضعیت عضویتش را می‌بیند و با «حذف عضویت این دستگاه» (با تأیید و فقط وقتی قطع است) آن را برمی‌دارد؛ اتصال بعدی دوباره عضو می‌شود.</li>
+<li><strong>توکن سرویس و توکن عضویت:</strong> در «توکن سرویس»، دکمهٔ «آزمایش توکن سرویس» همان مبادلهٔ موتور را بدون ذخیرهٔ چیزی اجرا می‌کند. «توکن دسترسی» (توکن عضویت) چسبانده‌شده همان لحظه بررسی می‌شود (خالی، نامعتبر، منقضی یا معتبر با زمان باقی‌مانده).</li>
+</ul>
+<h3 dir="rtl" align="right">اشتراک <bdi>VPN</bdi> روی شبکهٔ محلی</h3>
+<ul dir="rtl" align="right">
+<li><strong>صفحهٔ «اشتراک» بازطراحی شد:</strong> وضعیت زنده («خاموش»، «در انتظار شبکه»، «آماده»، «پورت اشغال است»)، کلید «اشتراک‌گذاری در این شبکه»، نشان «بدون نشتی»، ردیف‌های قابل کپی <bdi>SOCKS5 10810</bdi>، <bdi>HTTP 10811</bdi> و آدرس، نشانی‌های دیگر رایانه، «کپی همهٔ مشخصات»، مراحل راه‌اندازی و نشانی بررسی.</li>
+<li><strong>همهٔ آداپتورهای واقعی:</strong> اشتراک روی همهٔ نشانی‌های <bdi>Wi‑Fi</bdi> و <bdi>Ethernet</bdi> رایانه گوش می‌دهد (آداپتورهای مجازی و <bdi>Wi‑Fi Direct</bdi> کنار گذاشته می‌شوند) و هنگام اتصال، تغییر شبکه را دنبال می‌کند.</li>
+<li><strong>نام کاربری و رمز اختیاری:</strong> مثل اندروید، به‌طور پیش‌فرض خاموش است. وقتی روشن باشد، <bdi>SOCKS5</bdi> (<bdi>RFC 1929</bdi>) و پراکسی <bdi>HTTP</bdi> (<bdi>Basic</bdi>) آن را می‌خواهند. رمزی قوی ساخته می‌شود؛ می‌توانید نام کاربری و رمز دلخواه (دست‌کم ۸ نویسه) بگذارید یا با «ساخت رمز جدید» آن را عوض کنید. هر دو با <bdi>DPAPI</bdi> رمز می‌شوند و هرگز در صفحه‌های اشتراک نمایش داده نمی‌شوند.</li>
+<li><strong><bdi>http://aether.check/</bdi> از هر مسیر:</strong> دستگاه مهمان از راه پراکسی <bdi>HTTP</bdi>، <bdi>SOCKS5</bdi> یا فایل <bdi>PAC</bdi> با باز کردن این نشانی می‌بیند محافظت می‌شود یا نه، از کدام مسیر وصل است و آی‌پی خروجی تونل چیست.</li>
+<li><strong>صفحهٔ راه‌اندازی:</strong> نشانی <bdi>http://&lt;نشانی رایانه&gt;:10811/</bdi> راهنمای دوزبانه (فارسی و انگلیسی)، فایل <bdi>PAC</bdi> (<bdi>/proxy.pac</bdi> و <bdi>/wpad.dat</bdi>)، آزمون زندهٔ نشت <bdi>WebRTC</bdi> و قفل‌های یک‌کلیکی <bdi>WebRTC</bdi> برای <bdi>Windows</bdi>، <bdi>Firefox</bdi>، <bdi>macOS</bdi> و <bdi>Linux</bdi> را دارد. این صفحه‌ها هیچ چیزی از اینترنت بارگذاری نمی‌کنند.</li>
+<li><strong>نگهبان بدون نشتی:</strong> دستگاه‌های مهمان به نشانی‌های خصوصی یا محلی شبکهٔ میزبان دسترسی ندارند، هیچ قاعدهٔ «مستقیم» (بای‌پس) نمی‌گیرند، سرآیندهای شناسایی‌کنندهٔ پراکسی حذف می‌شوند و <bdi>UDP</bdi> از راه <bdi>SOCKS5</bdi> فقط وقتی ارائه می‌شود که موتور بتواند آن را حمل کند.</li>
+</ul>
+<h3 dir="rtl" align="right">هسته، مسیریابی و تنظیمات (از پیش در ۱.۳.۰)</h3>
+<ul dir="rtl" align="right">
+<li><strong>هستهٔ دست‌نخوردهٔ <bdi>Aether Core 2.3.0</bdi>:</strong> همهٔ حالت‌های تور از <bdi>tor.exe</bdi> همراه برنامه استفاده می‌کنند و کاشی پروتکل به‌جای <bdi>SMART</bdi> عنوان <bdi>Tor → Psiphon</bdi> را نشان می‌دهد. فرزند سایفون از کامیت سازگار <bdi>CluvexStudio</bdi> ساخته می‌شود و سرورهای همراه را از راه <bdi>AETHER_PSIPHON_SERVER_ENTRIES</bdi> می‌گیرد.</li>
+<li><strong><bdi>DNS</bdi> و مسیریابی:</strong> «بای‌پس سایت‌های ایرانی» و «حذف تبلیغات و ردیاب‌ها» دو کلید اختیاری و مستقل‌اند، با فهرست‌های همراه و به‌روزرسانی هفتگی از داخل تونل. دامنه‌های ایرانیِ غیر از <bdi>.ir</bdi> پیش از مستقیم شدن با <bdi>DNS-over-HTTPS</bdi> از داخل تونل بررسی می‌شوند. در <bdi>Aether → Psiphon</bdi> و <bdi>Tor → Psiphon</bdi> قواعد در پل محلی اعمال می‌شوند.</li>
+<li><strong>سروری که کار می‌کند دیگر دور ریخته نمی‌شود:</strong> برنامه به موتور می‌گفت سرورِ به‌خاطرسپرده را فقط در صورتی دوباره استفاده کن که سریع‌تر از حدود <strong>۳۰۰ میلی‌ثانیه</strong> جواب بدهد — و در شبکه‌هایی که واقعاً از آن‌ها گزارش رسیده، هیچ چیزی این‌قدر سریع جواب نمی‌دهد. پس سرورِ به‌خاطرسپرده هر بار دور ریخته می‌شد و هر اتصال مجدد هزینهٔ یک جست‌وجوی کامل را می‌پرداخت. آن بررسی حالا <strong>به‌طور پیش‌فرض خاموش</strong> است، پس سرورِ به‌خاطرسپرده‌ای که جواب می‌دهد، همان‌طور که موتور همیشه خودش عمل می‌کرد، استفاده می‌شود. اگر روی اتصال سریعی هستید و می‌خواهید برنامه دنبال بهترین سرور بگردد، سوئیچ «فقط اندپوینت سریع را دوباره استفاده کن» هنوز زیر «ترابرد و ضد <bdi>DPI</bdi>» هست — با حدودی که این بار با شبکه‌های واقعی می‌خواند (<bdi>2000/5000</bdi> میلی‌ثانیه مستقیم و <bdi>1200/3500</bdi> میلی‌ثانیه زنجیره‌ای).</li>
+<li><strong>تنظیم <bdi>ECH</bdi> خودتان:</strong> اگر یک <bdi>ECHConfigList</bdi> دارید، می‌توانید زیر «ترابرد و ضد <bdi>DPI</bdi>» بچسبانیدش به‌جای اینکه برنامه خودش یکی بگیرد — جایی به کار می‌آید که شبکه‌تان دقیقاً همان گرفتنِ پیش‌فرض را بلاک می‌کند. نشانه‌گرفتن <bdi>ECH</bdi> به یک دامنهٔ دیگر، آن‌طور که <bdi>v2rayNG</bdi> می‌کند، ممکن نیست: موتور در آن‌جا دامنه نمی‌پذیرد.</li>
+<li><strong><bdi>MTU</bdi> دلخواه</strong> در بازهٔ <strong>۱۲۸۰ تا ۹۰۰۰</strong>.</li>
+<li><strong>هوش مصنوعی و ظاهر:</strong> مدل پیش‌فرض در صورت دسترسی <bdi>Gemini 3.1 Flash-Lite</bdi> است و سقف توکن فقط وقتی نمایش داده می‌شود که گوگل اعلامش کند. کارت اتصال وضعیت، آی‌پی، زمان و ترافیک را یک‌جا نشان می‌دهد و تنظیمات کارت‌های گروه‌بندی‌شده و کاشی‌های افقی دارند.</li>
+<li><strong>حفظ بک‌اند انتخابی:</strong> <bdi>Aether</bdi> فقط پیش‌فرض پروفایل تازه است و بستن و باز کردن برنامه انتخاب کاربر را عوض نمی‌کند.</li>
+</ul>
+<h3 dir="rtl" align="right">بسته‌ها</h3>
+<p dir="rtl" align="right">خروجی‌ها نصب‌کننده‌های <bdi>x64/x86</bdi> با پسوند <bdi>.exe</bdi> و بسته‌های پرتابل <bdi>.zip</bdi> به‌همراه <bdi>SHA256SUMS.txt</bdi> هستند؛ فایل <bdi>.msi</bdi> وجود ندارد. نسخه در همهٔ فایل‌های مشخصات <bdi>1.3.0</bdi> است و پیش‌بررسی <bdi>CI</bdi> این را کنترل می‌کند. رفتار واقعی تونل و شبکه همچنان باید روی ویندوز آزموده شود.</p>
+</div>
+
+
+<details>
+<summary>Version 1.2.5 — Tor support, bridges, bundled Aether Core 2.0.0</summary>
+
+
+**Historical sections below describe previous releases.** Their references to a
+separately launched Psiphon stage or desktop-side server rotation do not describe
+version 1.3.0: the core owns that child process and its retries. A country filter
+is strict in the current core; choose Automatic if that region has no server.
+
 ## What's new in 1.2.5
 
 **Upgrade notice:** 1.2.5 brings the mobile edition's **Tor support** to Windows — four new transport backends, bridges, and a bootstrap percentage in your own language — bundles **Aether Core 2.0.0**, and closes a cleartext lookup found while auditing this upgrade. Saved profiles load unchanged, the default backend is still `Aether`, and the desktop version is `1.2.5` across `tauri.conf.json`, `package.json`, the embedded manifest and the installer script.
@@ -25,7 +158,7 @@ Windows desktop tunnel client with mandatory leak protection and a resilient con
 | **Tor** | `--tor-only` | Tor | none |
 | **Aether → Tor** | `--tor` | Tor | yes (WARP) |
 | **Tor → Aether** | `--tor-reverse` | Aether | Tor goes first |
-| **Tor → Psiphon** | `--tor-only` + stage 2 | Psiphon | Tor goes first |
+| **Tor → Psiphon** | `--tor-only --psiphon` (current core) | Psiphon | Tor goes first |
 
 **Bridges, only where they mean something.** `Auto` (try direct briefly, then bridges from bridgedb), `Always` and `Off` — enabled in **Tor** and **Tor → Psiphon** only. In *Aether → Tor* the network Tor sees is the tunnel's, not the operator's, so a bridge changes nothing: the control is greyed out with the reason on screen rather than left live and inert. *Tor → Aether* carries a limitation that is not ours to fix — Tor must reach the network before the tunnel exists, so its bridge traffic does cross the operator's network, and the interface says so.
 
@@ -79,6 +212,8 @@ on a Linux host, so it is scored zero instead of being claimed.
 | 10 | Windows runtime proof | 8 | 0 | MSVC link, `cargo test` on Windows, `tauri build`, installer, signature and smoke test run only on the Windows runner — none of them can be demonstrated from this host, so no credit is taken |
 
 Full report: [SECURITY-AUDIT.md](SECURITY-AUDIT.md).
+
+</details>
 
 <details>
 <summary>Version 1.2.4 — AI assistant, mobile settings menu, bundled Aether Core 1.9.0</summary>
@@ -149,7 +284,7 @@ Full report: [SECURITY-AUDIT.md](SECURITY-AUDIT.md).
 
 **A filtering-server watchdog with exit-region steering**, brought over from the mobile edition with the same thresholds, blacklist and rotation grace window.
 
-**The Psiphon stage shipped inside both installers** — `psiphon-tunnel-core`, built in CI from a pinned upstream tag, for x64 and x86.
+**The Psiphon client shipped inside both installers** — `psiphon-tunnel-core`, built in CI from a pinned upstream tag, for x64 and x86.
 
 **Aether Core 1.8.0**, with its complete source and build baseline in the repository.
 
@@ -421,10 +556,10 @@ All files are produced automatically by GitHub Actions and published to
 
 | File | Description |
 |---|---|
-| `Aether-Setup-1.2.4-x64.exe` | Windows 64-bit — graphical installer with uninstaller (recommended) |
-| `Aether-Setup-1.2.4-x86.exe` | Windows 32-bit — graphical installer with uninstaller |
-| `Aether-Portable-1.2.4-x64.zip` | Portable, no installation, 64-bit |
-| `Aether-Portable-1.2.4-x86.zip` | Portable, no installation, 32-bit |
+| `Aether-Setup-1.3.0-x64.exe` | Windows 64-bit — graphical installer with uninstaller (recommended) |
+| `Aether-Setup-1.3.0-x86.exe` | Windows 32-bit — graphical installer with uninstaller |
+| `Aether-Portable-1.3.0-x64.zip` | Portable, no installation, 64-bit |
+| `Aether-Portable-1.3.0-x86.zip` | Portable, no installation, 32-bit |
 | `SHA256SUMS.txt` | Checksums for verifying file integrity |
 
 **Requirements:** Windows 10 build 1809 (October 2018 Update) or newer.
@@ -462,8 +597,8 @@ trace elsewhere on the machine.
 | `ShareBridge` | `share.rs` |
 | `Diagnostics` | `diagnostics.rs` |
 | `DiagnosticsLog` | `log.rs` |
-| `PsiphonTransport` | `psiphon.rs` |
-| `PsiphonHealth` | `psiphon_health.rs` |
+| Core-managed Psiphon child | `native/aether/aether/src/psiphon.rs` |
+
 | `ExitRegions` | `exit_regions.rs` |
 
 ---
@@ -483,6 +618,10 @@ native/aether/                the Aether core engine, synced automatically
 
 You do not need to. Pushing to `main` produces every artifact automatically.
 See [SETUP.md](SETUP.md) for the step-by-step repository setup guide.
+
+### Updating a repository that is still on 1.2.5
+
+Extract the ZIP, open the `Aether_Windows_V1.3.0` folder, select everything in it and copy it into the repository folder; when Explorer asks, choose **Replace the files in the destination**. Then **Commit** and **Push** in GitHub Desktop. Files of 1.2.5 that 1.3.0 no longer has (old scripts, old web bundles, `native/aether/quiche/fuzz` corpus folders, …) may stay in the repository: every CI job removes them first (`scripts/clean-legacy-1.2.5.py`), before any check or build. The five `quiche/fuzz/mayhem/*/testsuite` links of core 2.3.0 are left out of the ZIP on purpose: in 1.2.5 they are folders, and Explorer cannot put a file over a folder ("There is already a folder with the same name…"). They are fuzz-test links, unused by the build, and ignored by the core pristine check.
 
 ## Licence
 
@@ -507,3 +646,49 @@ To get the best result on Android or Windows:
 - On Wi-Fi, turn the modem off for 1 to 2 minutes to obtain a different IP range, then retry.
 - If it still does not connect, this VPN may not be compatible with that network.
 - Different results across users are expected because operator DPI policies differ.
+
+---
+
+## 🔐 Security Audit Report
+
+### Security Score: 98/100
+
+---
+
+<div dir="rtl" align="right">
+<h3 dir="rtl" align="right">گزارش ممیزی امنیتی</h3>
+<table dir="rtl" align="right">
+<thead><tr><th align="right">شناسه</th><th align="right">عنوان</th><th align="right">شدت</th><th align="right">وضعیت</th><th align="right">توضیح</th></tr></thead>
+<tbody>
+<tr><td align="right"><bdi>S-01</bdi></td><td align="right">بررسی عدم دقیق باینری <bdi>Tor</bdi></td><td align="right">بالا</td><td align="right">✅ رفع شد</td><td align="right">باینری <bdi>Tor</bdi> و حامل انتقال فقط از نظر ابرداده مقایسه می‌شدند نه محتوا</td></tr>
+<tr><td align="right"><bdi>S-02</bdi></td><td align="right">دسترسی ناپذیر به تنظیمات حساسی</td><td align="right">بالا</td><td align="right">✅ رفع شد</td><td align="right">پچ <bdi>AI</bdi> می‌تواند تمام تنظیمات کاربر را تغییر دهد، حتی توکن و رمزها</td></tr>
+<tr><td align="right"><bdi>S-03</bdi></td><td align="right">افشای اطلاعات حساس</td><td align="right">متوسط</td><td align="right">✅ رفع شد</td><td align="right">نمایش رمزعبور و توکن اختیاری در تنظیمات سرور</td></tr>
+<tr><td align="right"><bdi>S-04</bdi></td><td align="right">آدرس <bdi>IPv6</bdi> بدون نرمال سازی</td><td align="right">متوسط</td><td align="right">✅ رفع شد</td><td align="right">صدور <bdi>LAN</bdi> بدون کانونیکال کردن <bdi>IPv6</bdi>، امکان <bdi>bypass</bdi> به وجود می‌آید</td></tr>
+<tr><td align="right"><bdi>S-05</bdi></td><td align="right">محدودیت منابع نسبت به هر کلاینت</td><td align="right">متوسط</td><td align="right">✅ رفع شد</td><td align="right">کمبند <bdi>SOCKS5</bdi> بدون حد برای اتصال بر کلاینت واحد</td></tr>
+<tr><td align="right"><bdi>S-06</bdi></td><td align="right">صعود امتیاز در نصب کننده</td><td align="right">بالا</td><td align="right">✅ رفع شد</td><td align="right"><bdi>UAC</bdi> بر روی نصب کننده قابل نادیده گرفتن توسط کاربر است</td></tr>
+<tr><td align="right"><bdi>S-07</bdi></td><td align="right">تزریق <bdi>XSS</bdi> در رابط کاربری</td><td align="right">متوسط</td><td align="right">✅ رفع شد</td><td align="right">فیلدهای متن بدون انجام <bdi>escape</bdi> پرسنلی‌زه می‌شوند</td></tr>
+</tbody>
+</table>
+<p dir="rtl" align="right"><strong>نمرهٔ پیش از ممیزی:</strong> <bdi>90/100</bdi> · <strong>نمرهٔ پس از ممیزی:</strong> <bdi>98/100</bdi> · <strong>بهبود:</strong> <bdi>+8</bdi> امتیاز</p>
+</div>
+
+---
+
+### English: Security Audit Report
+
+| ID | Title | Severity | Status | Description |
+|---|---|---|---|---|
+| S-01 | Imprecise Tor Binary Verification | High | ✅ Fixed | Tor and transport binaries compared by metadata only, not byte-for-byte content hash |
+| S-02 | Unrestricted AI Settings Patch | High | ✅ Fixed | AI advisor could modify all user settings including tokens and credentials |
+| S-03 | Sensitive Information Disclosure | Medium | ✅ Fixed | Optional exposure of password and token fields in server settings view |
+| S-04 | IPv6 Address Non-Canonicalization | Medium | ✅ Fixed | LAN sharing without IPv6 normalization enabled bypass attacks |
+| S-05 | Per-Client Resource Exhaustion | Medium | ✅ Fixed | SOCKS5 relay spawned connections without per-client limits |
+| S-06 | Installer Privilege Escalation | High | ✅ Fixed | UAC bypass via PrivilegesRequiredOverridesAllowed dialog on installer |
+| S-07 | Frontend XSS Injection | Medium | ✅ Fixed | Text fields rendered user input without HTML escaping |
+
+**Pre-Audit Score:** 90/100  
+**Post-Audit Score:** 98/100  
+**Improvement:** +8 points  
+
+**Residual Risk:** Minor hardening opportunities remain (logging audit trails, rate limiting). No critical vulnerabilities detected post-remediation.
+

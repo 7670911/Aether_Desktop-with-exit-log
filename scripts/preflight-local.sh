@@ -35,6 +35,13 @@ else
   echo "  ✗ ناهمخوانی نسخه"; fail=1
 fi
 
+echo "── ۳ب) هم‌خوانی سایفون، هسته و رابط فارسی"
+if out=$(python3 scripts/check-psiphon-core-compat.py 2>&1); then
+  echo "  ✓ سازگاری نسخه، باینری سایفون و ترجمه"
+else
+  echo "  ✗ سازگاری سایفون/هسته"; echo "$out" | tail -12; fail=1
+fi
+
 echo "── ۴) حالت پراکسی نباید مسیر کد داشته باشد"
 if grep -rniE 'proxy[_-]?mode' src src-tauri/src installer 2>/dev/null | grep -vE 'profile\.rs|\.md$'; then
   echo "  ✗ پیدا شد"; fail=1
@@ -76,25 +83,32 @@ else
   echo "  ✗ ترتیب گام‌ها"; echo "$out" | head -5; fail=1
 fi
 
-echo "── ۹) سطرهای پلِ داخلی برای arti خوانا هستند"
-if out=$(python3 scripts/check-bridge-lines.py 2>&1); then
-  echo "  ✓ ${out##*✓ }"
+echo "── ۸ب) هیچ باقی‌مانده‌ای از ۱.۲.۵ در درخت نیست"
+if out=$(python3 scripts/clean-legacy-1.2.5.py --check 2>&1); then
+  echo "  ✓ $(echo "$out" | tail -1)"
 else
-  echo "  ✗ سطرهای پل"; echo "$out" | head -6; fail=1
+  echo "  ✗ باقی‌ماندهٔ ۱.۲.۵ (python3 scripts/clean-legacy-1.2.5.py --apply)"; echo "$out" | head -8; fail=1
 fi
 
-echo "── ۱۰) نگهبانِ بی‌پیشرفتِ بوت‌استرپ تور"
-if out=$(python3 scripts/check-tor-watchdog.py 2>&1); then
-  echo "  ✓ ${out##*✓ }"
+echo "── ۹) هستهٔ native/aether دست‌نخوردهٔ آپ‌استریم است (Aether 2.3.0)"
+if out=$(python3 scripts/check-core-pristine.py 2>&1); then
+  echo "  ✓ $(echo "$out" | tail -1)"
 else
-  echo "  ✗ نگهبان تور"; echo "$out" | head -6; fail=1
+  echo "  ✗ هسته با آپ‌استریم نمی‌خواند"; echo "$out" | head -8; fail=1
 fi
 
-echo "── ۱۱) سپرهٔ ناکامِ تور کامل می‌افتد (رانتایمِ اختصاصی)"
-if out=$(python3 scripts/check-tor-runtime.py 2>&1); then
-  echo "  ✓ ${out##*✓ }"
+echo "── ۱۰) و همان نگهبان، تغییرِ هسته را می‌گیرد"
+if out=$(bash scripts/check-core-pristine-negative.sh 2>&1); then
+  echo "  ✓ $(echo "$out" | tail -1)"
 else
-  echo "  ✗ رانتایمِ سپره"; echo "$out" | head -6; fail=1
+  echo "  ✗ کنترل‌های منفیِ هسته"; echo "$out" | tail -8; fail=1
+fi
+
+echo "── ۱۱) سازگاریِ Psiphon با هستهٔ وندورشده"
+if out=$(python3 scripts/check-psiphon-core-compat.py 2>&1); then
+  echo "  ✓ $(echo "$out" | tail -1)"
+else
+  echo "  ✗ سازگاریِ Psiphon"; echo "$out" | head -8; fail=1
 fi
 
 echo "── ۱۲) «تور تنها» از tor.exe رسمی می‌گذرد"
@@ -139,7 +153,7 @@ else
   echo "  ✗ کارتِ اتصال"; echo "$out" | head -12; fail=1
 fi
 
-echo "── ۱۸) و همان نگهبان، هر ۱۶ بازگشت را می‌گیرد"
+echo "── ۱۸) و همان نگهبان، هر ۱۴ بازگشت را می‌گیرد"
 if out=$(bash scripts/check-connection-card-negative.sh 2>&1); then
   echo "  ✓ ${out##*✓ }"
 else
@@ -153,25 +167,11 @@ else
   echo "  ✗ نحوِ Rust"; echo "$out" | head -8; fail=1
 fi
 
-echo "── ۲۰) و همان نگهبان، چهار آسیب را می‌گیرد و کدِ سالم را قرمز نمی‌کند"
+echo "── ۲۰) و همان نگهبان، پنج آسیب را می‌گیرد و کدِ سالم را قرمز نمی‌کند"
 if out=$(bash scripts/check-rust-parses-negative.sh 2>&1); then
   echo "  ✓ ${out##*✓ }"
 else
   echo "  ✗ کنترل‌های نحو"; echo "$out" | tail -8; fail=1
-fi
-
-echo "── ۲۱) پچ‌های هسته از یک ارتقای هسته جان سالم می‌برند"
-if out=$(python3 scripts/check-core-patches.py 2>&1); then
-  echo "  ✓ ${out##*OK }"
-else
-  echo "  ✗ پچ‌های هسته در معرضِ حذفِ بی‌صدا"; echo "$out" | grep '^✗' | head -8; fail=1
-fi
-
-echo "── ۲۲) و همان نگهبان، پنج راهِ گم‌شدنِ بی‌صدا را می‌گیرد"
-if out=$(bash scripts/check-core-patches-negative.sh 2>&1); then
-  echo "  ✓ $(echo "$out" | grep -c '^  ✓') کنترلِ منفیِ پچ‌های هسته گرفته شد"
-else
-  echo "  ✗ کنترل‌های منفیِ پچ‌های هسته"; echo "$out" | tail -10; fail=1
 fi
 
 # ۲۳) و اگر cargo هست، حقیقت از خودِ کامپایلر پرسیده می‌شود.

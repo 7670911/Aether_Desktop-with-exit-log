@@ -12,7 +12,7 @@ use anyhow::{anyhow, Result};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
 #[cfg(windows)]
@@ -31,7 +31,7 @@ pub const LOCAL_SOCKS_PORT: u16 = 1819;
 /// می‌کند و Psiphon خودش روی ۱۸۲۷ می‌نشیند)، چون tun2socks آن‌جا
 /// `UDP ASSOCIATE` می‌خواهد. مسیر دادهٔ ویندوز پروکسی سیستمی WinINET است، یعنی
 /// از بنیاد TCP-only، و فقط `CONNECT` لازم دارد؛ پس Psiphon مستقیم همین پورت را
-/// می‌گیرد و آن لایهٔ میانی وجود ندارد. مفصل در `psiphon.rs`.
+/// می‌گیرد و آن لایهٔ میانی وجود ندارد. اجرای فرزند در `native/aether/aether/src/psiphon.rs` است.
 pub const CHAIN_SOCKS_PORT: u16 = 1825;
 
 /// ۱.۲.۵ — لیسنر SOCKS5 خودِ تور در موتور (هستهٔ ۲.۰.۰).
@@ -62,7 +62,60 @@ const GRACEFUL_EXIT_MS: u64 = 250;
 /// بالا می‌آمد، نشانِ IP کشور هاپ اول را نشان می‌داد و کاربر از خروجی اِتِر
 /// بیرون می‌رفت، درست همان چیزی که زنجیره برای عوض‌کردنش هست. یک منبع حقیقت،
 /// یک بار تنظیم، بدون تغییر امضای هیچ تابعی.
+/// Every fixed local port an Aether pipeline binds. The port guard
+/// (`procguard.rs`) clears orphans from all of them at start-up.
+pub const FIXED_PORTS: [u16; 3] = [LOCAL_SOCKS_PORT, TOR_SOCKS_PORT, CHAIN_SOCKS_PORT];
+
 static EXIT_SOCKS_PORT: AtomicU16 = AtomicU16::new(LOCAL_SOCKS_PORT);
+
+// >>> AETHER-APP-FIX tor-psiphon-waits-for-psiphon
+/// Set when the engine prints `[+] psiphon is ready` (core `psiphon.rs`,
+/// `run_only`/`run_chain`/`start_reverse`): the moment Psiphon has an
+/// established tunnel. Cleared on every engine start. Mobile reads the same
+/// line (`PsiphonEngine.snapshot.ready`) before it lets the data path up.
+static PSIPHON_READY: AtomicBool = AtomicBool::new(false);
+
+pub fn psiphon_ready() -> bool {
+    PSIPHON_READY.load(Ordering::SeqCst)
+}
+
+// >>> AETHER-APP-FIX psiphon-wsaeacces-hint
+/// یک بار در هر نشست: psiphon-tunnel-core.exe با WSAEACCES (10013) رد شد.
+static PSIPHON_ACCESS_HINT: AtomicBool = AtomicBool::new(false);
+
+/// پیش از هر اجرای سایفون صدا زده می‌شود تا راهنما دوباره یک بار گفته شود.
+pub fn reset_psiphon_access_hint() {
+    PSIPHON_ACCESS_HINT.store(false, Ordering::SeqCst);
+}
+
+/// WSAEACCES خطای خودِ ویندوز است، نه سانسور: یک قاعدهٔ فایروال (ماندهٔ یک
+/// نشستِ کشته‌شده، یا برنامهٔ امنیتیِ دیگری) اجازهٔ connect نداد. لاگ‌های
+/// ۲۰۲۶-۱۰-۱۰ صدها سطرِ «forbidden by its access permissions» داشتند و هیچ
+/// توضیحی؛ این یک سطرِ قابل‌اقدام می‌گذارد و قواعدِ اتر را بررسی می‌کند.
+fn ingest_access_denied(line: &str) {
+    if !line.contains("forbidden by its access permissions") || !line.contains("psiphon") {
+        return;
+    }
+    if PSIPHON_ACCESS_HINT.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    DiagnosticsLog::w(
+        "engine",
+        "Windows refused a socket of psiphon-tunnel-core.exe (WSAEACCES 10013): a local firewall rule blocks it, not the censor. Checking for leftover Aether rules…",
+    );
+    std::thread::Builder::new()
+        .name("aether-wsaeacces".into())
+        .spawn(crate::leakguard::diagnose_access_denied)
+        .ok();
+}
+// <<< AETHER-APP-FIX psiphon-wsaeacces-hint
+
+fn ingest_psiphon_ready(line: &str) {
+    if line.contains("[+] psiphon is ready") {
+        PSIPHON_READY.store(true, Ordering::SeqCst);
+    }
+}
+// <<< AETHER-APP-FIX tor-psiphon-waits-for-psiphon
 
 /// پورت خروجیِ خط لولهٔ فعال.
 pub fn exit_socks_port() -> u16 {
@@ -157,6 +210,7 @@ fn forced_perf_tier(cpus: usize) -> Option<&'static str> {
 pub struct AetherProcess {
     exe: PathBuf,
     working_dir: PathBuf,
+    bundled_dir: PathBuf,
     child: Option<Child>,
     /// قابلیت‌های هستهٔ همراه، یک‌بار خوانده‌شده.
     ///
@@ -190,6 +244,17 @@ pub struct AetherProcess {
     /// خودش بالا می‌آورد. این‌جا همان دو متغیر را می‌دهیم و پرچم را نه.
     upstream_socks: Option<u16>,
     // <<< AETHER-APP-PATCH the-tor-in-front-is-the-real-tor
+    /// 1.3.0 port-guard: the engine's whole process tree (aether.exe plus the
+    /// psiphon-tunnel-core.exe it spawns). `TerminateProcess` on aether.exe
+    /// alone left Psiphon orphaned on 127.0.0.1:1819, and an app crash left
+    /// aether.exe itself there — see `procguard.rs`.
+    tree: Option<crate::procguard::KillTree>,
+    // >>> AETHER-APP-PATCH custom-configs-psiphon-only
+    /// زنجیره‌های کانفیگِ سفارشیِ `Psiphon → Config`: هستهٔ موتور با
+    /// `--psiphon-only` و **بی** upstream اجرا می‌شود (سایفون مستقیم، Xray از
+    /// دلِ 1819). فقط وقتی کانفیگِ سفارشی روشن است `true` می‌شود.
+    psiphon_only: bool,
+    // <<< AETHER-APP-PATCH custom-configs-psiphon-only
 }
 
 impl AetherProcess {
@@ -209,10 +274,38 @@ impl AetherProcess {
             caps: engine_caps(&exe),
             exe,
             working_dir: working_dir.to_path_buf(),
+            bundled_dir,
             child: None,
             uses_tor: false,
             upstream_socks: None,
+            tree: None,
+            psiphon_only: false,
         }
+    }
+
+    /// The engine, not the desktop, launches this bundled client. Runtime staging
+    /// can fall back to the installation directory; both paths are checked.
+    pub fn psiphon_assets(&self) -> Result<(PathBuf, PathBuf)> {
+        if engine_core_version(&self.exe) < (2, 1) {
+            return Err(anyhow!("Psiphon chains require Aether Core 2.1.0 or newer"));
+        }
+        let install = self.working_dir.join("engine");
+        let candidates = [
+            self.exe.parent().unwrap_or(install.as_path()),
+            install.as_path(),
+            self.bundled_dir.as_path(),
+        ];
+        let find = |name: &str| -> Result<PathBuf> {
+            candidates
+                .iter()
+                .map(|d| d.join(name))
+                .find(|p| p.is_file())
+                .ok_or_else(|| anyhow!("Bundled Psiphon asset missing: {name}"))
+        };
+        Ok((
+            find("psiphon-tunnel-core.exe")?,
+            find("server_entries.txt")?,
+        ))
     }
 
     /// قابلیت‌های هستهٔ همراه — همان چیزی که [`AetherProcess::start`] برای
@@ -227,6 +320,21 @@ impl AetherProcess {
     pub fn set_upstream_socks(&mut self, port: Option<u16>) {
         self.upstream_socks = port;
     }
+
+    // >>> AETHER-APP-PATCH custom-configs-psiphon-only
+    /// رجوع به فیلدِ `psiphon_only`. پیش از `start`؛ پیش‌فرض `false`.
+    pub fn set_psiphon_only(&mut self, on: bool) {
+        self.psiphon_only = on;
+    }
+
+    /// این اجرا مسیرِ «فقط سایفون»ِ هسته است؟ پیش از این قابلیت تنها شرط
+    /// `TorPsiphon && upstream_socks.is_some()` بود و با `psiphon_only=false`
+    /// دقیقاً همان می‌ماند.
+    fn psiphon_only_run(&self, profile: &ConnectionProfile) -> bool {
+        profile.backend == crate::profile::TransportBackend::TorPsiphon
+            && (self.upstream_socks.is_some() || self.psiphon_only)
+    }
+    // <<< AETHER-APP-PATCH custom-configs-psiphon-only
 
     /// آیا این موتور در این نشست اصلاً اجرا شده؟
     ///
@@ -298,10 +406,74 @@ impl AetherProcess {
                     format!("socks5://127.0.0.1:{port}"),
                 ),
                 ("AETHER_MASQUE_HTTP2".to_string(), "1".to_string()),
+                // >>> AETHER-APP-PATCH tor-reverse-latch
+                // سنجشِ گیت‌وِیِ کش‌شده به‌طورِ پیش‌فرض ۲ ثانیه است (۱۵۰۰ms +
+                // ۵۰۰ms). از داخلِ یک مدارِ تور فقط دست‌دادنِ SOCKS و TLS بیش از
+                // این طول می‌کشد، پس در `loge2`/`loge3` هر بار هر دو گیت‌وِیِ
+                // سالمِ قبلی «no longer answers» شدند و اسکنِ تازه راه افتاد.
+                // `0` یعنی «بی‌بودجه»: سقفِ خودِ هسته (۵ ثانیه) می‌ماند، و
+                // کندیِ مدارِ تور به حسابِ لبهٔ WARP گذاشته نمی‌شود.
+                // HTTP/2 PING over Tor may take much longer than on a direct
+                // socket. Avoid dropping a working circuit after the default
+                // 20s without PONG; the session watchdog still checks egress.
+                (
+                    "AETHER_MASQUE_H2_KEEPALIVE_TIMEOUT_SECS".to_string(),
+                    "60".to_string(),
+                ),
+                // <<< AETHER-APP-PATCH tor-reverse-latch
             ],
         }
     }
     // <<< AETHER-APP-PATCH the-tor-in-front-is-the-real-tor
+
+    /// پوشه‌ای که موتور در آن اجرا می‌شود و فایل‌های هویتش (`aether-team-*.toml`)
+    /// را می‌نویسد. ورودِ Zero Trust با آن می‌فهمد دستگاه عضوِ تیم هست یا نه.
+    pub fn run_dir(&self) -> PathBuf {
+        self.exe
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.working_dir.clone())
+    }
+
+    // >>> AETHER-APP-FIX forget-a-gateway-that-failed-its-proof
+    /// Deletes the engine's "last working gateway" caches (`*-lastconn.toml`:
+    /// `aether-lastconn.toml` for WireGuard/gool, `aether-masque-lastconn.toml`,
+    /// and the `aether-team-…-lastconn.toml` variants) from the run folder.
+    ///
+    /// ROOT CAUSE (field log 2026-10-08, Aether mode, first connect after
+    /// install). The core saves a gateway to `lastconn` as soon as it picks it —
+    /// before the tunnel has carried a single byte (`lib.rs`: `lastconn::save`
+    /// right after "using cloudflare edge"). Its quick-reconnect check only
+    /// re-does the handshake. So an edge that handshakes but carries no data
+    /// (`188.114.96.125:878`: "no valid data from peer", HTTPS probes failed)
+    /// was reused by the NEXT rung ("cached endpoint … still works; skipping
+    /// scan") and again by the NEXT session — two full rungs and a whole second
+    /// connect burnt on the same dead edge. The rescan that finally ran found a
+    /// working edge in seconds. The core cannot be patched here (CI keeps it
+    /// byte-identical to upstream), so the app forgets the cache whenever an
+    /// attempt fails its end-to-end proof; a successful session re-creates it.
+    /// Must only be called while the engine is stopped.
+    pub fn forget_cached_gateways(&self) {
+        let mut dirs = vec![self.run_dir()];
+        if !dirs.contains(&self.working_dir) {
+            dirs.push(self.working_dir.clone());
+        }
+        for dir in dirs {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if is_gateway_cache_file(&name) && std::fs::remove_file(entry.path()).is_ok() {
+                    DiagnosticsLog::i(
+                        "engine",
+                        &format!("Forgot the cached gateway {name}: the attempt that used it failed its self-test, so the next attempt scans afresh."),
+                    );
+                }
+            }
+        }
+    }
+    // <<< AETHER-APP-FIX forget-a-gateway-that-failed-its-proof
 
     pub fn start(
         &mut self,
@@ -311,11 +483,34 @@ impl AetherProcess {
         if !self.exe.exists() {
             return Err(anyhow!("Engine binary missing: {}", self.exe.display()));
         }
+        // The rung budget is the app's own deadline (see `state.rs`); the unmodified
+        // core takes no budget variable, so it is only recorded for the log.
+        if let Some(ms) = rung_budget_ms {
+            DiagnosticsLog::i(
+                "engine",
+                &format!("Rung budget {}s (scan sized by --scan).", ms / 1000),
+            );
+        }
 
         // v10: فلگ‌های هستهٔ 1.5.0 (Zero Trust / routing / dns) فقط وقتی
         // فرستاده می‌شوند که هستهٔ همراه واقعاً آن‌ها را بفهمد.
         let caps = self.caps;
-        let mut args = profile.to_args_with_caps(caps);
+        let mut engine_profile = profile.clone();
+        // Direct routes belong to the local bridge only. The engine is the shared
+        // upstream for both localhost and LAN peers, so it must never route direct.
+        engine_profile.route_direct.clear();
+        let mut args = engine_profile.to_args_with_caps(caps);
+        if self.psiphon_only_run(profile) {
+            // Core's Psiphon-only path binds the primary SOCKS listener (1819).
+            // Never ask it to bootstrap a second, internal arti process: the
+            // native Tor circuit is already up on 1820. The bundled Psiphon
+            // child and its server entries are still supplied below.
+            args.retain(|arg| arg != "--tor-only" && arg != "--psiphon");
+            if let Some(at) = args.iter().position(|arg| arg == "--psiphon-bind") {
+                args.drain(at..at + 2);
+            }
+            args.insert(0, "--psiphon-only".into());
+        }
         // لاگر جدید هستهٔ 1.4.0 متغیر RUST_LOG را نادیده می‌گیرد و فقط از
         // سوییچ رسمی خودش دستور می‌گیرد (لاگ v12 این را ثابت کرد: هیچ
         // خط debug چاپ نشد). سطح trace تنها راه دیدن عملیاتی است که
@@ -381,7 +576,10 @@ impl AetherProcess {
         //    ولی وقتی موتور از پوشهٔ نصب اجرا می‌شود و PTها کنار دادهٔ برنامه‌اند
         //    (نصبِ per-user، یا PTهایی که بعداً کنار هم گذاشته شده‌اند) این
         //    متغیر تنها راهِ یافتنشان است.
-        let tor_dirs = if caps.tor && profile.backend.uses_tor() {
+        let tor_dirs = if caps.tor
+            && profile.backend.uses_tor()
+            && !self.psiphon_only_run(profile)
+        {
             tor_runtime_dirs(&self.working_dir)
         } else {
             Vec::new()
@@ -390,14 +588,93 @@ impl AetherProcess {
         // بزند — رجوع به توضیحِ فیلد `uses_tor` در تعریفِ struct.
         self.uses_tor = !tor_dirs.is_empty();
 
+        // >>> AETHER-APP-PATCH smart-lists-routes-file (mobile 1.4.0 `SmartLists.engineRoutesFile`)
+        // «دور زدن سایت‌های ایرانی» / «مسدودسازی تبلیغات»: موتور در نشست‌های
+        // تک‌هاپی مقصد را می‌بیند، پس فهرست‌های داخلی به‌صورت فایل مسیرها به او
+        // می‌رسند (`routing.rs::RuleSet::from_env`). در استیجِ ۱ِ Psiphon هر دو
+        // پرچم خاموش‌اند (`chained_stage`) و این‌جا هیچ فایلی ساخته نمی‌شود؛
+        // آن‌جا پل قواعد را اعمال می‌کند.
+        let mut smart_env: Vec<(String, String)> = Vec::new();
+        if caps.routing {
+            if let Some(path) = crate::smart_lists::engine_routes_file(&self.working_dir, profile) {
+                smart_env.push(("AETHER_ROUTES_FILE".into(), path.display().to_string()));
+            }
+        }
+        // <<< AETHER-APP-PATCH smart-lists-routes-file
+        // >>> AETHER-APP-PATCH zt-preconnect-handoff (mobile 1.4.0 `TeamSignInHandoff`)
+        // ورودِ پیش از اتصال: اگر کاربر در تنظیمات با کدِ ایمیل وارد شده و
+        // دستگاه هنوز عضوِ این تیم نیست، JWT به‌صورت `AETHER_ACCESS_TOKEN` می‌رود؛
+        // موتور توکن را بر ایمیل مقدم می‌دارد و دیگر وسطِ اتصال کدی نمی‌خواهد.
+        if caps.zero_trust
+            && profile.uses_zero_trust()
+            && profile.access_mode == crate::profile::AccessMode::Email
+        {
+            let record = crate::zt_signin::load_record(&self.working_dir);
+            let dirs: Vec<&Path> = [Some(run_dir.as_path()), Some(self.working_dir.as_path())]
+                .into_iter()
+                .flatten()
+                .collect();
+            match crate::zt_signin::decide(
+                record.as_ref(),
+                &profile.team,
+                &profile.access_email,
+                |t| crate::zt_signin::is_enrolled(&dirs, t),
+                crate::zt_signin::now_secs(),
+            ) {
+                crate::zt_signin::Decision::Use(token) => {
+                    DiagnosticsLog::i(
+                        "zerotrust",
+                        "Handing the pre-connect sign-in to the engine.",
+                    );
+                    smart_env.push(("AETHER_ACCESS_TOKEN".into(), token));
+                }
+                crate::zt_signin::Decision::AlreadyEnrolled
+                | crate::zt_signin::Decision::Unusable => {
+                    // مصرف‌شده یا منقضی: نگه‌داشتنش فقط یک رازِ خفته است.
+                    crate::zt_signin::save_record(&self.working_dir, None);
+                }
+                _ => {}
+            }
+        }
+        // <<< AETHER-APP-PATCH zt-preconnect-handoff
+
+        if profile.is_chained() {
+            let (binary, servers) = self.psiphon_assets()?;
+            args.push("--psiphon-bin".into());
+            args.push(binary.display().to_string());
+            smart_env.push((
+                "AETHER_PSIPHON_SERVER_ENTRIES".into(),
+                servers.display().to_string(),
+            ));
+            smart_env.push((
+                "AETHER_PSIPHON_DIR".into(),
+                self.working_dir.join("psiphon").display().to_string(),
+            ));
+        }
         let mut cmd = Command::new(&self.exe);
         cmd.args(&args)
+            .envs(smart_env)
             .envs(tor_dirs.clone())
-            .envs(self.upstream_env())
             .current_dir(&run_dir)
             // v11: متغیرهای هستهٔ 1.7.0 هم مثل فلگ‌ها گِیت شده‌اند.
-            .envs(profile.to_env_with_caps(caps))
-            .envs(scan_budget_env(rung_budget_ms))
+            .envs(
+                if self.psiphon_only_run(profile) {
+                    // No arti bootstrap is performed by this process.
+                    let mut env = profile.to_env_with_caps(caps);
+                    env.retain(|key, _| !key.starts_with("AETHER_TOR"));
+                    env
+                } else {
+                    profile.to_env_with_caps(caps)
+                },
+            )
+            // >>> AETHER-APP-PATCH tor-reverse-latch
+            // بعد از پروفایل، تا هیچ مقدارِ پروفایلی (مثلاً `AETHER_MASQUE_HTTP2=0`
+            // یا بودجهٔ fast_endpoint_only) حاملِ داخلِ تور را پس نزند.
+            .envs(self.upstream_env())
+            // <<< AETHER-APP-PATCH tor-reverse-latch
+            // Core 2.3.0 (upstream, unmodified) sizes its own endpoint scan from
+            // `--scan` and has no rung-budget variable; the ladder in
+            // `smart_auto.rs` sizes every rung to fit that scan instead.
             .env("HOME", &run_dir)
             .env("TMPDIR", &run_dir)
             // هستهٔ 1.4.0 بلافاصله بعد از مرحلهٔ جدید sysprofile با
@@ -419,18 +696,27 @@ impl AetherProcess {
         #[cfg(windows)]
         cmd.creation_flags(CREATE_NO_WINDOW);
 
+        // >>> AETHER-APP-FIX tor-psiphon-waits-for-psiphon
+        PSIPHON_READY.store(false, Ordering::SeqCst);
+        // <<< AETHER-APP-FIX tor-psiphon-waits-for-psiphon
         let mut child = cmd.spawn()?;
+        // Before anything else: from here on the engine and every process it
+        // starts die with this app, however the app ends.
+        self.tree = Some(crate::procguard::KillTree::adopt(&child, "aether.exe"));
 
-        // موتور بدون کنسول اجرا می‌شود (CREATE_NO_WINDOW). تست cmd کاربر ثابت
-        // کرد هستهٔ 1.4.0 در کنسول واقعی کامل وصل می‌شود و سؤال تعاملی
-        // quick-reconnect ([Y/n]) می‌پرسد؛ زیر برنامه بدون stdin معتبر، دسترسی
-        // کنسولی هسته با Access is denied (code 5) شکست می‌خورد.
-        // اینجا یک stdin معتبر می‌دهیم و جواب پیش‌فرض «بله» را می‌نویسیم؛
-        // با بسته‌شدن pipe، خواندن‌های بعدی EOF تمیز می‌گیرند نه خطا.
-        if let Some(mut stdin) = child.stdin.take() {
-            use std::io::Write;
-            let _ = stdin.write_all(b"y\n");
-        }
+        // >>> AETHER-APP-PATCH zt-login-code-prompt
+        // موتور بدون کنسول اجرا می‌شود (CREATE_NO_WINDOW) و stdinش یک لولهٔ
+        // معتبر است (نه دستگیرهٔ کنسولی که Access is denied می‌داد). هستهٔ ۲.۳.۰
+        // از stdinِ غیرترمینال فقط یک چیز می‌خواند: کدِ ورودِ Zero Trust
+        // (`[zerotrust] login-code-needed`). پس لوله باز می‌ماند و به
+        // `login_code` سپرده می‌شود؛ دیگر «y\n»ی نوشته نمی‌شود که هسته آن را
+        // اولین کد بگیرد. پورت از LoginCodePrompt.kt موبایل ۱.۵.۰.
+        let stdin_sink: Option<Box<dyn std::io::Write + Send>> = child
+            .stdin
+            .take()
+            .map(|s| Box::new(s) as Box<dyn std::io::Write + Send>);
+        let generation = crate::login_code::attach(stdin_sink);
+        // <<< AETHER-APP-PATCH zt-login-code-prompt
 
         DiagnosticsLog::i(
             "engine",
@@ -447,10 +733,10 @@ impl AetherProcess {
 
         // درنگ کردن stdout و stderr — دقیقاً مثل ترد «aether-log» در اندروید.
         if let Some(out) = child.stdout.take() {
-            spawn_drain(out);
+            spawn_drain(out, Some(generation));
         }
         if let Some(err) = child.stderr.take() {
-            spawn_drain(err);
+            spawn_drain(err, None);
         }
 
         self.child = Some(child);
@@ -527,10 +813,16 @@ impl AetherProcess {
     /// نحوهٔ خاتمهٔ پردازه. پس این تابع دوباره همان چیزی است که بود: سریع و صریح.
     pub fn stop(&mut self) {
         let Some(mut child) = self.child.take() else {
+            self.tree = None;
             return;
         };
         self.uses_tor = false;
 
+        // The whole tree first (aether.exe + psiphon-tunnel-core.exe), then the
+        // direct kill as a fallback for a tree that could not be adopted.
+        if let Some(tree) = self.tree.as_ref() {
+            tree.terminate();
+        }
         let _ = child.kill(); // در ویندوز TerminateProcess فوری است
         let deadline = Instant::now() + Duration::from_millis(GRACEFUL_EXIT_MS);
         while Instant::now() < deadline {
@@ -540,6 +832,7 @@ impl AetherProcess {
             std::thread::sleep(Duration::from_millis(10));
         }
         let _ = child.wait();
+        self.tree = None;
         DiagnosticsLog::w("engine", "Engine stopped and reaped.");
     }
 }
@@ -670,7 +963,13 @@ fn runtime_copy_is_fresh(src: &Path, dst: &Path) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    matches!((a.modified(), b.modified()), (Ok(s), Ok(d)) if d >= s)
+    // AETHER-APP-PATCH security-audit-1.3.0 (S-01): the runtime folder is
+    // user-writable and its binaries run elevated, so size+mtime is not proof.
+    // Compare the bytes against the protected install copy every time.
+    match (std::fs::read(src), std::fs::read(dst)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
 }
 
 /// v10 سخت‌سازی امنیتی: مقدار فلگ‌های محرمانه در لاگ ماندگار پوشانده می‌شود.
@@ -678,7 +977,9 @@ fn runtime_copy_is_fresh(src: &Path, dst: &Path) -> bool {
 /// فایل لاگ چرخان ثبت نمی‌شود (همان قاعدهٔ ماسک IP در diagnostics.rs).
 fn redact_args(args: &[String]) -> Vec<String> {
     // v11: مقدار --upstream می‌تواند user:pass پروکسی کاربر را داشته باشد.
-    const SENSITIVE: [&str; 4] = [
+    const SENSITIVE: [&str; 6] = [
+        "--tor-bridge",
+        "--access-id",
         "--access-secret",
         "--access-token",
         "--access-email",
@@ -757,7 +1058,7 @@ fn tor_runtime_dirs(working_dir: &Path) -> Vec<(String, String)> {
     env
 }
 
-fn spawn_drain<R: std::io::Read + Send + 'static>(reader: R) {
+fn spawn_drain<R: std::io::Read + Send + 'static>(reader: R, prompt_generation: Option<u64>) {
     std::thread::Builder::new()
         .name("aether-log".into())
         .spawn(move || {
@@ -774,30 +1075,24 @@ fn spawn_drain<R: std::io::Read + Send + 'static>(reader: R) {
                 // ۱.۲.۵ — مهرِ ساختِ موتور در همین سطرها می‌آید. مثل بالا،
                 // برای هر سطرِ دیگری با یک `contains` برمی‌گردد.
                 crate::provenance::ingest(&line);
+                // AETHER-APP-FIX tor-fresh-circuit-for-the-engine: درخواستِ بی‌جواب از راهِ تور.
+                crate::tor_native::ingest_engine_line(&line);
+                // >>> AETHER-APP-FIX tor-psiphon-waits-for-psiphon
+                ingest_psiphon_ready(&line);
+                // <<< AETHER-APP-FIX tor-psiphon-waits-for-psiphon
+                // AETHER-APP-FIX psiphon-wsaeacces-hint
+                ingest_access_denied(&line);
+                // AETHER-APP-PATCH zt-login-code-prompt: درخواستِ کدِ ورود در stdout می‌آید.
+                if prompt_generation.is_some() {
+                    crate::login_code::ingest(&line);
+                }
+            }
+            if let Some(generation) = prompt_generation {
+                crate::login_code::detach(generation);
             }
             DiagnosticsLog::w("engine", "Engine output stream closed.");
         })
         .ok();
-}
-
-/// Translates this rung's wall-clock budget into the scan budget the engine
-/// understands. See [`AetherProcess::start`] for why this exists.
-fn scan_budget_env(rung_budget_ms: Option<u64>) -> Vec<(String, String)> {
-    let Some(total) = rung_budget_ms else {
-        return Vec::new();
-    };
-    // ۱.۲.۵: این حساب و سقفِ پاسِ اول یک چیزند و حالا یک‌جا زندگی می‌کنند —
-    // `budgets.rs`. رابطه‌شان همان‌جا با assertِ زمانِ کامپایل قفل است.
-    let budget = crate::budgets::scan_budget_ms(total);
-    DiagnosticsLog::i(
-        "engine",
-        &format!(
-            "Rung budget {}s → engine endpoint-scan budget {}s (the rest is identity, gateway check and tunnel setup).",
-            total / 1000,
-            budget / 1000
-        ),
-    );
-    vec![("AETHER_SCAN_BUDGET_MS".to_string(), budget.to_string())]
 }
 
 /// معادل `PortProbe.kt`: پیش از اجرای موتور جدید، منتظر آزادشدن پورت می‌مانیم.
@@ -837,3 +1132,36 @@ mod perf_tier_tests {
     }
 }
 // <<< AETHER-APP-FIX perf-tier-matches-the-machine
+
+// >>> AETHER-APP-FIX forget-a-gateway-that-failed-its-proof
+/// `aether[-masque|-team-…|-secondary]-lastconn.toml` — the core's
+/// `derive_sibling_path(config, "lastconn")` names, and nothing else.
+fn is_gateway_cache_file(name: &str) -> bool {
+    name.starts_with("aether") && name.ends_with("-lastconn.toml")
+}
+
+#[cfg(test)]
+mod gateway_cache_tests {
+    use super::is_gateway_cache_file;
+
+    #[test]
+    fn only_the_cores_lastconn_files_are_forgotten() {
+        assert!(is_gateway_cache_file("aether-lastconn.toml"));
+        assert!(is_gateway_cache_file("aether-masque-lastconn.toml"));
+        assert!(is_gateway_cache_file("aether-team-acme-lastconn.toml"));
+        assert!(!is_gateway_cache_file("aether.toml"));
+        assert!(!is_gateway_cache_file("aether-masque.toml"));
+        assert!(!is_gateway_cache_file("aether-team-acme.toml"));
+    }
+
+    /// The exact line core 2.3.0 prints in `run_only` (field log 2026-10-08).
+    #[test]
+    fn the_psiphon_ready_line_is_recognised() {
+        super::PSIPHON_READY.store(false, std::sync::atomic::Ordering::SeqCst);
+        super::ingest_psiphon_ready("[2026-10-08T12:39:52Z INFO  aether::psiphon] [*] psiphon dials out through the upstream proxy");
+        assert!(!super::psiphon_ready());
+        super::ingest_psiphon_ready("[2026-10-08T12:39:53.969Z INFO  aether::psiphon] [+] psiphon is ready; 127.0.0.1:1819 leaves through psiphon");
+        assert!(super::psiphon_ready());
+    }
+}
+// <<< AETHER-APP-FIX forget-a-gateway-that-failed-its-proof

@@ -14,9 +14,12 @@ import { renderDiagnostics } from './views/diagnostics.js'
 import { renderShare } from './views/share.js'
 import { renderAbout } from './views/about.js'
 
-import { t, applyLang } from './i18n.js'
-import { initAi } from './ai.js'
+import { t, applyLang, getLang, setLangPersister, adoptStoredLang } from './i18n.js'
+import { initAi, refreshAi } from './ai.js'
+// AETHER-APP-PATCH whats-new
+import { maybeShowWhatsNew } from './ui/whatsnew.js'
 import { setTabRouter } from './ui/nav.js'
+import { syncLoginCode } from './ui/logincode.js'
 
 // --- وضعیت سراسری ------------------------------------------------------
 export const app = {
@@ -32,6 +35,12 @@ export const app = {
     txBytes: 0,
     shareSocks: null,
     shareHttp: null,
+    // ۱.۵.۰ — اشتراک LAN: off | waiting | ready | portBusy، آدرس‌ها و اتصال‌ها.
+    shareStatus: 'off',
+    shareTargets: [],
+    shareClients: 0,
+    // ۱.۵.۰ — هسته منتظرِ کدِ ورودِ Zero Trust است (دیالوگ سراسری).
+    loginCode: null,
     ipInfo: null,
     ipLoading: true,
     // v1.2.0 — سنجش نشتی WebRTC: null = هنوز سنجیده نشده.
@@ -92,6 +101,8 @@ export async function saveProfile(patch) {
   }
   app.profile = { ...base, ...patch }
   await invoke('set_profile', { profile: app.profile })
+  // ai-gate-follows-tunnel: عوض‌شدن بک‌اند دروازهٔ هوش مصنوعی (WRONG_MODE) را عوض می‌کند.
+  refreshAi()
   emit()
 }
 
@@ -271,6 +282,9 @@ function renderTab() {
   // `emit()` تازه تضمین می‌کند هر چیزی که این تب نشان می‌دهد با `app.profile`/
   // `app.snapshot` *همین الان* یکی است — نه با آخرین باری که این تب دیده شد.
   emit()
+  // A tab may be opened after a missed event while it was detached; consult
+  // Rust's current tunnel state before presenting the chat gate or model list.
+  if (app.tab === 'chat' || app.tab === 'assistant') refreshAi()
 }
 
 // Drops a cached view so the next visit rebuilds it. Used by panels whose markup
@@ -390,12 +404,21 @@ async function boot() {
   host.innerHTML = '<div class="boot-skeleton" aria-busy="true"></div>'
 
   // Fetch initial state in parallel instead of serializing two IPC round trips.
-  const [profile, snapshot] = await Promise.all([
+  // ui-lang-on-disk: زبان از prefs.json سمت Rust هم خوانده می‌شود (همان رفت‌وبرگشت موازی).
+  setLangPersister((lang) => invoke('set_ui_lang', { lang }))
+  const [profile, snapshot, storedLang] = await Promise.all([
     invoke('get_profile'),
     invoke('get_snapshot'),
+    invoke('get_ui_lang').catch(() => null),
   ])
   app.profile = profile
   app.snapshot = snapshot
+  if (storedLang === 'fa' || storedLang === 'en') {
+    if (adoptStoredLang(storedLang)) translateChrome()
+  } else {
+    // اولین اجرا بعد از این نسخه: انتخابِ فعلیِ localStorage را به دیسک منتقل کن.
+    invoke('set_ui_lang', { lang: getLang() }).catch(() => {})
+  }
 
   // پروفایلی که خودِ Rust نوشته — مسیرهای هوش مصنوعی. بی این، صفحهٔ تنظیمات
   // مقدارِ پیش از اعمال را نشان می‌داد و کاربر نتیجه می‌گرفت که «اعمال نشد».
@@ -405,8 +428,14 @@ async function boot() {
 
   // جریان زندهٔ وضعیت — معادل StateFlow در اندروید (هر ۲۰۰ میلی‌ثانیه).
   let lastAccent = null
+  // ai-gate-follows-tunnel: حالت اتصالی که دروازهٔ هوش مصنوعی آخرین بار با آن سنجیده شد.
+  let lastGateState = app.snapshot?.state ?? null
   await listen('aether://state', (event) => {
     app.snapshot = event.payload
+    if (app.snapshot?.state !== lastGateState) {
+      lastGateState = app.snapshot?.state ?? null
+      refreshAi()
+    }
     // فقط وقتی رنگ واقعاً عوض شده بنویس — نوشتن مداوم متغیر CSS روی <html>
     // هر ۲۰۰ms باعث style-recalc کل صفحه و گیرکردن انیمیشن کمان می‌شد.
     const accent = accentFor(app.snapshot.state)
@@ -414,6 +443,7 @@ async function boot() {
       lastAccent = accent
       document.documentElement.style.setProperty('--accent', accent)
     }
+    syncLoginCode(app.snapshot?.loginCode)
     emit()
   })
 
@@ -424,7 +454,14 @@ async function boot() {
 
   // Repaint the already-visible shell with the real state once IPC returns.
   renderTab()
+  syncLoginCode(app.snapshot?.loginCode)
   emit()
+
+  // >>> AETHER-APP-PATCH whats-new (1.3.0)
+  // پنجرهٔ «تازه‌ها»: اولین اجرا بعد از نصب یا ارتقا (تا وقتی کاربر برای همین
+  // نسخه «دیگر نمایش نده» را بزند). بعد از اولین رنگ‌آمیزی، تا شروع را کند نکند.
+  maybeShowWhatsNew().catch((error) => console.error('What\'s new dialog unavailable', error))
+  // <<< AETHER-APP-PATCH whats-new
 }
 
 boot().catch((error) => {

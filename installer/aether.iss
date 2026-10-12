@@ -5,7 +5,7 @@
 ; ============================================================================
 
 #ifndef MyAppVersion
-  #define MyAppVersion "1.2.5"
+  #define MyAppVersion "1.3.0"
 #endif
 #ifndef MyArch
   #define MyArch "x64"
@@ -52,7 +52,8 @@ ArchitecturesInstallIn64BitMode=x64compatible
 #endif
 
 PrivilegesRequired=admin
-PrivilegesRequiredOverridesAllowed=dialog
+; security-audit-1.3.0 (S-06): no per-user install; the app runs elevated and
+; must never live in a user-writable folder.
 Compression=lzma2/ultra64
 SolidCompression=yes
 LZMAUseSeparateProcess=yes

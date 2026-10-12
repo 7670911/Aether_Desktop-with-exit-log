@@ -4,7 +4,7 @@
 //! رفتار یکسان است: خواندن هرگز خطا نمی‌دهد — فایل خراب یعنی پیش‌فرض‌ها.
 
 use crate::log::DiagnosticsLog;
-use crate::profile::{ConnectionProfile, TransportBackend, SETTINGS_REV};
+use crate::profile::{ConnectionProfile, SETTINGS_REV};
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
@@ -33,7 +33,10 @@ impl ProfileStore {
             },
             Err(_) => ConnectionProfile::default(),
         };
-        if migrate(&mut profile) {
+        // A missing profile already defaults to Aether. Never reset a saved choice:
+        // even profiles from an older settings revision belong to the user.
+        let changed = migrate(&mut profile);
+        if changed {
             let _ = self.save(&profile);
         }
         profile
@@ -70,35 +73,11 @@ impl ProfileStore {
 /// so a network that genuinely needs the TCP carrier gets it anyway, on evidence
 /// rather than on a stale checkbox.
 ///
-/// ## rev 3 - the connection backend goes back to Aether
-///
-/// `ConnectionProfile::default()` and `default_backend()` have always been
-/// `Aether`, so a genuinely fresh profile starts there. What made the app come up
-/// on a Tor pipeline anyway is that `profile.json` lives in `%LOCALAPPDATA%` and
-/// outlives an uninstall: whatever backend was selected while chasing a
-/// connection problem is still there after reinstalling, and Tor is the slowest
-/// and least likely of them to come up on its own.
-///
-/// The backend is the one setting where a leftover choice costs the user the
-/// whole session, so it is reset once - the same reasoning as rev 2, and the
-/// mechanism these revisions exist for. A user who wants Tor picks it again and
-/// keeps it: later revisions do not touch it.
+/// The backend is *not* migrated: only a missing profile or missing backend field
+/// uses Aether. Previous releases reset the user's saved choice at startup.
 fn migrate(profile: &mut ConnectionProfile) -> bool {
     if profile.settings_rev >= SETTINGS_REV {
         return false;
-    }
-
-    if profile.backend != TransportBackend::Aether {
-        let was = profile.backend;
-        profile.backend = TransportBackend::Aether;
-        DiagnosticsLog::i(
-            "store",
-            &format!(
-                "Settings migration: the connection backend was still '{was:?}' from an earlier \
-                 session and is back on 'Aether', the default. Pick another backend in Settings \
-                 to keep it."
-            ),
-        );
     }
 
     if profile.masque_http2 {
@@ -161,6 +140,13 @@ impl PrefsStore {
     }
 
     pub fn set_string(&self, key: &str, value: &str) -> Result<()> {
+        // >>> AETHER-APP-PATCH ui-lang-on-disk (1.3.0)
+        // چند نویسنده (هندسهٔ پنجره روی رشتهٔ رویداد، زبان و مدل روی رشتهٔ IPC)
+        // همین فایل را خواندن-تغییر-نوشتن می‌کنند؛ بی قفل، یکی تغییر دیگری را
+        // بی‌صدا پاک می‌کرد.
+        static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // <<< AETHER-APP-PATCH ui-lang-on-disk
         let mut all = self.read_all();
         if value.is_empty() {
             all.remove(key);
@@ -182,30 +168,38 @@ mod tests {
     use super::*;
     use crate::profile::{ConnectionProfile, TransportBackend};
 
-    /// rev 3: ein gespeichertes Tor-Backend faellt einmalig auf Aether zurueck.
     #[test]
-    fn a_profile_from_an_older_build_comes_back_on_aether() {
+    fn first_install_defaults_to_aether() {
+        let dir = std::env::temp_dir().join(format!("aether-fresh-{}", std::process::id()));
+        let store = ProfileStore::new(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(store.load().backend, TransportBackend::Aether);
+    }
+
+    #[test]
+    fn migration_preserves_legacy_backend() {
         let mut old = ConnectionProfile {
             backend: TransportBackend::Tor,
             settings_rev: 2,
             ..ConnectionProfile::default()
         };
-
         assert!(migrate(&mut old));
-        assert_eq!(old.backend, TransportBackend::Aether);
+        assert_eq!(old.backend, TransportBackend::Tor);
         assert_eq!(old.settings_rev, SETTINGS_REV);
     }
 
-    /// Und danach nicht mehr: wer Tor bewusst waehlt, behaelt es.
     #[test]
-    fn a_current_profile_keeps_the_backend_the_user_picked() {
-        let mut mine = ConnectionProfile {
-            backend: TransportBackend::Tor,
+    fn load_preserves_saved_backend_across_launches() {
+        let dir = std::env::temp_dir().join(format!("aether-saved-{}", std::process::id()));
+        let store = ProfileStore::new(&dir);
+        let saved = ConnectionProfile {
+            backend: TransportBackend::AetherTor,
             settings_rev: SETTINGS_REV,
             ..ConnectionProfile::default()
         };
-
-        assert!(!migrate(&mut mine));
-        assert_eq!(mine.backend, TransportBackend::Tor);
+        store.save(&saved).unwrap();
+        assert_eq!(store.load().backend, TransportBackend::AetherTor);
+        assert_eq!(store.load().backend, TransportBackend::AetherTor);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -98,6 +98,9 @@ def zerlege(text: str):
             i += 1
             while i < n:
                 if text[i] == "\\":
+                    # `"…\<Zeilenumbruch>` — der Umbruch zählt trotzdem als Zeile
+                    if i + 1 < n and text[i + 1] == "\n":
+                        zeile += 1
                     i += 2
                     continue
                 if text[i] == '"':
@@ -145,6 +148,95 @@ def _roher_string(text: str, i: int):
     return ende + len(schluss), text.count("\n", i, ende)
 
 
+
+# >>> AETHER-APP-FIX top-level-stray-code
+# Am 2026-10-05 fiel `Build x64` erneut beim ersten cargo-Schritt:
+#
+#   error: expected one of `!` or `::`, found `=`
+#      --> src\\engine.rs:918:40
+#   918 | AETHER_QUICK_RECONNECT_MAX_HANDSHAKE_MS=0 # Disable handshake timeout for Tor
+#
+# Eine Shell-Zeile war ans Dateiende geraten. Die Klammer-Bilanz bleibt dabei
+# völlig ausgeglichen, deshalb war dieser Wächter grün. Jetzt wird zusätzlich
+# geprüft, dass auf oberster Ebene (Klammertiefe 0) nur Items beginnen:
+# Attribute, `pub`/`fn`/`use`/`mod`/… oder ein Makroaufruf `name!`.
+ITEM_START = {
+    "pub", "fn", "use", "mod", "struct", "enum", "union", "impl", "trait",
+    "const", "static", "type", "extern", "unsafe", "async", "macro_rules",
+    "crate", "self", "super", "auto", "default",
+}
+
+
+def oberste_ebene(code: str, zeilen):
+    """Befunde für Text auf Klammertiefe 0, der kein Item beginnt."""
+    import re
+
+    befunde = []
+    tiefe = 0
+    erwartet = True      # wir stehen vor dem Beginn eines Items
+    attribut = False     # das laufende Item ist ein `#[...]`
+    i, n = 0, len(code)
+    while i < n:
+        c = code[i]
+        if c.isspace():
+            i += 1
+            continue
+        if tiefe == 0 and erwartet:
+            if c == ";":
+                i += 1
+                continue
+            if c == "#":
+                attribut = True
+                erwartet = False
+                i += 1
+                continue
+            m = re.match(r"[A-Za-z_][A-Za-z0-9_]*", code[i:])
+            if not m:
+                befunde.append(
+                    f"Zeile {zeilen[i]}: `{c}` auf oberster Ebene — dort darf nur ein Item beginnen"
+                )
+                return befunde
+            wort = m.group(0)
+            j = i + len(wort)
+            # Makroaufruf: name! / pfad::name!
+            k = j
+            while code.startswith("::", k):
+                m2 = re.match(r"::[A-Za-z_][A-Za-z0-9_]*", code[k:])
+                if not m2:
+                    break
+                k += len(m2.group(0))
+            while k < n and code[k].isspace():
+                k += 1
+            ist_makro = k < n and code[k] == "!"
+            if wort not in ITEM_START and not ist_makro:
+                befunde.append(
+                    f"Zeile {zeilen[i]}: `{wort}` auf oberster Ebene ist kein Rust-Item "
+                    f"(verirrte Zeile, z. B. Shell/Env-Syntax?) — cargo bricht hier ab"
+                )
+                return befunde
+            erwartet = False
+            attribut = False
+            i = j
+            continue
+        if c in OEFFNER:
+            tiefe += 1
+        elif c in PAARE:
+            tiefe -= 1
+            if tiefe == 0:
+                if attribut and c == "]":
+                    erwartet = True
+                    attribut = False
+                elif c == "}" and not attribut:
+                    erwartet = True
+        elif c == ";" and tiefe == 0:
+            erwartet = True
+            attribut = False
+        i += 1
+    if not erwartet and not attribut and tiefe == 0:
+        pass
+    return befunde
+# <<< AETHER-APP-FIX top-level-stray-code
+
 def pruefe(pfad: Path):
     """Alle Befunde einer Datei — leere Liste heisst: parsebar."""
     text = pfad.read_text(encoding="utf-8", errors="replace")
@@ -167,6 +259,8 @@ def pruefe(pfad: Path):
     if stapel and not befunde:
         offen, offen_zeile = stapel[0]
         befunde.append(f"Zeile {offen_zeile}: `{offen}` wird nie geschlossen")
+    if not befunde:
+        befunde.extend(oberste_ebene(code, zeilen))
 
     # Code hinter einem Kommentar auf derselben Zeile.
     for nummer, roh in enumerate(text.split("\n"), 1):
@@ -211,7 +305,7 @@ def main() -> int:
         print(f"✗ {kaputt} Datei(en) sind nicht parsebar — cargo bricht darauf ab")
         return 1
 
-    print(f"✓ alle {len(dateien)} .rs-Dateien sind balanciert, kein Code hinter einem Kommentar")
+    print(f"✓ alle {len(dateien)} .rs-Dateien sind balanciert, kein Code hinter einem Kommentar, keine verirrte Zeile auf oberster Ebene")
     return 0
 
 

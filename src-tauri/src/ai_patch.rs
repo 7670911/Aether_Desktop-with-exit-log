@@ -84,6 +84,7 @@ const IP_VERSIONS: &[&str] = &["V4", "V6", "BOTH"];
 const NOIZE_MODES: &[&str] = &["OFF", "LIGHT", "FIREWALL", "BALANCED", "GFW", "AGGRESSIVE"];
 const ENDPOINT_MODES: &[&str] = &["AUTO", "MANUAL_PEER", "MANUAL_RANGE"];
 const SPLIT_MODES: &[&str] = &["OFF", "INCLUDE", "EXCLUDE"];
+#[allow(dead_code)]
 const ACCESS_MODES: &[&str] = &["OFF", "EMAIL", "SERVICE_TOKEN", "TOKEN"];
 
 /// هر کلیدی که مشاور اجازه دارد بنویسد — و هیچ کلید دیگری.
@@ -112,22 +113,17 @@ fn writable() -> BTreeMap<&'static str, Kind> {
     // --- تاب‌آوری
     m.insert("quickReconnect", Kind::Bool);
     m.insert("reconnectAttempts", Kind::Int(3, 20));
-    m.insert("killSwitch", Kind::Bool);
-    m.insert("ipv6Protection", Kind::Bool);
-    m.insert("lanShare", Kind::Bool);
     // --- DNS و مسیریابی
     m.insert("dns", Kind::TextList(8, 64));
     m.insert("routeBlock", Kind::TextList(200, 200));
-    m.insert("routeDirect", Kind::TextList(200, 200));
     m.insert("routeSniff", Kind::Bool);
     m.insert("gateway", Kind::Bool);
     // --- پروکسی بالادست و Zero Trust (بدون اعتبارنامه)
-    m.insert("upstream", Kind::Text(200));
-    m.insert("team", Kind::Text(64));
-    m.insert("accessMode", Kind::Enum(ACCESS_MODES));
-    m.insert("accessEmail", Kind::Text(160));
-    m.insert("accessId", Kind::Text(120));
     m.insert("splitMode", Kind::Enum(SPLIT_MODES));
+    // AETHER-APP-PATCH security-audit-1.3.0 (S-02): upstream, team, access*,
+    // routeDirect, lanShare, killSwitch and ipv6Protection are no longer
+    // writable by the model: they decide where traffic goes and whether it is
+    // protected, and the advisor prompt carries third-party log text.
     m
 }
 
@@ -162,7 +158,7 @@ fn writable() -> BTreeMap<&'static str, Kind> {
 /// افزودن یک کلید به این فهرست یعنی پاسخ‌دادن به این پرسش: «اگر مدل اشتباه کند،
 /// یا کسی موفق شود مدل را به این وادار کند، بدترین چیزی که می‌شود چیست؟»
 fn chat_writable() -> BTreeMap<&'static str, Kind> {
-    const CHAT_KEYS: [&str; 14] = [
+    const CHAT_KEYS: [&str; 13] = [
         "protocol",
         "scanMode",
         "ipVersion",
@@ -174,7 +170,8 @@ fn chat_writable() -> BTreeMap<&'static str, Kind> {
         "masqueHttp2",
         "quickReconnect",
         "reconnectAttempts",
-        "ipv6Protection",
+        // security-audit-1.3.0 (S-02): `ipv6Protection` left `writable`, so it
+        // cannot stay here either (`expect` below would panic on every chat).
         "routeSniff",
         "dns",
     ];
@@ -212,6 +209,14 @@ pub struct PatchOutcome {
     pub applied: Vec<(String, String)>,
     /// کلیدهایی که رد شدند، با دلیل.
     pub rejected: Vec<(String, String)>,
+    /// ۱.۴.۰-r4 (پورت از `AiPatch.REASON_ALREADY_SET`): پیشنهادهایی که مقدارشان
+    /// **همان** مقدارِ فعلیِ کاربر است — `(کلید، مقدارِ فعلی)`.
+    ///
+    /// نه «اعمال‌شده» است و نه «رد‌شده»، و قبلاً بی‌صدا دور ریخته می‌شد. ولی همین
+    /// است که حلقهٔ «بررسی و بازنویسی» لازم دارد: متنِ بالای کارت هنوز می‌گفت
+    /// «MTU را ۱۲۸۰ کن» به کاربری که ۱۲۸۰ داشت، و این سریع‌ترین راهِ از دست دادنِ
+    /// اعتمادِ کاربر به بقیهٔ حرف‌های دستیار است.
+    pub redundant: Vec<(String, String)>,
 }
 
 impl PatchOutcome {
@@ -270,7 +275,7 @@ fn apply_with(
             );
             outcome
                 .rejected
-                .push((key.clone(), "protected setting".into()));
+                .push((key.clone(), REASON_PROTECTED.into()));
             continue;
         }
         let Some(kind) = allowed.get(key.as_str()) else {
@@ -278,9 +283,7 @@ fn apply_with(
                 "ai",
                 &format!("advisor proposed the unknown key \"{key}\" — ignored"),
             );
-            outcome
-                .rejected
-                .push((key.clone(), "unknown setting".into()));
+            outcome.rejected.push((key.clone(), REASON_UNKNOWN.into()));
             continue;
         };
         match coerce(*kind, proposed) {
@@ -289,7 +292,9 @@ fn apply_with(
                 if before == value {
                     // نه اعمال‌شده و نه رد‌شده: خبری نیست. گزارش‌کردنش به‌عنوان
                     // «تغییر» یعنی کاربر با فهرستی از کارهای انجام‌نشده روبه‌رو
-                    // شود و باور کند چیزی عوض شده.
+                    // شود و باور کند چیزی عوض شده. ولی **ثبت** می‌شود تا
+                    // [`verification_feedback`] بتواند به مدل بگوید.
+                    outcome.redundant.push((key.clone(), render(&before)));
                     continue;
                 }
                 outcome.applied.push((key.clone(), render(&value)));
@@ -505,17 +510,26 @@ pub fn writable_keys_for_prompt() -> String {
 pub fn chat_keys_for_prompt() -> String {
     chat_writable()
         .into_iter()
-        .map(|(key, kind)| match kind {
-            Kind::Bool => format!("  {key}: true | false"),
-            Kind::Int(min, max) => format!("  {key}: a number from {min} to {max}"),
-            Kind::Enum(options) => format!("  {key}: {}", options.join(" | ")),
-            Kind::Text(max) => format!("  {key}: text, at most {max} characters"),
-            Kind::TextList(max_items, _) => {
-                format!("  {key}: comma separated, at most {max_items} entries, or empty for the default")
-            }
-        })
+        .map(|(key, kind)| format!("  {key}: {}", describe(kind)))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// شرحِ مقادیرِ مجازِ یک `Kind`، به زبانی که مدل می‌خواند.
+///
+/// یک منبع برای دو مصرف: فهرستِ پرامپت ([`chat_keys_for_prompt`]) و بازخوردِ
+/// «INVALID» در [`verification_feedback`]. اگر دو متن جدا بودند، روزی که یکی
+/// عوض می‌شد، بازخورد به مدل مقادیری را «مجاز» می‌گفت که پرامپت نمی‌گفت.
+fn describe(kind: Kind) -> String {
+    match kind {
+        Kind::Bool => "true | false".to_string(),
+        Kind::Int(min, max) => format!("a number from {min} to {max}"),
+        Kind::Enum(options) => options.join(" | "),
+        Kind::Text(max) => format!("text, at most {max} characters"),
+        Kind::TextList(max_items, _) => {
+            format!("comma separated, at most {max_items} entries, or empty for the default")
+        }
+    }
 }
 
 /// مقدارِ کنونیِ یک کلید، به شکلی که به کاربر نشان داده می‌شود.
@@ -534,13 +548,190 @@ pub fn read_key(profile: &ConnectionProfile, key: &str) -> String {
     }
 }
 
+/// کلیدهایی که مدل **می‌بیند** ولی نمی‌تواند بنویسد (پورت از `AiPatch.READ_ONLY`).
+///
+/// بدون این‌ها snapshot فقط کلیدهای نوشتنی را داشت و مدل دربارهٔ تونلی نظر
+/// می‌داد که شکلِ واقعی‌اش را نمی‌دید: نمی‌دانست Psiphon یا Tor در مسیر است، و
+/// «برای سرعت به WARP*2 برو» در حالتِ Tor توصیهٔ غلطی است چون آنجا اصلاً تونلِ
+/// WARP وجود ندارد. هیچ‌کدام راز نیستند: `upstream` فقط «(set)/(none)» نشان داده
+/// می‌شود و پل‌های تور فقط با شمارشان.
+const READ_ONLY: [&str; 8] = [
+    "backend",
+    "splitMode",
+    "upstream",
+    "killSwitch",
+    "lanShare",
+    "bypassIran",
+    "blockAds",
+    "torBridges",
+];
+
+/// مقدارِ نمایشیِ یک کلیدِ فقط‌خواندنی، بدون لو دادنِ چیزی که مدل نباید ببیند.
+fn read_only_value(profile: &ConnectionProfile, key: &str) -> String {
+    match key {
+        "upstream" => {
+            if profile.upstream.trim().is_empty() {
+                "(none)".into()
+            } else {
+                "(set)".into()
+            }
+        }
+        "torBridges" => {
+            let own = profile
+                .tor_bridge_lines
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .count();
+            if own == 0 {
+                read_key(profile, key)
+            } else {
+                format!("{} ({own} own bridge line(s))", read_key(profile, key))
+            }
+        }
+        _ => read_key(profile, key),
+    }
+}
+
 /// مقدارِ کنونیِ هر کلیدِ نوشتنیِ چت — بلوکِ زمینه‌ای که به پرامپت می‌رود.
+///
+/// ۱.۴.۰-r4 (پورت از `AiPatch.snapshot`): هر خط می‌گوید مقدار هنوز **پیش‌فرضِ**
+/// برنامه است یا کاربر عوضش کرده و پیش‌فرض چه بوده. مدلی که نمی‌تواند «کاربر
+/// ۱۲۸۰ را انتخاب کرده» را از «۱۲۸۰ همان چیزی است که همه دارند» تشخیص دهد،
+/// نمی‌تواند دربارهٔ قدمِ بعدی استدلال کند، و «X را به پیش‌فرض برگردان» توصیه‌ای
+/// بود که بدون دانستنِ پیش‌فرض، درست گفتنی نبود.
 pub fn chat_snapshot(profile: &ConnectionProfile) -> String {
-    chat_writable()
+    annotated_snapshot(profile, &chat_writable())
+}
+
+/// همان [`chat_snapshot`] برای مشاور — با فهرستِ کاملِ کلیدهای مشاور.
+pub fn advisor_snapshot(profile: &ConnectionProfile) -> String {
+    annotated_snapshot(profile, &writable())
+}
+
+fn annotated_snapshot(
+    profile: &ConnectionProfile,
+    allowed: &BTreeMap<&'static str, Kind>,
+) -> String {
+    let defaults = ConnectionProfile::default();
+    let mut lines: Vec<String> = allowed
         .keys()
-        .map(|key| format!("  {key} = {}", read_key(profile, key)))
-        .collect::<Vec<_>>()
-        .join("\n")
+        .map(|key| {
+            let current = read_key(profile, key);
+            let default = read_key(&defaults, key);
+            if current == default {
+                format!("  {key} = {current}   [default]")
+            } else {
+                format!("  {key} = {current}   [changed by user; default: {default}]")
+            }
+        })
+        .collect();
+    for key in READ_ONLY {
+        if allowed.contains_key(key) {
+            continue;
+        }
+        lines.push(format!(
+            "  {key} = {}   [read-only for you]",
+            read_only_value(profile, key)
+        ));
+    }
+    lines.join("\n")
+}
+
+// ---- ۱.۴.۰-r4: بررسیِ پیشنهاد و بازخورد به مدل -----------------------------
+
+/// دلیلِ ردِ «کلیدِ محافظت‌شده» — ثابت تا بازخورد بتواند رویش تصمیم بگیرد.
+pub const REASON_PROTECTED: &str = "protected setting";
+/// دلیلِ ردِ «کلیدِ ناشناخته/خارج از فهرستِ این مسیر».
+pub const REASON_UNKNOWN: &str = "unknown setting";
+
+/// چرا یک پیشنهاد از بررسی رد شد.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Problem {
+    /// کاربر همین حالا همین مقدار را دارد.
+    AlreadySet,
+    /// مقدار جزوِ مقادیرِ مجاز نیست؛ متنِ دلیلِ نگهبان همراهش است.
+    Invalid(String),
+    /// کلید را مدل اجازهٔ نوشتن ندارد (محافظت‌شده یا خارج از فهرست).
+    NotChangeable,
+    /// همان کلید دو بار در یک پیشنهاد آمده.
+    Duplicate,
+}
+
+/// یک پیشنهادِ ردشده، با مقداری که مدل خواسته بود.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    pub key: String,
+    pub proposed: String,
+    pub problem: Problem,
+}
+
+impl Refusal {
+    /// از دلیلِ متنیِ [`PatchOutcome::rejected`] یک `Refusal` می‌سازد.
+    pub fn from_rejection(key: &str, proposed: &str, reason: &str) -> Self {
+        let problem = if reason == REASON_PROTECTED || reason == REASON_UNKNOWN {
+            Problem::NotChangeable
+        } else {
+            Problem::Invalid(reason.to_string())
+        };
+        Self {
+            key: key.to_string(),
+            proposed: proposed.to_string(),
+            problem,
+        }
+    }
+}
+
+/// کدام فهرستِ مجاز: پیامِ «مقادیرِ مجاز» باید از همان فهرستی بیاید که پیشنهاد
+/// با آن سنجیده شده.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    Chat,
+    Advisor,
+}
+
+/// متنی که وقتی پیشنهادِ مدل از بررسی رد شد، به خودِ مدل برگردانده می‌شود —
+/// یک خط برای هر ردشده، با مقدارِ **واقعیِ** فعلیِ کاربر کنارش. `None` یعنی
+/// چیزی برای اصلاح نیست (پورت از `AiPatch.verificationFeedback`).
+///
+/// همین است که «برنامه بی‌صدا دکمه را حذف می‌کند» را به «مدل پیش از آنکه کاربر
+/// چیزی ببیند می‌فهمد داشت تنظیمی را توصیه می‌کرد که کاربر از قبل دارد» تبدیل
+/// می‌کند؛ پاسخ دورِ یک علتِ دیگر بازنویسی می‌شود.
+pub fn verification_feedback(
+    profile: &ConnectionProfile,
+    refusals: &[Refusal],
+    scope: Scope,
+) -> Option<String> {
+    if refusals.is_empty() {
+        return None;
+    }
+    let allowed = match scope {
+        Scope::Chat => chat_writable(),
+        Scope::Advisor => writable(),
+    };
+    let lines: Vec<String> = refusals
+        .iter()
+        .map(|r| {
+            let key = r.key.trim();
+            let head = format!("- {key} = \"{}\": ", r.proposed.trim());
+            let body = match &r.problem {
+                Problem::AlreadySet => format!(
+                    "REDUNDANT - the user ALREADY has {key} = {}. Do not recommend it; if it matters, say it is already set.",
+                    read_key(profile, key)
+                ),
+                Problem::Invalid(reason) => match allowed.get(key) {
+                    Some(kind) => format!(
+                        "INVALID ({reason}) - accepted values for {key} are: {}.",
+                        describe(*kind)
+                    ),
+                    None => format!("INVALID ({reason})."),
+                },
+                Problem::Duplicate => "DUPLICATE - pick one value for this setting.".to_string(),
+                Problem::NotChangeable => "NOT CHANGEABLE BY YOU - explain where the user changes it by hand, or drop it.".to_string(),
+            };
+            format!("{head}{body}")
+        })
+        .collect();
+    Some(lines.join("\n"))
 }
 
 #[cfg(test)]
@@ -647,7 +838,7 @@ mod tests {
     fn enum_lists_match_the_profile() {
         // هر مقدار نامی باید واقعاً روی *همان* فیلد پروفایل بنشیند. این تست همان
         // اشکالی را گرفت که کپی‌کردن فهرست‌های اندروید ساخته بود.
-        let cases: [(&str, &[&str]); 8] = [
+        let cases: [(&str, &[&str]); 7] = [
             ("backend", BACKENDS),
             ("protocol", PROTOCOLS),
             ("scanMode", SCAN_MODES),
@@ -655,7 +846,6 @@ mod tests {
             ("noize", NOIZE_MODES),
             ("endpointMode", ENDPOINT_MODES),
             ("splitMode", SPLIT_MODES),
-            ("accessMode", ACCESS_MODES),
         ];
         for (key, options) in cases {
             for option in options {
@@ -771,7 +961,20 @@ mod tests {
         // پس رد‌شدنِ بالا از فهرستِ چت آمده و نه از بی‌اعتبار بودنِ مقادیر.
         let mut advisor_profile = profile();
         let accepted = apply(&mut advisor_profile, &dangerous);
-        assert!(accepted.applied.len() >= 6, "{:?}", accepted);
+        // security-audit-1.3.0: the advisor now refuses every traffic-redirecting key too.
+        for key in [
+            "upstream",
+            "routeDirect",
+            "lanShare",
+            "killSwitch",
+            "accessMode",
+        ] {
+            assert!(
+                !accepted.applied.iter().any(|(k, _)| k == key),
+                "{key}: {:?}",
+                accepted
+            );
+        }
     }
 
     #[test]
@@ -814,6 +1017,89 @@ mod tests {
             "{snapshot}"
         );
         assert!(!snapshot.contains("accessSecret"));
+    }
+
+    #[test]
+    fn the_snapshot_marks_defaults_and_user_changes() {
+        let mut p = profile();
+        p.mtu = 1380;
+        let snapshot = chat_snapshot(&p);
+        assert!(
+            snapshot.contains(&format!(
+                "mtu = 1380   [changed by user; default: {DEFAULT_MTU}]"
+            )),
+            "{snapshot}"
+        );
+        assert!(
+            snapshot.contains("fragment = off   [default]"),
+            "{snapshot}"
+        );
+        // زمینهٔ فقط‌خواندنی دیده می‌شود ولی هرگز به‌عنوان کلیدِ نوشتنی.
+        assert!(
+            snapshot.contains("backend = AETHER   [read-only for you]"),
+            "{snapshot}"
+        );
+        assert!(!snapshot.contains("routeDirect"));
+    }
+
+    #[test]
+    fn the_snapshot_never_leaks_the_upstream_address() {
+        let mut p = profile();
+        p.upstream = "socks5://10.1.2.3:1080".into();
+        let snapshot = chat_snapshot(&p);
+        assert!(snapshot.contains("upstream = (set)"), "{snapshot}");
+        assert!(!snapshot.contains("10.1.2.3"), "{snapshot}");
+        let advisor = advisor_snapshot(&p);
+        assert!(!advisor.contains("accessSecret"));
+    }
+
+    #[test]
+    fn a_value_the_user_already_has_is_reported_as_redundant() {
+        let mut p = profile();
+        let out = apply_chat(&mut p, &json!({ "mtu": DEFAULT_MTU, "fragment": true }));
+        assert_eq!(out.applied.len(), 1);
+        assert_eq!(
+            out.redundant,
+            vec![("mtu".to_string(), DEFAULT_MTU.to_string())]
+        );
+        assert!(out.rejected.is_empty());
+    }
+
+    #[test]
+    fn verification_feedback_names_the_real_current_value() {
+        let p = profile();
+        assert!(verification_feedback(&p, &[], Scope::Chat).is_none());
+        let refusals = [
+            Refusal {
+                key: "mtu".into(),
+                proposed: DEFAULT_MTU.to_string(),
+                problem: Problem::AlreadySet,
+            },
+            Refusal::from_rejection("noize", "ULTRA", "\"ULTRA\" is not one of OFF"),
+            Refusal::from_rejection("upstream", "socks5://x", REASON_UNKNOWN),
+            Refusal {
+                key: "ech".into(),
+                proposed: "true".into(),
+                problem: Problem::Duplicate,
+            },
+        ];
+        let text = verification_feedback(&p, &refusals, Scope::Chat).unwrap();
+        assert!(
+            text.contains(&format!(
+                "REDUNDANT - the user ALREADY has mtu = {DEFAULT_MTU}"
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains("accepted values for noize are: OFF | LIGHT"),
+            "{text}"
+        );
+        assert!(
+            text.contains("upstream = \"socks5://x\": NOT CHANGEABLE BY YOU"),
+            "{text}"
+        );
+        assert!(text.contains("DUPLICATE"), "{text}");
+        assert_eq!(text.lines().count(), 4);
     }
 
     #[test]

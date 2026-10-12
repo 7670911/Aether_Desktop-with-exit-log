@@ -261,7 +261,11 @@ fn reg_delete(name: &str) -> bool {
 }
 
 fn reg_output(args: &[&str]) -> Option<String> {
-    let mut cmd = Command::new("reg");
+    let mut cmd = Command::new(
+        std::path::Path::new(&std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()))
+            .join("System32")
+            .join("reg.exe"),
+    );
     cmd.args(args);
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
@@ -273,7 +277,11 @@ fn reg_output(args: &[&str]) -> Option<String> {
 }
 
 fn reg(args: &[&str]) -> bool {
-    let mut cmd = Command::new("reg");
+    let mut cmd = Command::new(
+        std::path::Path::new(&std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()))
+            .join("System32")
+            .join("reg.exe"),
+    );
     cmd.args(args);
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);

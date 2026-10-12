@@ -14,54 +14,6 @@ use rand::RngExt;
 
 const TIMER_TICK: Duration = Duration::from_millis(250);
 const MAX_PACKET: usize = 65536;
-
-/// How many outbound IP packets are encapsulated under ONE acquisition of the
-/// boringtun session lock.
-///
-/// ## 1.2.3-p1: the lock hand-off was the packets-per-second ceiling
-///
-/// The writer loop was, per packet:
-///
-/// ```text
-///     outbound_rx.recv().await  ->  tunn_w.lock().await  ->  send
-/// ```
-///
-/// `tunn` is the ONE boringtun session, and the socket reader takes the very same
-/// lock for every datagram it decapsulates. So there was one acquisition per
-/// packet, in both directions, contending with each other - and because it is a
-/// fair async mutex, each hand-off is a full task park and wake through the tokio
-/// scheduler.
-///
-/// A download is not the asymmetric flow it looks like: roughly one ACK leaves
-/// for every two segments that arrive, so a fast download is a symmetric packet
-/// stream, and the two tasks then trade the lock on essentially every packet.
-/// The download can therefore never go faster than the scheduler can round-trip,
-/// no matter what the line or the tunnel can do. That is a throughput ceiling
-/// with no error, no counter and no log line attached to it.
-///
-/// Encapsulating a whole burst under one acquisition makes hand-offs scale with
-/// bursts (>= 64x fewer) instead of with packets. No packet is ever delayed to
-/// build a batch: the burst is whatever is ALREADY queued when the first packet
-/// arrives.
-const MAX_ENCAP_BATCH: usize = 64;
-
-/// How often the writer reports what the uplink is actually doing.
-///
-/// The uplink queue is the one queue in the path that nothing in this process
-/// could see before 1.2.3-p1, because it lived in the kernel's `SO_SNDBUF`. A
-/// writer that never waits while the uplink is saturated means the OS ignored the
-/// buffer request and the bound is not in effect.
-const UPLINK_REPORT_INTERVAL: Duration = Duration::from_secs(15);
-
-/// How long the socket reader will wait for room in the netstack's inbound queue
-/// before it drops a datagram.
-///
-/// 1.2.3-p1. The reader used to `inbound_tx.send(..).await`, an unbounded wait. A
-/// download fills that queue in milliseconds, so the only task draining the
-/// WireGuard UDP socket parked - and while it was parked the kernel receive
-/// buffer overflowed and discarded whatever arrived next. A datagram is worth
-/// waiting a few milliseconds for; it is never worth going deaf for.
-const INBOUND_HANDOFF_BUDGET: Duration = Duration::from_millis(20);
 const VERIFY_RETRY_DELAYS: [Duration; 2] =
     [Duration::from_millis(750), Duration::from_millis(2_000)];
 
@@ -94,29 +46,6 @@ impl Drop for TaskGuard {
         for handle in self.0.drain(..) {
             handle.abort();
         }
-    }
-}
-
-/// Hands a decapsulated IP packet to the netstack without ever blocking the
-/// socket reader indefinitely (see [`INBOUND_HANDOFF_BUDGET`]).
-///
-/// Returns `false` only when the netstack is gone for good, which is the one case
-/// where the reader should stop.
-async fn deliver_inbound(tx: &mpsc::Sender<Vec<u8>>, pkt: Vec<u8>) -> bool {
-    match tx.try_send(pkt) {
-        Ok(()) => true,
-        Err(mpsc::error::TrySendError::Full(pkt)) => {
-            match tokio::time::timeout(INBOUND_HANDOFF_BUDGET, tx.send(pkt)).await {
-                Ok(Ok(())) => true,
-                // The netstack closed: nothing left to read for.
-                Ok(Err(_)) => false,
-                // Congested. Dropping here is deliberate and is exactly the loss
-                // signal TCP congestion control is built to read; going deaf on
-                // the socket is not.
-                Err(_) => true,
-            }
-        }
-        Err(mpsc::error::TrySendError::Closed(_)) => false,
     }
 }
 
@@ -248,80 +177,34 @@ impl WgTunnel {
             let mut buf = vec![0u8; MAX_PACKET];
             let mut tmp = vec![0u8; MAX_PACKET];
             let mut transient_errors = 0u32;
-            // Reused across iterations so a busy tunnel does not allocate two
-            // vectors per datagram.
-            let mut to_network: Vec<Vec<u8>> = Vec::new();
-            let mut to_tunnel: Vec<Vec<u8>> = Vec::new();
             loop {
                 match sock_r.recv(&mut buf).await {
                     Ok(0) => {}
                     Ok(n) => {
                         transient_errors = 0;
                         strip_client_id(&mut buf[..n]);
-                        to_network.clear();
-                        to_tunnel.clear();
-                        let mut progressed = false;
-
-                        {
-                            let mut tunn = tunn_r.lock().await;
-                            // 1.2.3-p1: boringtun QUEUES packets internally - the
-                            // ones that arrived while a handshake was in flight,
-                            // and the handshake replies it owes the peer. One
-                            // `decapsulate` call returns ONE of them. This used to
-                            // take the first and throw the rest away, which is how
-                            // a rekey under load could silently half-complete.
-                            // Drain until it says Done.
-                            let mut first = true;
-                            loop {
-                                let outcome = if first {
-                                    tunn.decapsulate(None, &buf[..n], &mut tmp)
-                                } else {
-                                    tunn.decapsulate(None, &[], &mut tmp)
-                                };
-                                first = false;
-
-                                match outcome {
-                                    TunnResult::Done => {
-                                        progressed = true;
-                                        break;
-                                    }
-                                    TunnResult::Err(e) => {
-                                        log::trace!("decapsulate error: {e:?}");
-                                        break;
-                                    }
-                                    TunnResult::WriteToNetwork(pkt) => {
-                                        progressed = true;
-                                        let mut pkt_vec = pkt.to_vec();
-                                        inject_client_id(&mut pkt_vec, &client_id);
-                                        to_network.push(pkt_vec);
-                                    }
-                                    TunnResult::WriteToTunnelV4(pkt, _)
-                                    | TunnResult::WriteToTunnelV6(pkt, _) => {
-                                        progressed = true;
-                                        to_tunnel.push(pkt.to_vec());
-                                        break;
-                                    }
-                                }
+                        let mut tunn = tunn_r.lock().await;
+                        match tunn.decapsulate(None, &buf[..n], &mut tmp) {
+                            TunnResult::Done => {
+                                *last_valid_rx_r.lock() = Instant::now();
                             }
-                        }
-
-                        if progressed {
-                            *last_valid_rx_r.lock() = Instant::now();
-                        }
-
-                        for pkt in to_network.drain(..) {
-                            let _ = sock_r.send(&pkt).await;
-                        }
-                        let mut netstack_gone = false;
-                        for pkt in to_tunnel.drain(..) {
-                            if !deliver_inbound(&inbound_tx, pkt).await {
-                                netstack_gone = true;
-                                break;
+                            TunnResult::Err(e) => {
+                                log::trace!("decapsulate error: {e:?}");
                             }
-                        }
-                        if netstack_gone {
-                            log::warn!("[wg] the netstack is gone; stopping the socket reader");
-                            break;
+                            TunnResult::WriteToNetwork(pkt) => {
+                                *last_valid_rx_r.lock() = Instant::now();
+                                let mut pkt_vec = pkt.to_vec();
+                                inject_client_id(&mut pkt_vec, &client_id);
+                                drop(tunn);
+                                let _ = sock_r.send(&pkt_vec).await;
+                            }
+                            TunnResult::WriteToTunnelV4(pkt, _)
+                            | TunnResult::WriteToTunnelV6(pkt, _) => {
+                                *last_valid_rx_r.lock() = Instant::now();
+                                let pkt_vec = pkt.to_vec();
+                                drop(tunn);
+                                let _ = inbound_tx.send(pkt_vec).await;
+                            }
                         }
                     }
                     Err(e) => {
@@ -346,155 +229,41 @@ impl WgTunnel {
             }
         });
 
-        // ------------------------------------------------------------------
-        // 1.2.3-p1 THROUGHPUT FIX. See [MAX_ENCAP_BATCH] for the full reasoning.
-        //
-        // Two things were on this hot path once per PACKET: the single boringtun
-        // session lock (contended with the socket reader on every datagram, and a
-        // fair async mutex, so every hand-off is a scheduler park and wake) and
-        // `obf_sent.lock().await`, a second async mutex taken forever to re-read a
-        // flag that can only ever change once.
-        //
-        // A download is a symmetric packet stream (one ACK per ~two segments), so
-        // both tasks wanted the lock constantly and the download could not go
-        // faster than the scheduler could round-trip. Bursts are encapsulated
-        // under one acquisition now, and the one-shot flag has left the hot path.
-        // ------------------------------------------------------------------
         let send_task = tokio::spawn(async move {
             let mut out_buf = vec![0u8; MAX_PACKET];
             let mut post_hs_junk_sent = false;
-            let mut batch: Vec<Vec<u8>> = Vec::with_capacity(MAX_ENCAP_BATCH);
-            let mut wire: Vec<Vec<u8>> = Vec::with_capacity(MAX_ENCAP_BATCH);
-            let mut obfuscation_settled = false;
-            // Per-tunnel, not global: in WARP*2 mode there are two of these tasks
-            // and their uplinks are nested, so one shared counter would be
-            // unreadable. The peer address in the log line tells them apart.
-            let mut up_pkts: u64 = 0;
-            let mut up_bytes: u64 = 0;
-            let mut up_waits: u64 = 0;
-            let mut up_wait_micros: u64 = 0;
-            let mut up_wait_worst_micros: u64 = 0;
-            let mut last_uplink_report = Instant::now();
-            let sndbuf_kb = crate::upstream::send_buffer_kb(&sock_w);
-            let rcvbuf_kb = crate::upstream::recv_buffer_kb(&sock_w);
+            while let Some(ip_packet) = outbound_rx.recv().await {
+                let mut tunn = tunn_w.lock().await;
 
-            loop {
-                let first = match outbound_rx.recv().await {
-                    Some(pkt) => pkt,
-                    None => break,
-                };
-
-                batch.clear();
-                batch.push(first);
-                // Whatever is already waiting, nothing more: this never adds
-                // latency in order to build a bigger burst.
-                while batch.len() < MAX_ENCAP_BATCH {
-                    match outbound_rx.try_recv() {
-                        Ok(pkt) => batch.push(pkt),
-                        Err(_) => break,
+                match tunn.encapsulate(&ip_packet, &mut out_buf) {
+                    TunnResult::Done => {}
+                    TunnResult::Err(e) => {
+                        log::trace!("encapsulate error: {e:?}");
                     }
-                }
+                    TunnResult::WriteToNetwork(pkt) => {
+                        let mut pkt_vec = pkt.to_vec();
+                        inject_client_id(&mut pkt_vec, &client_id);
+                        drop(tunn);
 
-                wire.clear();
-                {
-                    let mut tunn = tunn_w.lock().await;
-                    for ip_packet in batch.drain(..) {
-                        match tunn.encapsulate(&ip_packet, &mut out_buf) {
-                            TunnResult::Done => {}
-                            TunnResult::Err(e) => {
-                                log::trace!("encapsulate error: {e:?}");
+                        {
+                            let mut sent = obf_sent.lock().await;
+                            if !*sent && aethernoize.is_enabled() {
+                                *sent = true;
+                                drop(sent);
+                                aethernoize::apply_obfuscation(&sock_w, peer, &aethernoize).await;
                             }
-                            TunnResult::WriteToNetwork(pkt) => {
-                                let mut pkt_vec = pkt.to_vec();
-                                inject_client_id(&mut pkt_vec, &client_id);
-                                wire.push(pkt_vec);
-                            }
-                            TunnResult::WriteToTunnelV4(_, _)
-                            | TunnResult::WriteToTunnelV6(_, _) => {}
+                        }
+
+                        let _ = sock_w.send(&pkt_vec).await;
+
+                        // Post-handshake junk once only — not on every data packet.
+                        if aethernoize.jc_after_hs > 0 && !post_hs_junk_sent {
+                            post_hs_junk_sent = true;
+                            aethernoize::send_post_handshake_junk(&sock_w, peer, &aethernoize)
+                                .await;
                         }
                     }
-                }
-
-                if wire.is_empty() {
-                    continue;
-                }
-
-                // Once per session, not once per packet.
-                if !obfuscation_settled {
-                    obfuscation_settled = true;
-                    let mut sent = obf_sent.lock().await;
-                    if !*sent && aethernoize.is_enabled() {
-                        *sent = true;
-                        drop(sent);
-                        aethernoize::apply_obfuscation(&sock_w, peer, &aethernoize).await;
-                    }
-                }
-
-                // `try_send` + `writable()` rather than plain `send()` so a wait on
-                // the uplink can be attributed and timed instead of being
-                // invisible. With `SO_SNDBUF` now a latency budget rather than the
-                // OS default (see upstream::tune_udp_buffers) this call really can
-                // wait, and that wait is the only way backpressure from the NIC
-                // reaches the congestion controller.
-                for pkt in wire.drain(..) {
-                    let began = Instant::now();
-                    let mut waited = false;
-                    loop {
-                        match sock_w.try_send(&pkt) {
-                            Ok(_) => break,
-                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                waited = true;
-                                if sock_w.writable().await.is_err() {
-                                    break;
-                                }
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    up_pkts = up_pkts.saturating_add(1);
-                    up_bytes = up_bytes.saturating_add(pkt.len() as u64);
-                    if waited {
-                        let micros = began.elapsed().as_micros() as u64;
-                        up_waits = up_waits.saturating_add(1);
-                        up_wait_micros = up_wait_micros.saturating_add(micros);
-                        if micros > up_wait_worst_micros {
-                            up_wait_worst_micros = micros;
-                        }
-                    }
-                }
-
-                if last_uplink_report.elapsed() >= UPLINK_REPORT_INTERVAL {
-                    let window = last_uplink_report.elapsed();
-                    last_uplink_report = Instant::now();
-                    let kbps = if window.as_millis() > 0 {
-                        (up_bytes * 1000) / (window.as_millis() as u64) / 1024
-                    } else {
-                        0
-                    };
-                    log::info!(
-                        "[uplink {peer}] {:?} window: {} pkts, {} KB ({} KB/s) | kernel sndbuf \
-                         {} KB, rcvbuf {} KB | writer waited {} times, {} ms total, worst {} ms",
-                        window,
-                        up_pkts,
-                        up_bytes / 1024,
-                        kbps,
-                        sndbuf_kb,
-                        rcvbuf_kb,
-                        up_waits,
-                        up_wait_micros / 1000,
-                        up_wait_worst_micros / 1000,
-                    );
-                    up_pkts = 0;
-                    up_bytes = 0;
-                    up_waits = 0;
-                    up_wait_micros = 0;
-                    up_wait_worst_micros = 0;
-                }
-
-                // Post-handshake junk once only, not on every data packet.
-                if aethernoize.jc_after_hs > 0 && !post_hs_junk_sent {
-                    post_hs_junk_sent = true;
-                    aethernoize::send_post_handshake_junk(&sock_w, peer, &aethernoize).await;
+                    TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => {}
                 }
             }
         });
@@ -994,36 +763,15 @@ pub const WG_SEEDS_V6: &[&str] = &[
 ];
 
 pub fn wg_prefixes_v4() -> Vec<&'static str> {
-    // >>> AETHER-APP-PATCH scan-cidrs — «بازهٔ آدرس» در تنظیمات برنامه
-    if let Some(pinned) = crate::prober::pinned_cidrs_v4("AETHER_WG_CIDRS") {
-        return pinned;
-    }
-    // <<< AETHER-APP-PATCH scan-cidrs
     crate::prober::prioritize(WG_PREFIXES_V4, WG_ZT_PREFIXES_V4)
 }
 
 pub fn wg_prefixes_v6() -> Vec<&'static str> {
-    // >>> AETHER-APP-PATCH scan-cidrs
-    if let Some(pinned) = crate::prober::pinned_cidrs_v6("AETHER_WG_CIDRS") {
-        return pinned;
-    }
-    // <<< AETHER-APP-PATCH scan-cidrs
     crate::prober::prioritize(WG_PREFIXES_V6, WG_ZT_PREFIXES_V6)
 }
 
 pub fn wg_seeds_v4() -> Vec<&'static str> {
-    // >>> AETHER-APP-PATCH scan-cidrs — دانهٔ بیرون از بازهٔ پین‌شده پروب نمی‌شود
-    crate::prober::seeds_within(
-        &crate::prober::prioritize(WG_SEEDS_V4, &["162.159.193.1"]),
-        "AETHER_WG_CIDRS",
-    )
-    // <<< AETHER-APP-PATCH scan-cidrs
-}
-
-/// دانه‌های IPv6؛ مثل همتای v4 به بازهٔ پین‌شده محدود می‌شود.
-/// (AETHER-APP-PATCH scan-cidrs)
-pub fn wg_seeds_v6() -> Vec<&'static str> {
-    crate::prober::seeds_within(WG_SEEDS_V6, "AETHER_WG_CIDRS")
+    crate::prober::prioritize(WG_SEEDS_V4, &["162.159.193.1"])
 }
 
 #[cfg(test)]

@@ -112,6 +112,43 @@ const DASH = '\u2014'
  * خواندنِ `textContent` خودش مرورگر را وادار می‌کند متنِ زیردرخت را از نو بسازد،
  * که همان چیزی است که می‌خواستیم از آن پرهیز کنیم.
  */
+// >>> AETHER-APP-PATCH custom-configs
+/**
+ * زنجیرهٔ کانفیگِ سفارشی (`VLESS → Aether(WireGuard) → Psiphon`) در یک خط.
+ *
+ * Rust شکل‌ها را از بلند به کوتاه می‌فرستد (`protocolCompact`): کامل، بی‌پرانتزِ
+ * ترابری، با پیکان‌های چسبیده. اولین شکلی که جا شود نشان داده می‌شود؛ اگر هیچ‌کدام
+ * جا نشد، کوتاه‌ترین با فونتِ کوچک‌تر. متنِ کامل همیشه در `title` می‌ماند.
+ */
+function fitChain(node, options) {
+  if (!node) return
+  const list = Array.isArray(options) ? options.filter(Boolean) : []
+  if (!list.length) {
+    if (node.__aetherFit) {
+      node.__aetherFit = null
+      node.classList.remove('ccard__slide-v--tight')
+      node.removeAttribute('title')
+    }
+    return
+  }
+  const key = `${list.join('\u0001')}@${node.clientWidth}`
+  if (node.__aetherFit === key) return
+  node.__aetherFit = key
+  node.classList.remove('ccard__slide-v--tight')
+  let chosen = list[list.length - 1]
+  for (const option of list) {
+    node.textContent = option
+    if (node.scrollWidth <= node.clientWidth) { chosen = option; break }
+  }
+  node.textContent = chosen
+  // `setText` همان برچسبِ کامل (`snapshot.protocol` = `list[0]`) را می‌بیند و
+  // شکلِ کوتاه‌شده را با آن بازنویسی نمی‌کند.
+  node.__aetherText = list[0]
+  if (node.scrollWidth > node.clientWidth) node.classList.add('ccard__slide-v--tight')
+  node.title = list[0]
+}
+// <<< AETHER-APP-PATCH custom-configs
+
 function setText(el, value) {
   if (!el) return
   const next = String(value)
@@ -255,11 +292,6 @@ export function createConnectionCard() {
       <div class="ccard__slide">
         <span class="ccard__slide-k">${t('Protocol')}</span>
         <span class="ccard__slide-v ltr" dir="ltr" id="cc-proto">${DASH}</span>
-      </div>
-
-      <div class="ccard__slide">
-        <span class="ccard__slide-k">${t('Endpoint')}</span>
-        <span class="ccard__slide-v ccard__slide-v--wrap ltr" dir="ltr" id="cc-endpoint">${DASH}</span>
       </div>
 
       <div class="ccard__slide ccard__slide--stack">
@@ -539,7 +571,7 @@ export function createConnectionCard() {
    * ۱.۲.۵-perf — هر نوشتن روی DOM از `setText` می‌گذرد و فقط وقتی انجام می‌شود
    * که مقدار **واقعاً** عوض شده باشد. پیش از این هر رسیدنِ snapshot حدود پانزده
    * `textContent` و چهار `innerHTML` می‌نوشت، پنج بار در ثانیه، در حالی که
-   * بیشترشان در طولِ یک نشست هرگز عوض نمی‌شوند (`cc-proto`، `cc-endpoint`،
+   * بیشترشان در طولِ یک نشست هرگز عوض نمی‌شوند (`cc-proto`،
    * برچسبِ آی‌پی). یک نوشتنِ بی‌تغییر روی `textContent` هم مرورگر را وادار به
    * بازمحاسبهٔ سبک و چیدمانِ همان زیردرخت می‌کند، و `innerHTML` علاوه بر آن
    * HTML را از نو parse می‌کند.
@@ -625,7 +657,9 @@ export function createConnectionCard() {
 
     // ۵–۷. اسلایدهای متا
     setText(el('cc-proto'), connected ? (snapshot.protocol ?? DASH) : DASH)
-    setText(el('cc-endpoint'), connected ? (snapshot.endpoint ?? '\u2026') : DASH)
+    // AETHER-APP-PATCH custom-configs: زنجیرهٔ کانفیگِ سفارشی کوتاه می‌شود تا جا شود.
+    fitChain(el('cc-proto'), connected ? snapshot.protocolCompact : null)
+    // ردیف «Endpoint» از کارت حذف شد (۱.۳.۰): دیگر کاربردی نداشت و فضا را برای بقیه آزاد می‌کند.
 
     lastMs = !connected ? -1 : snapshot.latencyMs != null ? snapshot.latencyMs : lastMs
     setText(el('cc-latency'), !connected

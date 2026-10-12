@@ -17,6 +17,175 @@ export const LANGS = [
 ]
 
 const FA = {
+  // --- ۱.۳.۰ — پیام‌ها و اطلاعیه‌ها (پنجرهٔ «تازه‌ها»؛ پورت از اندروید ۱.۵.۰) ---
+  'Messages & announcements': 'پیام‌ها و اطلاعیه‌ها',
+  "What's new in this version and the connection guide, any time": 'تازه‌های این نسخه و راهنمای اتصال، هر زمان که خواستید',
+  'Version {0}': 'نسخهٔ {0}',
+  'Every update message is kept here. Click one to read it again.': 'همهٔ پیام‌های به‌روزرسانی اینجا بایگانی می‌شوند. برای خواندن دوباره روی هر کدام کلیک کنید.',
+  // --- ۱.۳.۰ — کانفیگ‌های سفارشی (پورت از اندروید ۱.۵.۰؛ بدونِ QR) ---
+  'Custom configs': 'کانفیگ‌های سفارشی',
+  'Your own VLESS, VMess, Trojan, Shadowsocks, SOCKS, WireGuard or npvt server, alone or chained': 'سرورِ خودتان با <bdi>VLESS</bdi>، <bdi>VMess</bdi>، <bdi>Trojan</bdi>، <bdi>Shadowsocks</bdi>، <bdi>SOCKS</bdi>، <bdi>WireGuard</bdi> یا <bdi>npvt</bdi> — تنها یا زنجیره‌ای',
+  'Custom config': 'کانفیگ سفارشی',
+  'Use a custom config': 'استفاده از کانفیگ سفارشی',
+  'Off: Aether runs exactly as before. On: the next connection runs the chain below.': 'خاموش: اتر دقیقاً مثل قبل کار می‌کند. روشن: اتصالِ بعدی زنجیرهٔ زیر را اجرا می‌کند.',
+  'Import a config first, then pick it in the list.': 'اول یک کانفیگ وارد کنید و بعد آن را در فهرست انتخاب کنید.',
+  'Chain': 'زنجیره',
+  'Config': 'کانفیگ',
+  'Single · the config alone': 'تکی · فقط کانفیگ',
+  'Double chain': 'زنجیرهٔ دوتایی',
+  'Triple chain': 'زنجیرهٔ سه‌تایی',
+  'Where the config sits in the route. Config first: the engine dials out through it. Config last: it dials out through the engine. Changes apply at the next connection.': 'جای کانفیگ در مسیر. کانفیگ اول: موتور از دلِ آن بیرون می‌رود. کانفیگ آخر: کانفیگ از دلِ موتور بیرون می‌رود. تغییرها از اتصالِ بعدی اعمال می‌شوند.',
+  'Import': 'وارد کردن',
+  'Link, subscription or config': 'لینک، اشتراک یا کانفیگ',
+  'Paste one or more share links, a full Xray JSON config, a base64 subscription, an npvt config, or a single https:// subscription address.': 'یک یا چند لینکِ اشتراک‌گذاری، یک کانفیگِ کاملِ <bdi>Xray JSON</bdi>، اشتراکِ <bdi>base64</bdi>، کانفیگِ <bdi>npvt</bdi> یا یک نشانیِ اشتراکِ <bdi>https://</bdi> بچسبانید.',
+  'Choose file…': 'انتخاب فایل…',
+  '…or drop a .npvt, .txt, .json or .conf file on this window.': '…یا یک فایلِ <bdi>.npvt</bdi>، <bdi>.txt</bdi>، <bdi>.json</bdi> یا <bdi>.conf</bdi> را روی همین پنجره رها کنید.',
+  'QR codes are not supported on Windows (no camera or image scanner). Use a link, a subscription or a file instead.': 'کد <bdi>QR</bdi> در نسخهٔ ویندوز پشتیبانی نمی‌شود (دوربین و اسکنرِ تصویر ندارد). به‌جایش از لینک، اشتراک یا فایل استفاده کنید.',
+  'Saved configs': 'کانفیگ‌های ذخیره‌شده',
+  'No configs yet.': 'هنوز کانفیگی وارد نشده است.',
+  'Delete all configs': 'حذف همهٔ کانفیگ‌ها',
+  'Removes every imported config from this PC.': 'همهٔ کانفیگ‌های واردشده از این رایانه پاک می‌شوند.',
+  'Delete all configs?': 'همهٔ کانفیگ‌ها حذف شوند؟',
+  'Every imported config is removed from this PC. This cannot be undone.': 'همهٔ کانفیگ‌های واردشده از این رایانه پاک می‌شوند. این کار برگشت‌پذیر نیست.',
+  'Delete all': 'حذف همه',
+  'Delete this config?': 'این کانفیگ حذف شود؟',
+  'Edit config': 'ویرایش کانفیگ',
+  'Rename': 'تغییر نام',
+  'Copy link': 'کپی لینک',
+  'Locked': 'قفل‌شده',
+  'Expired': 'منقضی‌شده',
+  'Expired on {0}': 'در {0} منقضی شد',
+  'Expires on {0}': 'انقضا: {0}',
+  'Password': 'رمز',
+  'Unlock': 'باز کردن',
+  'This npvt config is password protected.': 'این کانفیگِ <bdi>npvt</bdi> رمز دارد.',
+  'Wrong password for this npvt config.': 'رمزِ این کانفیگِ <bdi>npvt</bdi> اشتباه است.',
+  'This config is locked by its author.': 'این کانفیگ را سازنده‌اش قفل کرده است.',
+  'Paste a link or config first.': 'اول یک لینک یا کانفیگ بچسبانید.',
+  '1 config imported.': 'یک کانفیگ وارد شد.',
+  '{0} configs imported.': '{0} کانفیگ وارد شد.',
+  'Something went wrong.': 'مشکلی پیش آمد.',
+  // --- ۱.۳.۰ — پینگِ واقعی (Xrayِ موقت + generate_204) ---
+  'Ping': 'پینگ',
+  'Test all': 'تست پینگ همه کانفیگ‌ها',
+  'Testing…': 'در حالِ تست…',
+  'No response': 'بی‌پاسخ',
+  'Server off': 'سرور خاموش',
+  'Filtered': 'فیلتر شده',
+  'Invalid config': 'کانفیگ نامعتبر',
+  'No network': 'شبکه در دسترس نیست',
+  'a real-delay test is already running': 'یک تستِ پینگ در حالِ اجراست',
+  'the bundled Xray core (engine\\xray\\xray.exe) is missing — reinstall Aether': 'هستهٔ Xrayِ همراه (engine\\xray\\xray.exe) پیدا نشد — اتر را دوباره نصب کنید',
+  'the test was interrupted': 'تست نیمه‌کاره ماند',
+  'file is larger than 2 MB': 'حجم فایل بیش از ۲ مگابایت است',
+  'file could not be read': 'فایل خوانده نشد',
+  'Starting the custom config…': 'در حال راه‌اندازیِ کانفیگ سفارشی…',
+  'Checking the custom config…': 'در حال بررسیِ کانفیگ سفارشی…',
+  'Starting Psiphon…': 'در حال راه‌اندازیِ سایفون…',
+  'This custom config has expired. Import a fresh one or pick another config.': 'این کانفیگِ سفارشی منقضی شده است. یک کانفیگِ تازه وارد کنید یا کانفیگِ دیگری انتخاب کنید.',
+  'This custom config is locked to mobile data by its author, so it cannot run on Windows.': 'سازندهٔ این کانفیگ آن را به اینترنتِ موبایل محدود کرده، پس روی ویندوز اجرا نمی‌شود.',
+  'Custom configs need the bundled Xray core (engine\\xray\\xray.exe), which this installation is missing. Reinstall Aether.': 'کانفیگ‌های سفارشی به هستهٔ همراهِ <bdi>Xray</bdi> (<bdi>engine\\xray\\xray.exe</bdi>) نیاز دارند که در این نصب نیست. اتر را دوباره نصب کنید.',
+  'The custom config could not start: Xray exited. Check the config, or open the diagnostics log.': 'کانفیگِ سفارشی اجرا نشد: <bdi>Xray</bdi> بسته شد. کانفیگ را بررسی کنید یا لاگِ عیب‌یابی را ببینید.',
+  'The custom config opens no outbound connection. The server may be down or blocked on this network.': 'کانفیگِ سفارشی هیچ اتصالی به بیرون باز نمی‌کند. ممکن است سرور خاموش باشد یا روی این شبکه بسته شده باشد.',
+  'The custom config did not open its local port in time (Xray). Check the config, or open the diagnostics log.': 'کانفیگِ سفارشی پورتِ محلی‌اش را به‌موقع باز نکرد (<bdi>Xray</bdi>). کانفیگ را بررسی کنید یا لاگِ عیب‌یابی را ببینید.',
+  'empty input': 'ورودی خالی است',
+  'no supported config found': 'هیچ کانفیگِ پشتیبانی‌شده‌ای پیدا نشد',
+  'link has no server address': 'لینک نشانیِ سرور ندارد',
+  'link has no user id': 'لینک شناسهٔ کاربر ندارد',
+  'link has no user id / password': 'لینک شناسهٔ کاربر یا رمز ندارد',
+  'link has no valid port': 'لینک پورتِ معتبر ندارد',
+  'the JSON could not be read': 'این <bdi>JSON</bdi> خوانده نشد',
+  'the JSON has no proxy outbound': 'این <bdi>JSON</bdi> هیچ <bdi>outbound</bdi>ِ پروکسی ندارد',
+  'npvt file could not be decrypted': 'فایلِ <bdi>npvt</bdi> رمزگشایی نشد',
+  'this npvt config has expired': 'این کانفیگِ <bdi>npvt</bdi> منقضی شده است',
+  'this npvt config is bound to specific devices by its author': 'سازندهٔ این کانفیگِ <bdi>npvt</bdi> آن را به دستگاه‌های مشخصی محدود کرده است',
+  'this npvt config is restricted by its author to mobile data only, which a Windows PC cannot honour': 'سازندهٔ این کانفیگِ <bdi>npvt</bdi> آن را فقط به اینترنتِ موبایل محدود کرده و رایانهٔ ویندوزی نمی‌تواند این شرط را رعایت کند',
+  'the HTTP/2 (h2) transport was removed from Xray; ask for an XHTTP config': 'ترابرِ <bdi>HTTP/2 (h2)</bdi> از <bdi>Xray</bdi> حذف شده؛ کانفیگِ <bdi>XHTTP</bdi> بخواهید',
+  'the QUIC transport was removed from Xray': 'ترابرِ <bdi>QUIC</bdi> از <bdi>Xray</bdi> حذف شده است',
+  'unsupported file type (use .npvt, .txt, .json or .conf)': 'نوعِ فایل پشتیبانی نمی‌شود (<bdi>.npvt</bdi>، <bdi>.txt</bdi>، <bdi>.json</bdi> یا <bdi>.conf</bdi>)',
+  'input is larger than 2 MB': 'حجمِ ورودی بیش از ۲ مگابایت است',
+  'subscription is larger than 2 MB': 'حجمِ اشتراک بیش از ۲ مگابایت است',
+  'subscription redirected to a non-https address': 'اشتراک به نشانیِ غیرِ <bdi>https</bdi> هدایت شد',
+  'subscription redirected too many times': 'اشتراک بیش از حد هدایت شد',
+  'locked configs cannot be edited': 'کانفیگِ قفل‌شده ویرایش‌پذیر نیست',
+  'an edit must contain exactly one config': 'ویرایش باید دقیقاً یک کانفیگ داشته باشد',
+  'Default · highest daily limit, best for continuous everyday use':
+    'پیش‌فرض · سقف مصرف روزانهٔ بالا، بهینه برای استفادهٔ مداوم',
+  'Very fast · reaches the free daily limit sooner':
+    'سرعت بالا · رسیدن سریع‌تر به سقف محدودیت روزانه',
+  'Flash-Lite family · high daily limit (alias/preview build)':
+    'خانوادهٔ ⁨Flash-Lite⁩ · سقف روزانهٔ بالا (نسخهٔ پیش‌نمایش/نام مستعار)',
+
+
+  // --- ۱.۴.۰ (پورت به ویندوز ۱.۳.۰): MTU دستی، ECH سفارشی، اندپوینتِ کش‌شده ---
+  'Custom MTU': 'MTU دلخواه',
+  'Safe range: 1280 to 9000 bytes. Lower it if connections stall.':
+    'بازهٔ امن: ۱۲۸۰ تا ۹۰۰۰ بایت. اگر اتصال‌ها گیر می‌کنند، کمترش کنید.',
+  'Only reuse a fast endpoint': 'فقط اندپوینت سریع را دوباره استفاده کن',
+  'Quick reconnect skips the scan for the last endpoint that worked. With this on it is also checked for speed, and a slow one is replaced by a fresh scan instead of halving your download and upload for the whole session.':
+    'اتصال مجدد سریع برای آخرین اندپوینتی که کار کرده بود اسکن را رد می‌کند. با روشن بودن این گزینه، سرعت آن هم سنجیده می‌شود و اندپوینت کند با یک اسکن تازه جایگزین می‌شود، به‌جای آنکه سرعت دانلود و آپلود شما تا آخر آن نشست نصف بماند.',
+  'Encrypted Client Hello': '<bdi>Encrypted Client Hello</bdi>',
+  'Hide the destination name (SNI) from DPI': 'پنهان‌کردن نام مقصد (<bdi>SNI</bdi>) از <bdi>DPI</bdi>',
+  'ECHConfigList (base64, optional)': '<bdi>ECHConfigList</bdi> (<bdi>base64</bdi>، اختیاری)',
+  'Leave empty to let the engine fetch one. Paste a base64 ECHConfigList to use it instead — useful where fetching the default one is what your network blocks. Naming a different domain, as v2rayNG does, needs an engine change and is not possible here.':
+    'خالی بگذارید تا موتور خودش بگیرد. یک <bdi>ECHConfigList</bdi> به شکل <bdi>base64</bdi> بچسبانید تا از همان استفاده شود — جایی به کار می‌آید که شبکه‌تان دقیقاً گرفتنِ نسخهٔ پیش‌فرض را بلاک می‌کند. دادن نام یک دامنهٔ دیگر، آن‌طور که <bdi>v2rayNG</bdi> می‌کند، نیاز به تغییر موتور دارد و اینجا ممکن نیست.',
+
+  // --- ۱.۴.۰ (#66، #67): فهرست‌های هوشمند — همان values-fa موبایل ---
+  'Smart lists': 'فهرست‌های هوشمند',
+  'Bypass Iranian sites': 'بای‌پس سایت‌های ایرانی',
+  'Iranian sites (.ir and Iranian IP ranges) open directly on this Windows PC only; shared devices stay in the tunnel.':
+    'سایت‌های ایرانی (<bdi>.ir</bdi> و رنج آی‌پی ایران) فقط روی همین ویندوز مستقیم باز می‌شوند؛ دستگاه‌های اشتراکی داخل تونل می‌مانند.',
+  'Block ads and trackers': 'حذف تبلیغات و ردیاب‌ها',
+  'Blocks ad and tracker domains (HaGeZi Light list, refreshed weekly through the tunnel).':
+    'دامنه‌های تبلیغاتی و ردیاب مسدود می‌شوند (لیست <bdi>HaGeZi Light</bdi>، به‌روزرسانی هفتگی از داخل تونل).',
+  'built-in copy': 'نسخهٔ داخلی برنامه',
+  '{0} Iranian IP ranges and {1} domains · updated {2}': '{0} رنج آی‌پی ایران و {1} دامنه · به‌روزرسانی {2}',
+  '{0} ad and tracker domains · updated {1}': '{0} دامنهٔ تبلیغاتی و ردیاب · به‌روزرسانی {1}',
+
+  // --- ۱.۴.۰ (#12): Zero Trust — اول ورود، بعد اتصال ---
+  'Sign in before connecting': 'ورود پیش از اتصال',
+  'Checking this device\u2019s membership\u2026': 'در حال بررسی عضویت این دستگاه…',
+  'Login code': 'کد ورود',
+  'Signed in as {0}. The next connect joins this device without asking for a code.':
+    'با {0} وارد شده‌اید. اتصال بعدی بدون پرسیدن کد این دستگاه را عضو می‌کند.',
+  '{0} day(s) left.': '{0} روز مانده.',
+  'This device is already a member of {0}. Connecting needs no sign-in.':
+    'این دستگاه از قبل عضو {0} است. برای وصل شدن ورود لازم نیست.',
+  'Your sign-in has expired. Sign in again before connecting, or the code is asked for while connecting.':
+    'اعتبار ورود شما تمام شده. پیش از وصل شدن دوباره وارد شوید، وگرنه کد در حین اتصال پرسیده می‌شود.',
+  'The saved sign-in is for {0} in team {1}, not the address and team above. It will not be used: sign in again.':
+    'ورود ذخیره‌شده برای {0} در تیم {1} است، نه نشانی و تیمِ بالا. از آن استفاده نمی‌شود: دوباره وارد شوید.',
+  'A one-time code was e-mailed to {0}. Type it here to sign in.':
+    'یک کد یک‌بارمصرف به {0} ایمیل شد. برای ورود، آن را اینجا وارد کنید.',
+  'Not signed in yet. Sign in now and the connect will not stop to ask for a code. If you skip this, the code is asked for while connecting.':
+    'هنوز وارد نشده‌اید. اگر الان وارد شوید، اتصال برای پرسیدن کد متوقف نمی‌شود. اگر این کار را نکنید، کد در حین اتصال پرسیده می‌شود.',
+  'Enter the team name above to sign in or to see whether this device is already a member.':
+    'برای ورود، یا برای دیدن اینکه این دستگاه از قبل عضو است یا نه، اول نام تیم را در بالا وارد کنید.',
+  'Disconnect to sign in or to change the membership.': 'برای ورود یا تغییر عضویت، اول اتصال را قطع کنید.',
+  'Sign in': 'ورود',
+  'Send a new code': 'ارسال کد تازه',
+  'Sign in again': 'ورود دوباره',
+  'Forget this sign-in': 'فراموش کردن این ورود',
+  'Enter your work e-mail above first.': 'اول ایمیل کاری خود را در بالا وارد کنید.',
+  'Asking for a code\u2026': 'در حال درخواست کد…',
+  'You can ask for a new code in {0} s.': 'تا {0} ثانیهٔ دیگر می‌توانید کد تازه بخواهید.',
+  'Asking for a new code\u2026': 'در حال درخواست کد تازه…',
+  'A new code is on its way. Only the newest code works.': 'کد تازه در راه است. فقط جدیدترین کد کار می‌کند.',
+  'Enter the code from the e-mail.': 'کدِ داخل ایمیل را وارد کنید.',
+  'Checking the code\u2026': 'در حال بررسی کد…',
+  'Signed in. Connect now to join the organization.': 'وارد شدید. حالا وصل شوید تا عضو سازمان شوید.',
+  'Sign-in forgotten.': 'ورود فراموش شد.',
+  // پیام‌های خطای zt_signin.rs (Failure::message) و main.rs
+  'That team name is not valid.': 'این نام تیم معتبر نیست.',
+  'That e-mail address is not valid.': 'این نشانی ایمیل معتبر نیست.',
+  'This team does not offer sign-in with an e-mail code.': 'این تیم ورود با کد ایمیلی را ارائه نمی‌کند.',
+  'Cloudflare refused the request (HTTP {0}).': '<bdi>Cloudflare</bdi> درخواست را رد کرد (<bdi>HTTP {0}</bdi>).',
+  'Cloudflare did not start a code session. Try again.': '<bdi>Cloudflare</bdi> نشستِ کد را شروع نکرد. دوباره امتحان کنید.',
+  'Ask for a code first.': 'اول کد بخواهید.',
+  'That code was not accepted (HTTP {0}). Check it, or ask for a new one.':
+    'این کد پذیرفته نشد (<bdi>HTTP {0}</bdi>). آن را بررسی کنید، یا کد تازه بخواهید.',
+  'Cloudflare returned an unusable token.': '<bdi>Cloudflare</bdi> توکنی برگرداند که قابل استفاده نیست.',
+  'The request thread stopped unexpectedly.': 'رشتهٔ درخواست ناگهان متوقف شد.',
 
   // --- ۱.۲.۵: پیام‌های شکستِ تور (از diagnostics.rs، از راهِ snapshot.detail)
   'The tunnel started but the self-test failed.':
@@ -112,6 +281,7 @@ const FA = {
   'Only applies to the chained backend. If no server is reachable in that country, Aether falls back to an automatic exit instead of hanging.':
     'فقط برای بک‌اند زنجیره‌ای است. اگر در آن کشور هیچ سروری در دسترس نباشد، اِتِر به‌جای معلق‌ماندن به خروجی خودکار برمی‌گردد.',
   'Starting the Psiphon stage…': 'در حال راه‌اندازی مرحلهٔ <bdi>Psiphon</bdi>…',
+  'Waiting for engine-managed Psiphon…': 'در انتظار راه‌اندازی سایفون توسط هسته…',
   'Rebuilding the chain…': 'بازسازی زنجیره…',
   // --- v12 (۱.۲.۴): دستیار هوش مصنوعی ---
   'Assistant': 'دستیار',
@@ -206,6 +376,11 @@ const FA = {
   'IP unavailable': 'آی‌پی در دسترس نیست',
   'Connected for': 'مدت اتصال',
   'Protocol': 'پروتکل',
+  'Gool mode': 'حالت GOOL',
+  'Modern: WireGuard inside MASQUE, the core 2.3.0 default.': 'نوین: وایرگارد داخل MASQUE، حالت پیش‌فرض هسته ۲.۳.۰.',
+  'Classic: the older WireGuard-inside-WireGuard mode.': 'سنتی: حالت قدیمی وایرگارد داخل وایرگارد.',
+  'Modern (MASQUE)': 'نوین (بستر MASQUE)',
+  'Classic (WireGuard)': 'سنتی (بستر WireGuard)',
   'MASQUE×2': 'ماسک×۲',
   'Endpoint': 'نقطهٔ اتصال',
   'Latency': 'تأخیر',
@@ -415,6 +590,203 @@ const FA = {
     'سه هاپ: اول تور، بعد سایفون از داخل آن. آی‌پی خروجی شما مال سایفون است که از یک آدرس تور به آن رسیده‌اید؛ پس سایت‌هایی که گره‌های خروجی تور را بلاک می‌کنند باز می‌شوند و آدرس خود شما پشت تور می‌ماند. کندترین حالت.',
   'The reverse chain: Tor first, then the Aether tunnel built INSIDE it. Your exit is a WARP address \u2014 the same as plain Aether \u2014 but the network you are on sees only Tor, and cannot tell that a VPN tunnel exists at all. Use it where Cloudflare/WARP itself is blocked or throttled but Tor still gets through. Carries normal UDP, unlike the Tor-exit modes.':
     'زنجیرهٔ معکوس: اول تور، بعد تونل اتر داخل آن ساخته می‌شود. خروجی شما یک آدرس <bdi>WARP</bdi> است — همان چیزی که اتر ساده می‌دهد — اما شبکه‌ای که در آن هستید فقط تور را می‌بیند و اصلاً نمی‌تواند بفهمد که تونل <bdi>VPN</bdi>‌ی وجود دارد. جایی به کار بیاید که خود <bdi>Cloudflare/WARP</bdi> بلاک یا کند شده اما تور هنوز رد می‌شود. برخلاف حالت‌های با خروجی تور، <bdi>UDP</bdi> عادی را حمل می‌کند.',
+
+  // --- 1.3.0-r4: رشته‌های صفحهٔ اتصال که ترجمه نشده بودند (a1/a2) ---
+  'Network backend': 'بک‌اند شبکه',
+  'Core': 'هسته',
+  'Aether/WARP chooses its own anycast exit.':
+    'اتر/<bdi>WARP</bdi> خروجیِ <bdi>anycast</bdi> خودش را انتخاب می‌کند.',
+  'Psiphon treats this as a hard region filter. If it cannot establish there, the app retries automatically with an automatic exit.':
+    'سایفون این را یک فیلتر قطعیِ منطقه می‌گیرد. اگر آنجا وصل نشود، برنامه خودکار با خروجیِ خودکار دوباره تلاش می‌کند.',
+  'Smart tries the protocols one at a time, starting with the one most likely to work on this network, and keeps the first one that passes the self-test.':
+    'حالت هوشمند پروتکل‌ها را یکی‌یکی امتحان می‌کند، از محتمل‌ترین گزینه برای همین شبکه شروع می‌کند و اولین پروتکلی را که از خودآزمایی سربلند بیرون بیاید نگه می‌دارد.',
+  'There is no WARP tunnel in this mode: Tor carries the traffic by itself, so the protocol, scan mode and IP version are not used.':
+    'در این حالت تونل <bdi>WARP</bdi> وجود ندارد: تور خودش ترافیک را می‌برد، پس پروتکل، حالت اسکن و نسخهٔ آی‌پی استفاده نمی‌شوند.',
+
+
+  // --- ۱.۵.۰ (پورت از موبایل ۱.۵.۰): Zero Trust (عضویت، دیالوگ ورود، کد حین اتصال) و «اشتراک VPN» ---
+  "A browser set to use a proxy still sends WebRTC on its own connection, which can reveal the device’s real IP. Open the setup page below on the other device: it tests WebRTC live and gives a one‑click lock for Chrome, Edge, Brave and Firefox. Phones: use v2rayNG / NekoBox in VPN mode with the SOCKS5 address.":
+    "مرورگری که روی پراکسی تنظیم شده، ⁨WebRTC⁩ را همچنان از اینترنت خودش می‌فرستد و می‌تواند ⁨IP⁩ واقعی دستگاه را لو دهد. صفحهٔ تنظیم زیر را روی دستگاه دیگر باز کنید: ⁨WebRTC⁩ را زنده آزمایش می‌کند و برای کروم، اج، بریو و فایرفاکس قفل یک‌کلیکی می‌دهد. در گوشی‌ها از ⁨v2rayNG⁩ یا ⁨NekoBox⁩ در حالت ⁨VPN⁩ با آدرس ⁨SOCKS5⁩ استفاده کنید.",
+  "Accepted: the organization issued an enrolment token for this service token.":
+    "پذیرفته شد: سازمان برای این توکن سرویس یک توکن عضویت صادر کرد.",
+  "Address copied":
+    "آدرس کپی شد",
+  "All details copied":
+    "همهٔ مشخصات کپی شد",
+  "Also reachable on these links (use the one the device is connected by)":
+    "روی این اتصال‌ها هم در دسترس است (آدرس همان اتصالی را بزنید که دستگاه با آن وصل است)",
+  "Asking your organization to e-mail a code to {0}…":
+    "در حال درخواست از سازمان برای ارسال کد به ⁨{0}⁩…",
+  "Asks your organization for an enrolment token exactly as the engine will when connecting. Nothing is stored.":
+    "دقیقاً همان‌طور که موتور موقع اتصال این کار را می‌کند، از سازمان شما یک توکن عضویت می‌خواهد. چیزی ذخیره نمی‌شود.",
+  "Automatic proxy (PAC) URL — easiest, fail‑closed":
+    "نشانی پراکسی خودکار (⁨PAC⁩) — ساده‌ترین و ایمن‌ترین",
+  "Cloudflare issued a token that is already expired. Check that this PC’s date and time are correct, then sign in again.":
+    "کلادفلر توکنی داد که از همین حالا منقضی است. درست بودن تاریخ و ساعت این رایانه را بررسی کنید و دوباره وارد شوید.",
+  "Cloudflare refused the request (HTTP {0}). Check the team name, and that this address is allowed to join.":
+    "کلادفلر درخواست را رد کرد (⁨HTTP {0}⁩). نام تیم را بررسی کنید، و اینکه این نشانی اجازهٔ عضویت دارد.",
+  "Connect the VPN first — sharing routes other devices through this PC’s tunnel.":
+    "اول ⁨VPN⁩ را وصل کنید — اشتراک‌گذاری، دستگاه‌های دیگر را از طریق تونل همین رایانه عبور می‌دهد.",
+  "Connect this PC to your home Wi‑Fi or wired network. The addresses appear here automatically.":
+    "این رایانه را به وای‌فای یا شبکهٔ کابلی خانه وصل کنید. آدرس‌ها خودکار اینجا ظاهر می‌شوند.",
+  "Copy all details":
+    "کپی همهٔ مشخصات",
+  "Could not reach {0} ({1}). Check the connection and try again. If Cloudflare is only reachable through your upstream proxy, skip signing in here: the code asked for while connecting goes through that proxy.":
+    "دسترسی به ⁨{0}⁩ ممکن نشد (⁨{1}⁩). اتصال را بررسی کنید و دوباره امتحان کنید. اگر کلادفلر فقط از راه پراکسی بالادستیِ شما در دسترس است، از ورود در اینجا بگذرید: کدی که در حین اتصال پرسیده می‌شود از همان پراکسی می‌گذرد.",
+  "Credentials saved":
+    "مشخصات ذخیره شد",
+  "Deletes the saved membership for this team only. The next connect joins again. Use it after your organization removed this device, or to join as someone else.":
+    "فقط عضویت ذخیره‌شده برای همین تیم را پاک می‌کند و اتصال بعدی دوباره عضو می‌شود. وقتی سازمان این دستگاه را حذف کرده، یا می‌خواهید با کاربر دیگری عضو شوید، از این استفاده کنید.",
+  "Deletes the saved sign-in from this PC. A membership this device already has is not affected.":
+    "ورود ذخیره‌شده را از این رایانه پاک می‌کند. عضویتی که این دستگاه از قبل دارد دست نمی‌خورد.",
+  "Disconnect first: the running tunnel is using this membership.":
+    "اول اتصال را قطع کنید: تونلِ روشن از همین عضویت استفاده می‌کند.",
+  "Enter both the client ID and the client secret first.":
+    "اول شناسه و رمز کلاینت را هر دو وارد کنید.",
+  "Enter on the other device (same Wi‑Fi)":
+    "در دستگاه دیگر (روی همین وای‌فای) وارد کنید",
+  "Enter your login code":
+    "کد ورود را وارد کنید",
+  "Ethernet address":
+    "آدرس اترنت",
+  "Everything the other device sends through the share leaves via the VPN tunnel only: DNS is resolved inside the tunnel, UDP is relayed through it, local/private targets are blocked, and if the tunnel drops, connections fail instead of going direct.":
+    "هر چه دستگاه دیگر از طریق اشتراک بفرستد فقط از تونل ⁨VPN⁩ خارج می‌شود: ⁨DNS⁩ داخل تونل حل می‌شود، ⁨UDP⁩ از تونل عبور می‌کند، مقصدهای محلی مسدودند و اگر تونل قطع شود اتصال برقرار نمی‌شود، نه اینکه مستقیم برود.",
+  "Generate a new password":
+    "ساخت رمز جدید",
+  "HTTP proxy — enter in system proxy settings":
+    "پراکسی ⁨HTTP⁩ — در تنظیمات پراکسی سیستم وارد کنید",
+  "How to connect":
+    "روش اتصال",
+  "In its Wi‑Fi / network settings choose Proxy → Automatic and paste the PAC URL (or Manual with the HTTP proxy). For apps and TUN clients (v2rayN, NekoBox, sing‑box) use the SOCKS5 address with remote DNS.":
+    "در تنظیمات وای‌فای/شبکهٔ آن، پراکسی را روی «خودکار» بگذارید و نشانی ⁨PAC⁩ را بچسبانید (یا «دستی» با پراکسی ⁨HTTP⁩). برای برنامه‌ها و کلاینت‌های ⁨TUN⁩ مثل ⁨v2rayN⁩، ⁨NekoBox⁩ و ⁨sing-box⁩ از آدرس ⁨SOCKS5⁩ با ⁨DNS⁩ راه‌دور استفاده کنید.",
+  "Make sure the other device is on the same Wi‑Fi (or wired network) as this PC.":
+    "مطمئن شوید دستگاه دیگر به همان وای‌فای (یا شبکهٔ کابلی) این رایانه وصل است.",
+  "Membership removed. The next connect joins again.":
+    "عضویت حذف شد. اتصال بعدی دوباره عضو می‌شود.",
+  "New code possible in {0} seconds":
+    "کد تازه تا {0} ثانیهٔ دیگر",
+  "New proxy password generated":
+    "رمز جدید پراکسی ساخته شد",
+  "Not a member yet. The next connect joins with the enrolment token above.":
+    "هنوز عضو نیست. اتصال بعدی با توکن عضویتِ بالا عضو می‌شود.",
+  "Not a member yet. The next connect joins with the service token above, without you.":
+    "هنوز عضو نیست. اتصال بعدی با توکن سرویسِ بالا و بدون دخالت شما عضو می‌شود.",
+  "Not accepted (HTTP {0}). Check the client ID and secret, and that the service token is allowed to enrol devices (Service Auth).":
+    "پذیرفته نشد (⁨HTTP {0}⁩). شناسه و رمز را بررسی کنید، و اینکه این توکن سرویس اجازهٔ عضو کردن دستگاه (⁨Service Auth⁩) را دارد.",
+  "Not now":
+    "حالا نه",
+  "Only traffic sent to the share is protected. A device or app that is not set to use it goes out on its own connection — a shared proxy cannot force other devices through the VPN.":
+    "فقط ترافیکی که به اشتراک فرستاده شود محافظت می‌شود. دستگاه یا برنامه‌ای که روی آن تنظیم نشده باشد با اینترنت خودش بیرون می‌رود — یک پراکسیِ اشتراکی نمی‌تواند ترافیک دستگاه‌های دیگر را اجباری از ⁨VPN⁩ عبور دهد.",
+  "Open the check page below in a browser: it only loads when the device is protected.":
+    "صفحهٔ بررسی زیر را در مرورگر باز کنید: فقط وقتی دستگاه محافظت شود باز می‌شود.",
+  "Opens a local proxy that devices on the same Wi‑Fi or wired network can use":
+    "یک پراکسی محلی باز می‌کند که دستگاه‌های روی همین وای‌فای یا شبکهٔ کابلی می‌توانند استفاده کنند",
+  "Optional — recommended on shared or public Wi‑Fi. Devices must sign in before using the share.":
+    "اختیاری — در وای‌فای عمومی یا مشترک توصیه می‌شود. دستگاه‌ها پیش از استفاده باید وارد شوند.",
+  "PC IP address":
+    "آدرس ⁨IP⁩ رایانه",
+  "Password must be at least {0} Latin characters.":
+    "رمز باید دست‌کم ⁨{0}⁩ نویسهٔ لاتین باشد.",
+  "Ports 10810/10811 are used by another app on this PC. Close it and toggle sharing again.":
+    "پورت‌های ⁨10810/10811⁩ روی این رایانه توسط برنامهٔ دیگری استفاده می‌شوند. آن را ببندید و سوییچ را دوباره روشن کنید.",
+  "Protection check page":
+    "صفحهٔ بررسی محافظت",
+  "Proxy password":
+    "رمز پراکسی",
+  "Proxy username":
+    "نام کاربری پراکسی",
+  "Remove the membership?":
+    "عضویت حذف شود؟",
+  "Remove this device’s membership":
+    "حذف عضویت این دستگاه",
+  "Remove":
+    "حذف",
+  "Require username & password":
+    "الزام نام کاربری و رمز عبور",
+  "SOCKS5 proxy — for apps that support SOCKS":
+    "پراکسی ⁨SOCKS5⁩ — برای برنامه‌هایی که ⁨SOCKS⁩ پشتیبانی می‌کنند",
+  "Send code":
+    "ارسال کد",
+  "Setup page + WebRTC test (open on the other device)":
+    "صفحهٔ تنظیم + آزمایش ⁨WebRTC⁩ (روی دستگاه دیگر باز کنید)",
+  "Share VPN":
+    "اشتراک‌گذاری ⁨VPN⁩",
+  "Share on this network":
+    "اشتراک‌گذاری در این شبکه",
+  "Share username & password":
+    "نام کاربری و رمز اشتراک",
+  "Sharing live · {0} connection(s)":
+    "اشتراک فعال · ⁨{0}⁩ اتصال",
+  "Sign in at https://{0}.cloudflareaccess.com/warp in a browser, then copy the value that follows token= and paste it here. Or pick E-mail code above to sign in inside the app instead.":
+    "در مرورگر به ⁨https://{0}.cloudflareaccess.com/warp⁩ بروید و وارد شوید، بعد مقداری که پس از ⁨token=⁩ می‌آید را کپی و اینجا بچسبانید. یا به‌جایش در بالا «کد ایمیلی» را انتخاب کنید تا داخل خود برنامه وارد شوید.",
+  "Sign in to {0}":
+    "ورود به ⁨{0}⁩",
+  "Signed in, but this PC could not store the result securely, so nothing was saved.":
+    "وارد شدید، ولی این رایانه نتوانست نتیجه را به‌صورت امن ذخیره کند، پس چیزی ذخیره نشد.",
+  "Starting sharing… if this takes more than a few seconds, toggle the switch off and on again.":
+    "در حال راه‌اندازی اشتراک‌گذاری… اگر بیش از چند ثانیه طول کشید، سوییچ را خاموش و دوباره روشن کنید.",
+  "Test the service token":
+    "آزمایش توکن سرویس",
+  "That code was not accepted either. Ask for a new code and try again.":
+    "این کد هم پذیرفته نشد. یک کد تازه بخواهید و دوباره امتحان کنید.",
+  "That code was not accepted. Attempt {0} of {1}.":
+    "آن کد پذیرفته نشد. تلاش {0} از {1}.",
+  "That e-mail address is not complete.":
+    "این نشانی ایمیل کامل نیست.",
+  "That team name is not valid. Use just the name, for example acme.":
+    "این نام تیم معتبر نیست. فقط خود نام را بنویسید، مثلاً ⁨acme⁩.",
+  "The code was sent, but Cloudflare’s answer lacked what the sign-in needs. Try again; if it keeps happening, the sign-in page has changed.":
+    "کد فرستاده شد، ولی در پاسخ کلادفلر چیزی که ورود لازم دارد نبود. دوباره امتحان کنید؛ اگر تکرار شد، صفحهٔ ورود تغییر کرده است.",
+  "The connection is waiting for this. It gives up after {0} seconds.":
+    "اتصال منتظر همین است. بعد از {0} ثانیه منصرف می‌شود.",
+  "The other device must sign in to the proxy with these:":
+    "دستگاه دیگر باید با این مشخصات به پراکسی وارد شود:",
+  "The sign-in carries no expiry date.":
+    "این ورود تاریخ انقضا ندارد.",
+  "The sign-in expires in under a minute.":
+    "اعتبار ورود کمتر از یک دقیقهٔ دیگر تمام می‌شود.",
+  "The sign-in is valid for {0} more day(s).":
+    "ورود تا {0} روز دیگر معتبر است.",
+  "The sign-in is valid for {0} more hour(s).":
+    "ورود تا {0} ساعت دیگر معتبر است.",
+  "The sign-in is valid for {0} more minute(s): connect before then.":
+    "ورود تا {0} دقیقهٔ دیگر معتبر است: پیش از آن وصل شوید.",
+  "This PC’s saved identity in {0} is deleted, and the next connect joins the organization again as a new device. Personal WARP and other teams are not touched. This cannot be undone.":
+    "هویت ذخیره‌شدهٔ این رایانه در ⁨{0}⁩ پاک می‌شود و اتصال بعدی به‌عنوان یک دستگاه تازه دوباره عضو سازمان می‌شود. ⁨WARP⁩ شخصی و تیم‌های دیگر دست نمی‌خورند. این کار برگشت‌پذیر نیست.",
+  "This does not look like a token. Copy the whole value that follows token= on the enrolment page.":
+    "این شبیه توکن نیست. کل مقداری که در صفحهٔ عضویت پس از ⁨token=⁩ آمده را کپی کنید.",
+  "This organization does not offer sign-in with an e-mailed code. Ask its administrator, or use a service token or an enrolment token instead.":
+    "این سازمان ورود با کد ایمیلی را ارائه نمی‌کند. از مدیر آن بپرسید، یا به‌جایش از توکن سرویس یا توکن عضویت استفاده کنید.",
+  "This token has expired. Sign in again and paste a fresh one.":
+    "این توکن منقضی شده. دوباره وارد شوید و یک توکن تازه بچسبانید.",
+  "Token looks valid but expires in under a day.":
+    "توکن معتبر به‌نظر می‌رسد ولی کمتر از یک روز دیگر منقضی می‌شود.",
+  "Token looks valid, expires in {0} day(s).":
+    "توکن معتبر به‌نظر می‌رسد؛ {0} روز دیگر منقضی می‌شود.",
+  "Token looks valid. It carries no expiry date.":
+    "توکن معتبر به‌نظر می‌رسد. تاریخ انقضایی در آن نیست.",
+  "Turn on sharing, and the addresses to enter on the other device appear here.":
+    "اشتراک‌گذاری را روشن کنید؛ آدرس‌هایی که باید در دستگاه دیگر وارد شوند اینجا نمایش داده می‌شوند.",
+  "Use this PC as a proxy for your laptop, phone or another computer":
+    "استفاده از این رایانه به‌عنوان پراکسی برای لپ‌تاپ، گوشی یا رایانهٔ دیگر",
+  "Username: 1–64 Latin characters, no spaces or \":\".":
+    "نام کاربری: ۱ تا ۶۴ نویسهٔ لاتین، بدون فاصله و «:».",
+  "WebRTC (real‑IP leak in browsers)":
+    "⁨WebRTC⁩ (نشت ⁨IP⁩ واقعی در مرورگر)",
+  "Wi‑Fi address":
+    "آدرس وای‌فای",
+  "Your organization e-mailed a one-time code to {0}. Type it here to finish joining.":
+    "سازمان شما یک کد یک‌بارمصرف به ⁨{0}⁩ ایمیل کرد. برای کامل شدن عضویت، آن را اینجا وارد کنید.",
+  "Your organization e-mailed you a one-time code. Type it here to finish joining.":
+    "سازمان شما یک کد یک‌بارمصرف برایتان ایمیل کرد. برای کامل شدن عضویت، آن را اینجا وارد کنید.",
+  "Your organization e-mails a one-time code to the address above, you type it here, and the result is kept encrypted on this PC for the next connect.":
+    "سازمان شما یک کد یک‌بارمصرف به نشانی بالا ایمیل می‌کند، شما آن را اینجا وارد می‌کنید، و نتیجه برای اتصال بعدی به‌صورت رمزشده روی همین رایانه نگه داشته می‌شود.",
+  "Membership":
+    "عضویت",
+  "Zero‑leak guard active":
+    "محافظ ضدنشت فعال است",
+  "Zero Trust sign-in was cancelled, so the connection was stopped. Sign in under Settings → Zero Trust, or connect again when you have the code.":
+    "ورود ⁨Zero Trust⁩ لغو شد، پس اتصال متوقف شد. از «تنظیمات ← ⁨Zero Trust⁩» وارد شوید، یا وقتی کد را دارید دوباره وصل شوید.",
 }
 
 let current = (() => {
@@ -429,11 +801,36 @@ export function getLang() {
   return current
 }
 
+// >>> AETHER-APP-PATCH ui-lang-on-disk (1.3.0)
+// localStorage وب‌ویو تنها جای زبان بود و WebView2 گاهی آن را پیش از بستن روی
+// دیسک نمی‌نوشت؛ برنامه دوباره انگلیسی باز می‌شد. main.js یک نویسنده ثبت می‌کند
+// که زبان را در prefs.json سمت Rust هم بنویسد؛ اینجا وابستگی به Tauri نمی‌ماند.
+let persistLang = null
+export function setLangPersister(fn) {
+  persistLang = typeof fn === 'function' ? fn : null
+}
+
+/** زبانِ خوانده‌شده از دیسک را بی‌نوشتنِ دوباره اعمال می‌کند. true = عوض شد. */
+export function adoptStoredLang(lang) {
+  if (lang !== 'fa' && lang !== 'en') return false
+  try { localStorage.setItem(STORAGE_KEY, lang) } catch { /* بی‌اثر */ }
+  if (lang === current) return false
+  current = lang
+  applyLang()
+  return true
+}
+// <<< AETHER-APP-PATCH ui-lang-on-disk
+
 export function setLang(lang) {
   current = lang === 'fa' ? 'fa' : 'en'
   try {
     localStorage.setItem(STORAGE_KEY, current)
   } catch { /* بی‌اثر */ }
+  if (persistLang) {
+    Promise.resolve()
+      .then(() => persistLang(current))
+      .catch((e) => console.error('saving UI language failed', e))
+  }
   applyLang()
 }
 

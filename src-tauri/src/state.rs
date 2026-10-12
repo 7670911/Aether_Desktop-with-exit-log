@@ -25,8 +25,6 @@ use crate::log::DiagnosticsLog;
 use crate::ping;
 use crate::probe;
 use crate::profile::{ConnectionProfile, Protocol};
-use crate::psiphon::PsiphonTransport;
-use crate::psiphon_health;
 use crate::share::ShareBridge;
 use crate::smart_auto::{self, Candidate};
 use crate::store::ProfileStore;
@@ -36,11 +34,19 @@ use crate::tun::Tunnel;
 use anyhow::Result;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const TAG: &str = "state";
+
+// >>> AETHER-APP-PATCH custom-configs
+// نشستِ کانفیگِ سفارشی (پورتِ `connectCustom` اندروید ۱.۵.۰) — رجوع به
+// `state_custom.rs`. زیرماژول است تا به فیلدهای خصوصیِ کنترلر برسد.
+#[path = "state_custom.rs"]
+mod state_custom;
+// <<< AETHER-APP-PATCH custom-configs
 
 /// همان مقادیر اندروید: MAX_RETRIES=3، BACKOFF = 2s/5s/10s.
 const DEFAULT_MAX_RETRIES: u32 = 3;
@@ -69,6 +75,19 @@ const CIRCUIT_HUNT_WINDOW: Duration = Duration::from_secs(20);
 /// وگرنه یک نشست زنجیره‌ای که فقط کُند است پیش از آنکه شانسی داشته باشد رد
 /// می‌شود — همان اشتباهی که مستند موبایل «بدترین نتیجهٔ ممکن» می‌خواندش.
 const CHAIN_BUDGET_MS: u64 = 430_000;
+// >>> AETHER-APP-PATCH tor-aether-fast-path
+/// چند بار موتورِ مرده پشتِ همان tor.exeِ آماده دوباره اجرا شود، به‌جای کشتنِ
+/// تور و شکستِ کلِ اتصال (لاگ: ثبت‌نامِ اول ۵ بار در ۱۰ ثانیه قطع شد و
+/// bootstrapِ کاملِ تور دور ریخته شد).
+const TOR_REVERSE_RESPAWNS: u8 = 2;
+// <<< AETHER-APP-PATCH tor-aether-fast-path
+// >>> AETHER-APP-FIX tor-psiphon-waits-for-psiphon
+/// Mobile `PsiphonTransport`: READY_TIMEOUT_MS / PROBE_INTERVAL_MS /
+/// PROBE_TIMEOUT_MS — the same three numbers.
+const PSIPHON_READY_TIMEOUT: Duration = Duration::from_millis(200_000);
+const PSIPHON_PROBE_INTERVAL: Duration = Duration::from_millis(4_000);
+const PSIPHON_PROBE_TIMEOUT: Duration = Duration::from_millis(5_000);
+// <<< AETHER-APP-FIX tor-psiphon-waits-for-psiphon
 const WATCHDOG_FAILURE_THRESHOLD: u8 = 3;
 
 /// معادل دقیق `ConnectionState.kt` — همان هشت حالت، همان ترتیب.
@@ -137,6 +156,14 @@ pub struct Snapshot {
     pub tx_bytes: u64,
     pub share_socks: Option<String>,
     pub share_http: Option<String>,
+    /// ۱.۵.۰ — وضعیت اشتراک LAN: `off` / `waiting` / `ready` / `portBusy`.
+    pub share_status: String,
+    /// ۱.۵.۰ — همهٔ آدرس‌های اشتراک (Wi‑Fi/Ethernet)؛ اولی آدرس اصلی.
+    pub share_targets: Vec<crate::share::ShareTarget>,
+    /// ۱.۵.۰ — اتصال‌های زندهٔ دستگاه‌های شبکه.
+    pub share_clients: usize,
+    /// ۱.۵.۰ — هسته منتظرِ کدِ ورودِ Zero Trust است (دیالوگ روی هر صفحه‌ای).
+    pub login_code: Option<crate::login_code::Request>,
     pub ip_info: Option<IpEndpoint>,
     pub ip_loading: bool,
     /// v1.2.0 — نتیجهٔ آخرین سنجش نشتی WebRTC. `None` = هنوز سنجیده نشده.
@@ -151,6 +178,12 @@ pub struct Snapshot {
     /// نشان داده می‌شود، پس کاربر فارسی پنج دقیقه به یک جملهٔ انگلیسی نگاه
     /// می‌کرد — همان‌جایی که برنامه بیشترین وقت را از او می‌گیرد.
     pub tor_percent: Option<u8>,
+    // >>> AETHER-APP-PATCH custom-configs
+    /// زنجیرهٔ کانفیگِ سفارشی به شکل‌های کوتاه‌شونده (اولی = `protocol`)؛
+    /// کارتِ اتصال اولین شکلی را نشان می‌دهد که در یک خط جا شود. خالی وقتی
+    /// کانفیگِ سفارشی در کار نیست.
+    pub protocol_compact: Vec<String>,
+    // <<< AETHER-APP-PATCH custom-configs
 }
 
 /// What the user asked for with the last tap on the big button.
@@ -186,6 +219,10 @@ enum Prep {
 struct PrepOutcome {
     /// What the pre-connect probes learned. Only meaningful for [`Prep::Plan`].
     fingerprint: smart_auto::NetFingerprint,
+    /// Set when a local port the pipeline needs is held by another program.
+    /// The attempt is abandoned with this exact reason instead of launching
+    /// engines that can only die with `os error 10048`.
+    blocked: Option<String>,
 }
 
 pub struct AetherController {
@@ -208,12 +245,43 @@ pub struct AetherController {
     /// کدام نیمهٔ یک نشستِ توری هنوز اجرا نشده است.
     tor_stage: TorStage,
     // <<< AETHER-APP-PATCH the-tor-in-front-is-the-real-tor
+    // >>> AETHER-APP-PATCH tor-reverse-latch (mobile 1.4.0 `connect`: REVERSE takes the plain path)
+    /// در `Tor → Aether`: tor.exe جلوی موتور آماده شده و موتور پشتش اجرا شده.
+    ///
+    /// از این لحظه دروازهٔ تور دیگر به درصدِ سراسریِ `tor_bootstrap` نگاه
+    /// نمی‌کند. آن وضعیت سراسری است و دو منبعِ نوشتن دارد (سینکِ tor.exe و
+    /// تردِ خروجیِ موتور) و هر `reset()`ای که بعد از `mark_done` برسد، دروازه را
+    /// دوباره روی «Reaching the Tor network…» می‌برد — دقیقاً لاگِ `loge3`:
+    /// `socks5 server listening on 127.0.0.1:1819`، `masque exit: …`، و بعد
+    /// «Tor is not getting through directly — trying bridges…» تا قطعِ دستی.
+    ///
+    /// موبایل ۱.۴.۰ همین حالت را از مسیرِ معمولی می‌برد: پورتِ باز + خودآزمای
+    /// واقعیِ مسیرِ داده، بی هیچ دروازهٔ درصدی. موتور هم SOCKS5 را فقط پس از
+    /// `tunnel validated (end-to-end data confirmed)` باز می‌کند، پس پورتِ باز
+    /// در این مرحله خودش اثباتِ عبور از تور است.
+    tor_front_ready: bool,
+    // <<< AETHER-APP-PATCH tor-reverse-latch
+    // >>> AETHER-APP-PATCH tor-aether-fast-path
+    /// رلهٔ صبورِ SOCKS بینِ موتور و tor.exe در `Tor → Aether` — رجوع به
+    /// [`crate::tor_relay`].
+    tor_relay: Option<crate::tor_relay::TorDialRelay>,
+    /// چند بار موتور در این نشست پشتِ همان تور دوباره اجرا شده.
+    tor_reverse_respawns: u8,
+    // <<< AETHER-APP-PATCH tor-aether-fast-path
     // <<< AETHER-APP-PATCH tor-native-carrier
-    /// استیج ۲. `Arc` چون ترد راه‌اندازی و ترد چرخش هم به آن نیاز دارند و
-    /// `Drop` باید فقط با آزادشدن آخرین ارجاع فرآیند را بکشد.
-    psiphon: Arc<PsiphonTransport>,
-    /// نتیجهٔ راه‌اندازی زنجیره در ترد پس‌زمینه — حلقهٔ tick مسدود نمی‌شود.
-    chain_slot: Option<Arc<Mutex<Option<Result<u16, String>>>>>,
+    /// The engine owns Psiphon; desktop only waits for its exit listener.
+    chain_waiting: bool,
+    // >>> AETHER-APP-FIX tor-psiphon-waits-for-psiphon
+    /// `Tor → Psiphon`: when Psiphon was started behind the ready tor.exe —
+    /// the start of the mobile `PsiphonTransport` readiness window.
+    psiphon_gate_since: Option<Instant>,
+    /// When the next real CONNECT probe through Psiphon may be sent.
+    psiphon_next_probe: Option<Instant>,
+    /// پورتِ سایفون یک بار باز دیده شد (`psiphon-port-latch`).
+    psiphon_port_latched: bool,
+    /// Result of the CONNECT probe in flight (`None` while it runs).
+    psiphon_probe: Option<Arc<Mutex<Option<bool>>>>,
+    // <<< AETHER-APP-FIX tor-psiphon-waits-for-psiphon
     tunnel: Option<Tunnel>,
     share: ShareBridge,
     sysproxy_on: bool,
@@ -258,6 +326,10 @@ pub struct AetherController {
     /// only once the Psiphon hop really is the exit, not merely because the
     /// chained backend is selected in Advanced.
     chain_exit_port: Option<u16>,
+    // >>> AETHER-APP-PATCH custom-configs
+    /// نشستِ کانفیگِ سفارشیِ فعلی؛ `None` = کلید خاموش، همه‌چیز مثل قبل.
+    custom: Option<state_custom::CustomRun>,
+    // <<< AETHER-APP-PATCH custom-configs
 }
 
 /// جوابِ دروازهٔ تور — [`AetherController::tor_gate`].
@@ -296,6 +368,8 @@ enum TorStage {
     None,
     /// `Tor → Aether`: تور بالا است و موتور پس از آمادگیِ آن اجرا می‌شود.
     TorThenEngine,
+    /// tor.exe reaches a circuit before core-managed Psiphon dials through it.
+    TorThenPsiphon,
     /// `Aether → Tor`: موتور بالا است و تور از دلِ تونلش اجرا می‌شود.
     EngineThenTor,
 }
@@ -310,6 +384,11 @@ impl AetherController {
             .ok()
             .and_then(|p| p.parent().map(Path::to_path_buf))
             .unwrap_or_else(|| data_dir.to_path_buf());
+
+        crate::procguard::set_own_roots(&[install_dir.clone(), data_dir.to_path_buf()]);
+
+        // ۱.۵.۰ — رمز اشتراک LAN از انبار مهرشده، پیش از اولین شنونده.
+        crate::share::load_credentials(data_dir);
 
         let ip_slot = Arc::new(Mutex::new(IpSlot {
             info: None,
@@ -332,9 +411,15 @@ impl AetherController {
             // >>> AETHER-APP-PATCH tor-native-carrier
             native_tor: None,
             tor_stage: TorStage::None,
+            tor_front_ready: false,
+            tor_relay: None,
+            tor_reverse_respawns: 0,
             // <<< AETHER-APP-PATCH tor-native-carrier
-            psiphon: Arc::new(PsiphonTransport::new(&install_dir, data_dir)),
-            chain_slot: None,
+            chain_waiting: false,
+            psiphon_gate_since: None,
+            psiphon_next_probe: None,
+            psiphon_port_latched: false,
+            psiphon_probe: None,
             tunnel: None,
             share: ShareBridge::new(),
             sysproxy_on: false,
@@ -359,6 +444,7 @@ impl AetherController {
             prep_slot: None,
             prep_kind: Prep::Plan,
             chain_exit_port: None,
+            custom: None,
         };
 
         // >>> AETHER-APP-PATCH the-flag-is-already-on-disk
@@ -368,16 +454,6 @@ impl AetherController {
             geoip::use_dir(&support);
         }
         // <<< AETHER-APP-PATCH the-flag-is-already-on-disk
-
-        // Tell the health scorer which destinations are OURS before anything can
-        // dial them, so a refused self-probe can never be read as evidence that
-        // the exit filters (mobile parity: registerSelfProbes).
-        for (host, port) in ping::probe_targets() {
-            psiphon_health::register_self_probe(host, port);
-        }
-        for (host, port) in probe::watchdog_targets() {
-            psiphon_health::register_self_probe(host, port);
-        }
 
         // Stale state from a previous crash is cleared on a worker thread.
         //
@@ -393,6 +469,10 @@ impl AetherController {
             .spawn(|| {
                 sysproxy::recover_stale();
                 leakguard::purge_stale();
+                // Orphans of an earlier session (crash, End task, an upgrade
+                // installed over a running copy) still sit on Aether's fixed
+                // ports and would make every protocol fail with 10048.
+                crate::procguard::sweep_orphans(&engine::FIXED_PORTS);
             })
             .ok();
         // Do not install network-blocking rules during ordinary app startup.
@@ -405,7 +485,8 @@ impl AetherController {
     }
 
     pub fn profile(&self) -> ConnectionProfile {
-        self.profile.clone()
+        // AETHER-APP-PATCH custom-configs: نسخهٔ کاربر، بی جایگزینیِ نشست.
+        self.custom_user_profile()
     }
 
     pub fn set_profile(&mut self, profile: ConnectionProfile) -> Result<()> {
@@ -445,6 +526,8 @@ impl AetherController {
         let kill_toggled = profile.kill_switch != self.profile.kill_switch;
         let ipv6_toggled = profile.ipv6_protection != self.profile.ipv6_protection;
         self.profile = profile;
+        // AETHER-APP-PATCH custom-configs: زنجیرهٔ سفارشیِ نشستِ جاری می‌ماند.
+        self.custom_reapply();
         // v1.2.0: خاموش/روشن‌کردن گارد نشتی وسط یک اتصالِ فعال باید فوراً
         // اثر کند — نه در اتصال بعدی. کاربری که سوییچ را می‌زند انتظار دارد
         // همان لحظه محافظت شود (یا آزاد شود).
@@ -460,8 +543,12 @@ impl AetherController {
         // while a connection is active must rebind the bridge immediately
         // (mobile restarts its ShareBridge the same way), so the UI gets the
         // fresh endpoints in the very next snapshot instead of never.
+        // ۱.۵.۰: فقط شنونده‌های LAN باز/بسته می‌شوند؛ شنوندهٔ loopback (پروکسی
+        // سیستمیِ همین رایانه) بی‌وقفه می‌ماند.
         if lan_toggled && self.state.is_active() {
-            if let Err(e) = self.share.start(
+            if self.share.is_running() {
+                self.share.set_lan(self.profile.lan_share);
+            } else if let Err(e) = self.share.start(
                 engine::SHARE_SOCKS_PORT,
                 engine::SHARE_HTTP_PORT,
                 self.profile.lan_share,
@@ -479,6 +566,12 @@ impl AetherController {
             let g = self.ip_slot.lock();
             (g.info.clone(), g.loading)
         };
+        crate::share::note_exit_ip(
+            ip_info
+                .as_ref()
+                .filter(|i| i.via_tunnel)
+                .map(|i| i.ip.as_str()),
+        );
         Snapshot {
             state: self.state,
             detail: self.detail.clone(),
@@ -494,6 +587,10 @@ impl AetherController {
             tx_bytes: tun_tx + br_tx,
             share_socks: self.share.socks_endpoint(),
             share_http: self.share.http_endpoint(),
+            share_status: self.share.lan_status().to_string(),
+            share_targets: self.share.targets(),
+            share_clients: self.share.lan_clients(),
+            login_code: crate::login_code::pending(),
             ip_info,
             ip_loading,
             webrtc_leak: self.webrtc_leak,
@@ -503,6 +600,7 @@ impl AetherController {
             } else {
                 None
             },
+            protocol_compact: self.custom_compact(),
         }
     }
 
@@ -516,13 +614,51 @@ impl AetherController {
     /// وقتی گفته می‌شود که استیج ۲ واقعاً خروجی را در دست گرفته باشد؛
     /// نوشتنِ `Aether → Psiphon` پیش از آن، ادعای دروغ است.
     fn display_protocol(&self) -> Option<String> {
-        if let Some(label) = self.profile.backend.protocol_label() {
-            if !self.profile.is_chained() || self.chain_exit_port.is_some() {
-                return Some(label.to_string());
+        // AETHER-APP-PATCH custom-configs: زنجیرهٔ سفارشی نامِ خودش را دارد.
+        if let Some(label) = self.custom_display() {
+            return Some(label);
+        }
+        // `Tor` و `Tor → Psiphon` هیچ تونلِ WARPی ندارند، پس «پروتکل»شان
+        // همان نامِ خط‌لوله است — مثل بقیهٔ کانکشن‌ها. پیش از این، `Tor → Psiphon`
+        // چون زنجیره‌ای است منتظرِ `chain_exit_port` (پورتِ ۱۸۲۵ِ حالتِ
+        // `Aether → Psiphon`) می‌ماند که در این خط‌لوله هرگز تنظیم نمی‌شود
+        // (خروجی‌اش ۱۸۱۹ است)، و کارت به `effective_protocol` یعنی `SMART`
+        // برمی‌گشت.
+        let pipeline_name = self.profile.backend.protocol_label();
+        if matches!(
+            self.profile.backend,
+            crate::profile::TransportBackend::Tor | crate::profile::TransportBackend::TorPsiphon
+        ) {
+            return pipeline_name.map(str::to_string);
+        }
+        let protocol = self
+            .effective_protocol
+            .map(|p| format!("{p:?}").to_uppercase());
+        let show_chain = !self.profile.is_chained() || self.chain_exit_port.is_some();
+        if show_chain {
+            let label = match self.profile.backend {
+                crate::profile::TransportBackend::Aether => {
+                    protocol.as_ref().map(|p| format!("Aether ({p})"))
+                }
+                crate::profile::TransportBackend::AetherPsiphon => protocol
+                    .as_ref()
+                    .map(|p| format!("Aether ({p}) \u{2192} Psiphon")),
+                crate::profile::TransportBackend::AetherTor => protocol
+                    .as_ref()
+                    .map(|p| format!("Aether ({p}) \u{2192} Tor")),
+                crate::profile::TransportBackend::TorAether => protocol
+                    .as_ref()
+                    .map(|p| format!("Tor \u{2192} Aether ({p})")),
+                crate::profile::TransportBackend::Tor => Some("Tor".to_string()),
+                crate::profile::TransportBackend::TorPsiphon => {
+                    Some("Tor \u{2192} Psiphon".to_string())
+                }
+            };
+            if label.is_some() {
+                return label;
             }
         }
-        self.effective_protocol
-            .map(|p| format!("{p:?}").to_uppercase())
+        protocol
     }
 
     /// معادل `onToggleConnection` — خطای اتصال دیگر به بیرون پرتاب نمی‌شود؛
@@ -546,7 +682,7 @@ impl AetherController {
     fn connect(&mut self) -> Result<()> {
         self.error = None;
         self.attempts = 0;
-        self.chain_slot = None;
+        self.chain_waiting = false;
         self.chain_exit_port = None;
         // هر نشست از موتور شروع می‌شود. اگر این جا بیفتد، یک نشست عادی به پورت
         // استیج ۲ که دیگر وجود ندارد وصل می‌ماند: «متصل ولی هیچ سایتی باز
@@ -556,6 +692,11 @@ impl AetherController {
         diagnostics::reset_checks();
         // The warm latency session belongs to the pipeline that is going away.
         ping::reset();
+        // >>> AETHER-APP-PATCH custom-configs
+        // خاموش (پیش‌فرض) = هیچ کاری. روشن = پروفایلِ در-حافظهٔ این نشست
+        // زنجیرهٔ انتخاب‌شده را می‌گیرد؛ نسخهٔ کاربر دست نمی‌خورد.
+        self.custom_begin()?;
+        // <<< AETHER-APP-PATCH custom-configs
         // The visible state is already StartingEngine — request_toggle set it the
         // moment the user tapped, so the button never waits on this method.
         // ۱.۲.۵ — پیش از هر چیزِ دیگر: این بیلد کدام است؟ اگر موتورِ کهنه
@@ -573,16 +714,42 @@ impl AetherController {
         // candidate, so the plain first pass can no longer waste 35-75s
         // (slow connects) or win with a tunnel that cannot carry real
         // browser traffic afterwards.
-        if self.profile.is_chained() && !self.psiphon.is_available() {
+        if self.profile.backend == crate::profile::TransportBackend::TorPsiphon
+            && !self.engine.caps().tor
+            && !self.custom_psiphon_base()
+        {
             return Err(anyhow::anyhow!(
-                "The Psiphon stage is missing from this installation ({}). Reinstall Aether, or set the transport back to Aether.",
-                self.psiphon.missing_parts()
+                "Tor → Psiphon requires a Tor-capable engine; refusing to connect without Tor."
             ));
         }
-        DiagnosticsLog::i(
-            TAG,
-            &format!("Pipeline: {}", self.profile.backend.pipeline_label()),
-        );
+        // Every Tor pipeline runs the bundled official tor.exe; the unmodified core
+        // is never asked to bootstrap its own (arti) Tor. Without tor.exe the
+        // pipeline would silently become a different one, so refuse clearly.
+        if self.profile.backend.uses_tor()
+            && !self.custom_psiphon_base()
+            && self.engine.native_tor().is_none()
+        {
+            return Err(anyhow::anyhow!(
+                "{} needs the bundled tor.exe (engine\\tor\\tor.exe), which this installation is missing. Reinstall Aether.",
+                self.profile.backend.protocol_label().unwrap_or("Tor")
+            ));
+        }
+        if self.profile.is_chained() {
+            self.engine.psiphon_assets()?;
+        }
+        // AETHER-APP-FIX custom-pipeline-label: نشستِ سفارشی backend را فقط
+        // برای آرگومان‌های موتور جایگزین می‌کند (پایهٔ Psiphon → TorPsiphon)؛
+        // برچسبِ آن backend («Tor → Psiphon») زنجیرهٔ واقعی نبود.
+        match self.custom_chain_label() {
+            Some(chain) => DiagnosticsLog::i(
+                TAG,
+                &format!("Pipeline: {chain} (custom config chain)"),
+            ),
+            None => DiagnosticsLog::i(
+                TAG,
+                &format!("Pipeline: {}", self.profile.backend.pipeline_label()),
+            ),
+        }
         // >>> AETHER-APP-FIX pt-egress-not-blocked
         // A Tor pipeline reaches the network through `lyrebird.exe`, a separate
         // process. Leak-guard rules left behind by a session that was killed
@@ -617,30 +784,65 @@ impl AetherController {
         // می‌گوید «no tunnel to scan» — ولی تا امروز ~۲.۴ ثانیه صرفش می‌شد،
         // پیش از هر تلاش. انتظارِ آزادشدنِ پورت می‌ماند، چون tor.exe همان
         // ۱۸۱۹ را می‌خواهد.
-        let tor_only = self.profile.backend.tor_mode() == Some(crate::profile::TorMode::Only);
+        // >>> AETHER-APP-PATCH tor-aether-fast-path
+        // `Tor → Aether` هم از اثرانگشت چیزی نمی‌گیرد: برنامه‌ریز در این حالت
+        // همیشه «MASQUE روی HTTP/2 از داخلِ تور» می‌سازد (UDP از تور رد
+        // نمی‌شود)، ولی اثرانگشت در لاگ ~۴.۶ ثانیه پیش از شروعِ تور می‌گرفت.
+        let tor_reverse = self.profile.backend.tor_mode() == Some(crate::profile::TorMode::Reverse);
+        let tor_only =
+            self.profile.backend.tor_mode() == Some(crate::profile::TorMode::Only) || tor_reverse;
+        // <<< AETHER-APP-PATCH tor-aether-fast-path
         let fingerprint = kind == Prep::Plan && !tor_only;
         if tor_only && kind == Prep::Plan {
             DiagnosticsLog::i(
                 TAG,
-                "Tor alone: skipping the network fingerprint — it decides nothing here.",
+                if self.custom_psiphon_base() {
+                    "Psiphon (custom chain): skipping the network fingerprint — Psiphon picks its own transports."
+                } else if tor_reverse {
+                    "Tor → Aether: skipping the network fingerprint — the carrier through Tor is always MASQUE over HTTP/2."
+                } else {
+                    "Tor alone: skipping the network fingerprint — it decides nothing here."
+                },
             );
         }
         std::thread::Builder::new()
             .name("aether-prep".into())
             .spawn(move || {
                 // معادل PortProbe.awaitClosed — ریشهٔ باگ «تعویض پروتکل گیر می‌کند».
-                if !engine::wait_for_port_release(
-                    engine::LOCAL_SOCKS_PORT,
+                //
+                // 1.3.0 port-guard: «starting anyway» دیگر وجود ندارد. لاگ‌های
+                // ۲۰۲۶-۱۰-۰۸ نشان دادند هر شش حالت روی همین سطر می‌مردند: یک
+                // فرآیندِ یتیم ۱۸۱۹ را گرفته بود و هر تلاش با 10048 می‌افتاد.
+                // حالا صاحبِ پورت پیدا می‌شود؛ یتیمِ خودِ اتر کشته می‌شود و
+                // برنامهٔ غریبه با نام و PID گزارش می‌شود.
+                let blocked = match crate::procguard::prepare_ports(
+                    &[engine::LOCAL_SOCKS_PORT],
+                    &[engine::TOR_SOCKS_PORT, engine::CHAIN_SOCKS_PORT],
                     Duration::from_millis(PORT_RELEASE_WAIT_MS),
                 ) {
-                    DiagnosticsLog::w(
-                        TAG,
-                        &format!(
-                            "Local port {} is still busy after {}s — starting anyway.",
+                    Ok(()) => {
+                        if !engine::wait_for_port_release(
                             engine::LOCAL_SOCKS_PORT,
-                            PORT_RELEASE_WAIT_MS / 1000
-                        ),
-                    );
+                            Duration::from_millis(500),
+                        ) {
+                            DiagnosticsLog::w(
+                                TAG,
+                                &format!(
+                                    "Local port {} still answers after the port guard ran.",
+                                    engine::LOCAL_SOCKS_PORT
+                                ),
+                            );
+                        }
+                        None
+                    }
+                    Err(reason) => Some(reason),
+                };
+                if blocked.is_some() {
+                    *slot.lock() = Some(PrepOutcome {
+                        fingerprint: smart_auto::NetFingerprint::default(),
+                        blocked,
+                    });
+                    return;
                 }
                 // SmartAuto.kt parity: fingerprint the network before planning.
                 // 1.2.3-p2 adds the UDP leg. Without it the planner could not
@@ -660,7 +862,10 @@ impl AetherController {
                 } else {
                     smart_auto::NetFingerprint::default()
                 };
-                *slot.lock() = Some(PrepOutcome { fingerprint: fp });
+                *slot.lock() = Some(PrepOutcome {
+                    fingerprint: fp,
+                    blocked: None,
+                });
             })
             .ok();
     }
@@ -670,7 +875,9 @@ impl AetherController {
         // استیج ۱ نردبانِ Smart Auto و سخت‌سازی ضد‌DPI را دست‌نخورده نگه می‌دارد،
         // پس یک نشست زنجیره‌ای همان اثر‌انگشت‌زنی و همان تلاش‌های مجدد نشست عادی
         // را می‌گیرد — ولی بدون مسیر داده و بدون پل.
-        let planning_profile = if self.profile.is_chained() {
+        let planning_profile = if self.profile.is_chained()
+            && self.profile.backend != crate::profile::TransportBackend::TorPsiphon
+        {
             self.profile.chained_stage()
         } else {
             self.profile.clone()
@@ -721,6 +928,14 @@ impl AetherController {
             cand.profile.clone()
         };
         // <<< AETHER-APP-PATCH the-tor-in-front-is-the-real-tor
+        let engine_profile = if self.profile.is_chained() {
+            let mut chain = engine_profile;
+            chain.backend = self.profile.backend;
+            chain.exit_region = self.profile.exit_region.clone();
+            chain
+        } else {
+            engine_profile
+        };
         // The engine is told how long this rung is allowed to take, so its own
         // endpoint scan is sized to fit inside that window instead of being
         // killed 78% of the way through it. See `engine::AetherProcess::start`.
@@ -777,9 +992,37 @@ impl AetherController {
     }
 
     /// موتور را **پشتِ** تورِ آماده اجرا می‌کند — حالتِ `Tor → Aether`.
+    /// As on mobile, establish Tor first. Unlike the old `--tor-only --psiphon`
+    /// invocation, this reuses the same tor.exe/obfs4 cache that succeeds in the
+    /// Tor-only and reverse modes. Core 2.3.0 then owns ONLY Psiphon and uses
+    /// AETHER_UPSTREAM for its server dials. No WARP hop is introduced.
+    fn start_psiphon_behind_tor(&mut self) -> Result<()> {
+        let cand = self.plan[self.plan_index].clone();
+        let port = self.tor_listener_port();
+        self.engine.set_upstream_socks(Some(port));
+        self.engine.start(&cand.profile, Some(cand.timeout_ms))?;
+        crate::tor_bootstrap::mark_done("tor.exe in front of Psiphon is ready");
+        // >>> AETHER-APP-FIX tor-psiphon-waits-for-psiphon
+        self.psiphon_gate_since = Some(Instant::now());
+        self.psiphon_next_probe = Some(Instant::now() + PSIPHON_PROBE_INTERVAL);
+        self.psiphon_probe = None;
+        // <<< AETHER-APP-FIX tor-psiphon-waits-for-psiphon
+        self.tor_front_ready = true;
+        self.tor_stage = TorStage::None;
+        self.deadline = Some(Instant::now() + Duration::from_millis(CHAIN_BUDGET_MS));
+        self.set_state(ConnectionState::Connecting, "Starting Psiphon through Tor…");
+        DiagnosticsLog::i(TAG, &format!("Tor → Psiphon: Tor is ready on 127.0.0.1:{port}; waiting for Psiphon egress on 127.0.0.1:{}", engine::LOCAL_SOCKS_PORT));
+        Ok(())
+    }
+
     fn start_engine_behind_tor(&mut self) -> Result<()> {
         let cand = self.plan[self.plan_index].clone();
-        let tor_port = self.tor_listener_port();
+        // >>> AETHER-APP-PATCH tor-aether-fast-path
+        // موتور مستقیم به tor.exe وصل نمی‌شود، بلکه به رلهٔ صبوری که جلوی آن
+        // است؛ اگر رله بالا نیاید، همان مسیرِ قبلی (خودِ پورتِ تور) می‌ماند.
+        let tor_listener = self.tor_listener_port();
+        let tor_port = self.patient_tor_dialer(tor_listener);
+        // <<< AETHER-APP-PATCH tor-aether-fast-path
         // بدونِ این، موتور `--tor-reverse` می‌گرفت و تورِ داخلیِ خودش (arti) را
         // بالا می‌آورد — همان چیزی که در لاگِ ۱۷ سپتامبر ده دقیقه روی ۱۵٪ ماند
         // درحالی‌که tor.exe با همان پل‌ها ۲۲ ثانیه‌ای رسیده بود.
@@ -791,6 +1034,15 @@ impl AetherController {
         stage.protocol = crate::profile::Protocol::Masque;
         self.engine.set_upstream_socks(Some(tor_port));
         self.engine.start(&stage, Some(cand.timeout_ms))?;
+        // >>> AETHER-APP-PATCH tor-reverse-gate
+        // `engine.start` درصدِ تور را صفر می‌کند؛ ولی تورِ این حالت tor.exe است و
+        // همین حالا به ۱۰۰٪ رسیده. بی این سطر دروازهٔ تور تا ابد منتظرِ درصدی
+        // می‌ماند که موتورِ MASQUE هرگز نمی‌گوید (`loge3`).
+        crate::tor_bootstrap::mark_done("tor.exe in front of the engine is ready");
+        // <<< AETHER-APP-PATCH tor-reverse-gate
+        // >>> AETHER-APP-PATCH tor-reverse-latch
+        self.tor_front_ready = true;
+        // <<< AETHER-APP-PATCH tor-reverse-latch
         self.tor_stage = TorStage::None;
         // بودجهٔ تازه: bootstrapِ تور تمام شده و از این‌جا کارِ موتور است. اگر
         // مهلتِ مرحلهٔ اول را نگه می‌داشتیم، توری که ۹ دقیقه bootstrap کرده
@@ -803,12 +1055,78 @@ impl AetherController {
         DiagnosticsLog::i(
             TAG,
             &format!(
-                "Tor → Aether: tor is ready on 127.0.0.1:{tor_port}; the engine dials out through \
-                 it (AETHER_UPSTREAM=socks5://127.0.0.1:{tor_port}, http/2 carrier)."
+                "Tor → Aether: tor is ready on 127.0.0.1:{tor_listener}; the engine dials out through \
+                 it (AETHER_UPSTREAM=socks5://127.0.0.1:{tor_port}, http/2 carrier; the engine \
+                 picks its own MASQUE edge, exactly as on mobile)."
             ),
         );
         Ok(())
     }
+
+    // >>> AETHER-APP-PATCH tor-aether-fast-path
+    /// پورتی که موتور باید به‌عنوانِ `AETHER_UPSTREAM` بگیرد: رلهٔ صبورِ جلوی
+    /// tor.exe، یا در صورتِ خطا خودِ پورتِ تور.
+    fn patient_tor_dialer(&mut self, tor_listener: u16) -> u16 {
+        if let Some(relay) = self.tor_relay.as_ref() {
+            if relay.tor_port() == tor_listener {
+                return relay.port();
+            }
+        }
+        self.tor_relay = None;
+        match crate::tor_relay::TorDialRelay::start(tor_listener) {
+            Ok(relay) => {
+                let port = relay.port();
+                self.tor_relay = Some(relay);
+                port
+            }
+            Err(e) => {
+                DiagnosticsLog::w(
+                    TAG,
+                    &format!("Patient Tor dialer could not start ({e}); the engine talks to tor directly."),
+                );
+                tor_listener
+            }
+        }
+    }
+
+    /// موتورِ `Tor → Aether` پیش از باز کردنِ SOCKS مُرد ولی tor.exe هنوز سالم و
+    /// آماده است: به‌جای دور ریختنِ bootstrapِ تور و شکستِ کلِ اتصال، موتور
+    /// پشتِ همان تور دوباره اجرا می‌شود.
+    fn respawn_engine_behind_tor(&mut self) -> bool {
+        let reverse = self.tor_mode_of_attempt() == Some(crate::profile::TorMode::Reverse);
+        let tor_alive = self
+            .native_tor
+            .as_ref()
+            .map(|t| t.is_alive())
+            .unwrap_or(false);
+        if !reverse
+            || !self.tor_front_ready
+            || !tor_alive
+            || !self.engine.was_started()
+            || self.engine.is_alive()
+            || self.tor_reverse_respawns >= TOR_REVERSE_RESPAWNS
+            || self.past_deadline()
+        {
+            return false;
+        }
+        self.tor_reverse_respawns += 1;
+        DiagnosticsLog::w(
+            TAG,
+            &format!(
+                "Tor → Aether: the engine exited before its SOCKS5 port opened; tor is still up, so the engine is restarted behind it ({}/{}) instead of dropping the circuit.",
+                self.tor_reverse_respawns, TOR_REVERSE_RESPAWNS
+            ),
+        );
+        self.engine.stop();
+        match self.start_engine_behind_tor() {
+            Ok(()) => true,
+            Err(e) => {
+                DiagnosticsLog::w(TAG, &format!("Engine restart behind tor failed: {e}"));
+                false
+            }
+        }
+    }
+    // <<< AETHER-APP-PATCH tor-aether-fast-path
     // <<< AETHER-APP-PATCH the-tor-in-front-is-the-real-tor
 
     // >>> AETHER-APP-PATCH tor-native-carrier
@@ -828,7 +1146,9 @@ impl AetherController {
         // موتور می‌رسیدند. `Reverse` هم از امروز اینجاست: تور جلوی موتور
         // می‌ایستد و موتور مشتریِ آن می‌شود. `Chain` اینجا نیست چون ترتیبش
         // برعکس است — اول موتور، بعد تور — و در `tick` انجام می‌شود.
+        let tor_psiphon = self.profile.backend == crate::profile::TransportBackend::TorPsiphon;
         let socks = match self.tor_mode_of_attempt() {
+            Some(TorMode::Only) if tor_psiphon => engine::TOR_SOCKS_PORT,
             Some(TorMode::Only) => {
                 // قراردادِ برنامه: مرورگر و پراکسیِ سیستم و TUN همین عدد را
                 // می‌شناسند.
@@ -846,21 +1166,28 @@ impl AetherController {
             return Ok(false);
         }
 
-        // پل: `Off` یعنی هیچ، و `Auto`/`Always` یعنی فهرستِ داخلیِ خودِ Tor.
-        // «تلاشِ مستقیم و بعد پل» را همین‌جا نمی‌سازیم: نردبانِ برنامه از قبل
-        // پله‌های جدا دارد و دوباره‌سازی‌اش یعنی دو منطقِ موازی.
+        // >>> AETHER-APP-FIX tor-auto-like-mobile
+        // پل، همان معنای موبایل (`TorBridges` در `tor.rs`ِ هسته): `Off` یعنی
+        // مستقیم، `Always` یعنی فقط پل، و `Auto` (پیش‌فرض) یعنی *هم مستقیم و هم
+        // پل* — که اینجا هم‌زمان اجرا می‌شوند (`BridgeMode::Auto`). تا این نسخه
+        // `Auto` همان `Always` بود و ویندوز هرگز تورِ مستقیم را امتحان نمی‌کرد؛
+        // روی وای‌فای‌ای که تورِ مستقیم باز است، موبایل زیرِ ۱۵ ثانیه وصل می‌شد
+        // و ویندوز از راهِ obfs4 دقیقه‌ها دایرکتوری می‌کشید. پلِ دستی همیشه
+        // بر هر دو مقدم است.
         let bridges = match cand.profile.tor_bridges {
             TorBridges::Off => crate::tor_native::BridgeMode::None,
-            TorBridges::Auto | TorBridges::Always => {
-                if cand.profile.has_custom_bridges() {
-                    crate::tor_native::BridgeMode::Custom
-                } else {
-                    crate::tor_native::BridgeMode::BuiltIn
-                }
-            }
+            _ if cand.profile.has_custom_bridges() => crate::tor_native::BridgeMode::Custom,
+            TorBridges::Always => crate::tor_native::BridgeMode::BuiltIn,
+            TorBridges::Auto => crate::tor_native::BridgeMode::Auto,
         };
+        // <<< AETHER-APP-FIX tor-auto-like-mobile
         let budget_ms = self.tor_budget_ms().unwrap_or(cand.timeout_ms);
-        let headline = if socks == engine::LOCAL_SOCKS_PORT {
+        if tor_psiphon {
+            self.tor_stage = TorStage::TorThenPsiphon;
+        }
+        let headline = if tor_psiphon {
+            format!("Tor → Psiphon: preparing bundled tor.exe on 127.0.0.1:{socks} before Psiphon starts (timeout={}s)", budget_ms / 1000)
+        } else if socks == engine::LOCAL_SOCKS_PORT {
             format!(
                 "Tor alone: running the bundled tor.exe on 127.0.0.1:{socks}, bridges={bridges:?} \
                  (timeout={}s)",
@@ -875,9 +1202,12 @@ impl AetherController {
                 budget_ms / 1000
             )
         };
+        // AETHER-APP-PATCH custom-configs: در `Config → Tor…` تور از دلِ Xray
+        // بیرون می‌رود؛ بی کانفیگِ سفارشی همان `None` و همان پل‌ها.
+        let (upstream, bridges) = self.custom_tor_front(bridges);
         self.spawn_native_tor(
             socks,
-            None,
+            upstream,
             bridges,
             cand.profile.sanitized_bridges().join("\n"),
             budget_ms,
@@ -898,6 +1228,9 @@ impl AetherController {
         budget_ms: u64,
         headline: String,
     ) -> Result<()> {
+        let probe = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, socks))
+            .map_err(|e| anyhow::anyhow!("Tor SOCKS port 127.0.0.1:{socks} is unavailable: {e}"))?;
+        drop(probe);
         let Some((binary, support)) = self.engine.native_tor() else {
             return Err(anyhow::anyhow!("this installation carries no tor binary"));
         };
@@ -915,10 +1248,19 @@ impl AetherController {
 
         // درصدِ نشستِ قبلی نباید این یکی را «در حرکت» نشان دهد.
         crate::tor_bootstrap::reset();
+        // >>> AETHER-APP-PATCH tor-reverse-latch
+        // تورِ تازه یعنی هنوز هیچ جلوداری آماده نیست.
+        self.tor_front_ready = false;
+        // <<< AETHER-APP-PATCH tor-reverse-latch
 
         let tor = crate::tor_native::TorNative::new(std::sync::Arc::new(|line: &str| {
             DiagnosticsLog::i("tor", line);
             crate::tor_bootstrap::ingest(line);
+            // >>> AETHER-APP-PATCH tor-cold-cache-waves
+            if crate::tor_bootstrap::is_native_headway(line) {
+                crate::tor_bootstrap::touch();
+            }
+            // <<< AETHER-APP-PATCH tor-cold-cache-waves
             // در حالت‌های توری اندپوینتِ واقعی پلِ اول است؛ همین سینک می‌رساندش.
             crate::firsthop::ingest(line);
         }));
@@ -960,11 +1302,15 @@ impl AetherController {
         } else {
             None
         };
-        match (tor, engine) {
-            (Some(tor), Some(engine)) => tor && engine,
-            (Some(alive), None) | (None, Some(alive)) => alive,
+        // AETHER-APP-PATCH custom-configs: Xray هم بخشی از حامل است.
+        let xray = self.custom_xray_alive();
+        match (tor, engine, xray) {
+            (None, None, Some(x)) => x,
+            (_, _, Some(false)) => false,
+            (Some(tor), Some(engine), _) => tor && engine,
+            (Some(alive), None, _) | (None, Some(alive), _) => alive,
             // هیچ‌کدام اجرا نشده: در فازِ Connecting این وضع یعنی چیزی مرده است.
-            (None, None) => false,
+            (None, None, None) => false,
         }
     }
     // <<< AETHER-APP-PATCH tor-native-carrier
@@ -974,7 +1320,7 @@ impl AetherController {
     /// پروفایلِ **پله** پرسیده می‌شود، نه پروفایلِ کاربر: در نشست زنجیره‌ای
     /// استیج ۱ چیزی است که `chained_stage` ساخته، و همان است که اجرا می‌شود.
     fn tor_fronted(&self) -> bool {
-        if !self.engine.caps().tor {
+        if !self.engine.caps().tor || self.custom_psiphon_base() {
             return false;
         }
         self.plan
@@ -986,7 +1332,7 @@ impl AetherController {
 
     /// حالتِ توری که **این تلاش** اجرا می‌کند، با گیتِ نسخهٔ هسته.
     fn tor_mode_of_attempt(&self) -> Option<crate::profile::TorMode> {
-        if !self.engine.caps().tor {
+        if !self.engine.caps().tor || self.custom_psiphon_base() {
             return None;
         }
         self.plan
@@ -1017,6 +1363,11 @@ impl AetherController {
     ///   شروع شود.
     fn tor_bridges_can_help(&self) -> bool {
         if self.tor_mode_of_attempt() == Some(crate::profile::TorMode::Chain) {
+            return false;
+        }
+        // `Config → Tor…`: تور از دلِ کانفیگِ سفارشی می‌رود و پل خاموش است؛
+        // «trying bridges» دروغ بود و پنجرهٔ گیرِ ۴۲۰ ثانیه‌ایِ پل را می‌خرید.
+        if self.custom_tor_behind_config() {
             return false;
         }
         if self.profile.tor_bridges == crate::profile::TorBridges::Off {
@@ -1069,6 +1420,9 @@ impl AetherController {
     /// اصلاً فرستاده نشده‌اند، پس لیسنر دومی وجود ندارد و اشاره به آن، مسیر
     /// داده را به پورتی می‌بست که کسی در آن گوش نمی‌دهد.
     fn data_path_exit_port(&self) -> u16 {
+        if self.psiphon_exit_session() {
+            return engine::LOCAL_SOCKS_PORT;
+        }
         if !self.tor_fronted() {
             return engine::LOCAL_SOCKS_PORT;
         }
@@ -1085,6 +1439,11 @@ impl AetherController {
     /// «Tor is ready — opening its local proxy…» می‌آید، و بعد پنج دقیقه سکوت تا
     /// کاربر دستی قطع کند؛ در کلِ فایل یک سطر «Starting Psiphon» وجود ندارد.
     fn tor_listener_port(&self) -> u16 {
+        if self.profile.backend == crate::profile::TransportBackend::TorPsiphon
+            && self.native_tor.is_some()
+        {
+            return engine::TOR_SOCKS_PORT;
+        }
         self.profile
             .backend
             .tor_socks_port()
@@ -1109,6 +1468,17 @@ impl AetherController {
         if !self.tor_fronted() {
             return TorGate::Ready;
         }
+        // >>> AETHER-APP-PATCH tor-reverse-latch
+        // `Tor → Aether` پس از اجرای موتور: تور قبلاً ثابت شده (۱۰۰٪ + مدار)، و
+        // آنچه حالا منتظرش هستیم پورتِ موتور است که این تابع فقط وقتی باز است
+        // صدا زده می‌شود. درصدِ سراسری این‌جا هیچ چیز را تعیین نمی‌کند.
+        if self.tor_front_ready
+            && (self.tor_mode_of_attempt() == Some(crate::profile::TorMode::Reverse)
+                || self.profile.backend == crate::profile::TransportBackend::TorPsiphon)
+        {
+            return TorGate::Ready;
+        }
+        // <<< AETHER-APP-PATCH tor-reverse-latch
         if tor_bootstrap::done() {
             // bootstrap تمام است، ولی در حالت‌های زنجیره‌ای/برعکس لیسنرِ دومِ
             // تور یک لحظه بعد از آن باز می‌شود. معادلِ `awaitOpen(torPort)`
@@ -1172,6 +1542,24 @@ impl AetherController {
             );
         }
 
+        // >>> AETHER-APP-PATCH bridge-smart-routes (mobile 1.4.0 `connectExternal`)
+        // در حالت‌های Psiphon موتور مقصد را نمی‌بیند؛ قواعد (فهرست‌های داخلی +
+        // قواعد دستیِ کاربر) پیش از بالا آمدنِ پل به آن داده می‌شوند. در بقیهٔ
+        // حالت‌ها خالی = مسیرِ قدیمیِ پل، و قواعد در خودِ موتور اعمال می‌شوند.
+        // Route at the front for ALL backends: Windows sends CONNECT hostnames
+        // rather than destination IPs to the engine. The bridge alone can
+        // resolve and compare .com destinations against the Iranian CIDRs.
+        crate::smart_routes::set_front(Some(crate::smart_lists::front_rules(
+            &self.data_dir,
+            &self.profile,
+        )));
+        crate::smart_routes::set_guest_front(Some(crate::smart_lists::guest_rules(
+            &self.data_dir,
+            &self.profile,
+        )));
+        crate::smart_routes::set_front_udp_passthrough(!self.profile.is_chained());
+        // <<< AETHER-APP-PATCH bridge-smart-routes
+
         // ۱) پل محلی HTTP/SOCKS — معادل hev-socks5-tunnel/ShareBridge (مسیر دادهٔ واقعی).
         if let Err(e) = self.share.start(
             engine::SHARE_SOCKS_PORT,
@@ -1202,153 +1590,35 @@ impl AetherController {
         }
     }
 
-    /// استیج ۲ را در ترد پس‌زمینه بالا می‌آورد.
-    ///
-    /// ترتیب کل نکتهٔ ماجراست و عیناً همان `connectExternal` اندروید است:
-    ///
-    /// ```text
-    ///   stage 1  موتور اِتِر → SOCKS5 127.0.0.1:1819   (هنوز هیچ مسیر داده‌ای!)
-    ///   stage 2  Psiphon    → SOCKS5 127.0.0.1:1825   از راه 1819 dial می‌کند
-    ///   سپس     پل + پروکسی سیستمی → 1825            خروجی = Psiphon
-    /// ```
-    ///
-    /// استیج ۱ **نباید** مسیر داده بسازد: استیج ۲ باید از لوپ‌بک به موتور برسد
-    /// در حالی که خود موتور هنوز از شبکهٔ واقعی به اینترنت می‌رسد. اگر پروکسی
-    /// سیستمی همین‌جا روشن شود، Psiphon از داخل تونلی بیرون می‌رود که خودش
-    /// دارد می‌سازد و همه‌چیز داخل خودش قفل می‌شود.
-    ///
-    /// مسدودکننده است (تا سه دقیقه در هر پاس)، پس روی ترد خودش می‌رود و
-    /// حلقهٔ ۲۰۰ms هرگز فریز نمی‌شود.
+    /// Core 2.1.0 starts and supervises the bundled Psiphon executable.
+    /// The desktop only waits for its final SOCKS listener; it never spawns or
+    /// rotates a second Psiphon process. End-to-end verification follows below.
     fn begin_chain(&mut self) {
-        let slot: Arc<Mutex<Option<Result<u16, String>>>> = Arc::new(Mutex::new(None));
-        self.chain_slot = Some(slot.clone());
-        // مهلتِ پلهٔ نردبان کنار گذاشته می‌شود: بودجهٔ استیج ۲ مال خودش است.
+        self.chain_waiting = true;
         self.deadline = Some(Instant::now() + Duration::from_millis(CHAIN_BUDGET_MS));
-        let psiphon = self.psiphon.clone();
-        let region = self.profile.exit_region.clone();
-        let upstream = ConnectionProfile::chain_upstream_url();
-        // ۱.۲.۵ — در `Tor → Psiphon` استیج ۱ خودِ تور است. پورتش از لحظهٔ اجرا
-        // باز است ولی تا پایان bootstrap به دست‌دادن جواب نمی‌دهد، پس دروازه
-        // باید صبر کند؛ در نشست غیرتوری صفر می‌ماند و رفتار قدیمی حفظ می‌شود:
-        // تونل اِتِری که فوراً دست نمی‌دهد خراب است و صبر روی آن فقط پلهٔ بعدی
-        // نردبان را عقب می‌اندازد.
-        let grace_ms = self.tor_budget_ms().unwrap_or(0);
-        let stall_ms = self.tor_stall_ms();
-        let tor_fronted = self.tor_fronted();
-        // ۱.۲.۵-p2: شکلِ تور پیش از spawn حساب می‌شود. ترد زنجیره `self` را
-        // ندارد و نباید داشته باشد، و پیامِ شکست باید بگوید تور کجا گیر کرد.
-        let tor_shape = self.tor_shape();
-        self.set_state(ConnectionState::Connecting, "Starting the Psiphon stage…");
-        // در `Tor → Psiphon` استیج ۱ خودِ tor.exe است، نه موتور. نوشتنِ نامِ
-        // اشتباه یعنی فرستادنِ عیب‌یاب سراغِ فرآیندی که اجرا نشده.
-        let stage_one = if self.native_tor.is_some() {
-            "bundled tor"
-        } else {
-            "Aether engine"
-        };
-        DiagnosticsLog::i(
-            TAG,
-            &format!(
-                "Chained mode: stage 1 = {stage_one} on 127.0.0.1:{}, stage 2 = Psiphon on 127.0.0.1:{}",
-                engine::LOCAL_SOCKS_PORT,
-                engine::CHAIN_SOCKS_PORT
-            ),
+        self.set_state(
+            ConnectionState::Connecting,
+            "Waiting for engine-managed Psiphon…",
         );
-        std::thread::Builder::new()
-            .name("aether-chain".into())
-            .spawn(move || {
-                // دروازهٔ استیج ۱ پیش از هر چیز: بدون یک پروکسی SOCKS5 کارکنده،
-                // Psiphon سه دقیقه در تاریکی تلاش می‌کند و شکست در جای اشتباه
-                // ظاهر می‌شود.
-                let ok = diagnostics::run_proxy_stage_with_grace(
-                    engine::LOCAL_SOCKS_PORT,
-                    grace_ms,
-                    // زندگیِ موتور از دید این ترد: `AetherProcess` نه Send است
-                    // و نه باید باشد، ولی سوکتِ گوش‌دهنده با مردنِ فرآیند بسته
-                    // می‌شود — پس پورتِ بسته یعنی موتور رفته، و همان چیزی است
-                    // که این انتظار باید با آن تمام شود.
-                    &|| probe::socks_ready(engine::LOCAL_SOCKS_PORT),
-                    &|| tor_fronted && tor_bootstrap::stalled(stall_ms),
-                );
-                if !ok {
-                    *slot.lock() = Some(Err(if tor_fronted {
-                        diagnostics::stage_failure_message(tor_shape)
-                    } else {
-                        "Stage 1 (the Aether engine) is not a working SOCKS5 proxy yet".to_string()
-                    }));
-                    return;
-                }
-                let outcome = psiphon.start(&region, &upstream).map_err(|e| e.to_string());
-                *slot.lock() = Some(outcome);
-            })
-            .ok();
     }
 
-    /// نتیجهٔ استیج ۲ را برمی‌دارد و مسیر داده را به **خروجی زنجیره** می‌چسباند.
     fn poll_chain(&mut self) {
-        let outcome = self.chain_slot.as_ref().and_then(|s| s.lock().take());
-        let Some(outcome) = outcome else {
-            // >>> AETHER-APP-PATCH stage-one-is-not-always-the-engine
-            // در `Tor → Psiphon` استیج ۱ خودِ tor.exe است و هیچ موتوری اجرا
-            // نشده، پس `engine.is_alive()` همیشه «مرده» می‌گفت و این شرط،
-            // ۲۰۰ms پس از رسیدنِ تور به ۱۰۰٪، نشستِ سالم را جمع می‌کرد. لاگِ
-            // ۱۷ سپتامبر، دو نشستِ پشت‌سرهم:
-            //
-            //     13:45:59 tor is ready on 127.0.0.1:1819
-            //     13:45:59 Starting the Psiphon stage…
-            //     13:45:59 W/state: Stage 1 (the engine) exited …  ← همین سطر
-            //
-            // خطای `speaks SOCKS5 but cannot reach the internet` سه میلی‌ثانیه
-            // *پس از* این تخریب ثبت شده: نتیجهٔ آن است، نه علتش.
-            //
-            // پاسخِ درست از قبل در همین فایل بود و `tick` از آن استفاده
-            // می‌کرد؛ فقط این یک جا از قلم افتاده بود.
-            if !self.carrier_alive() {
-                self.chain_slot = None;
-                let carrier = if self.native_tor.is_some() {
-                    "Stage 1 (the bundled tor) exited while the Psiphon stage was starting"
-                } else {
-                    "Stage 1 (the engine) exited while the Psiphon stage was starting"
-                };
-                self.advance_or_fail(carrier);
-            // <<< AETHER-APP-PATCH stage-one-is-not-always-the-engine
-            } else if self.past_deadline() {
-                self.chain_slot = None;
-                self.advance_or_fail("The Psiphon stage did not come up within its budget");
+        if !self.engine.is_alive() {
+            self.chain_waiting = false;
+            self.advance_or_fail("The engine exited while starting Psiphon");
+        } else if probe::socks_ready(engine::CHAIN_SOCKS_PORT) {
+            self.chain_waiting = false;
+            engine::set_exit_socks_port(engine::CHAIN_SOCKS_PORT);
+            self.chain_exit_port = Some(engine::CHAIN_SOCKS_PORT);
+            // AETHER-APP-PATCH custom-configs: `Aether → Psiphon → Config`.
+            if self.custom_hold_for_last(engine::CHAIN_SOCKS_PORT) {
+                return;
             }
-            return;
-        };
-        self.chain_slot = None;
-        match outcome {
-            Ok(port) => {
-                // از این لحظه پل، خودآزما و نشانِ IP همه به استیج ۲ نگاه
-                // می‌کنند. این تک‌خط است که خروجی را از اِتِر به Psiphon
-                // منتقل می‌کند.
-                engine::set_exit_socks_port(port);
-                // From here the PROTOCOL tile may honestly say `Aether → Psiphon`.
-                self.chain_exit_port = Some(port);
-                DiagnosticsLog::i(
-                    TAG,
-                    &format!(
-                        "Psiphon stage is up on 127.0.0.1:{port} — bringing up the data path."
-                    ),
-                );
-                self.bring_up_data_path();
-                self.begin_verification();
-            }
-            Err(why) => {
-                engine::reset_exit_socks_port();
-                self.psiphon.stop();
-                // یک خطای پیکربندی/آرگومان در استیج ۲ روی **هر** پلهٔ نردبان
-                // یکسان می‌افتد: در لاگ میدانی همین چهار پله را با یک پیام
-                // سوزاند و کاربر فقط «کانکت نشد» دید. پس همان‌جا و با همان
-                // پیام دقیق شکست می‌خوریم، نه با یک نردبانِ محکوم‌به‌شکست.
-                if crate::psiphon::is_config_fault(&why) {
-                    self.fail(&format!("The Psiphon stage failed: {why}"));
-                    return;
-                }
-                self.advance_or_fail(&format!("The Psiphon stage failed: {why}"));
-            }
+            self.bring_up_data_path();
+            self.begin_verification();
+        } else if self.past_deadline() {
+            self.chain_waiting = false;
+            self.advance_or_fail("The engine-managed Psiphon listener did not come up in time");
         }
     }
 
@@ -1362,7 +1632,16 @@ impl AetherController {
             .unwrap_or(OUTBOUND_GRACE_MS);
         // نشست زنجیره‌ای گرم‌شدنِ هر دو هاپ را می‌پردازد، پس پنجرهٔ بلندتر
         // `EXTERNAL_GRACE_MS` را می‌گیرد — همان تفکیک اندروید.
-        let ceiling = if self.profile.is_chained() {
+        // AETHER-APP-FIX tor-proves-its-exit: هر خط لوله‌ای که از تور می‌گذرد
+        // (از جمله «تور تنها») همان پنجرهٔ بلند را می‌گیرد — موبایل در
+        // `connectTor` برای همهٔ حالت‌های تور `EXTERNAL_GRACE_MS` می‌دهد. با ۹۰
+        // ثانیه و سنجهٔ ۴/۶ ثانیه‌ای، اولین استریم‌های یک مدارِ تازه از پلِ کند
+        // پیش از رسیدنِ پاسخ بریده می‌شدند.
+        let ceiling = if self.profile.is_chained()
+            || self.profile.backend == crate::profile::TransportBackend::TorAether
+            || self.tor_fronted()
+            || self.native_tor.is_some()
+        {
             diagnostics::EXTERNAL_GRACE_MS
         } else {
             OUTBOUND_GRACE_MS
@@ -1382,6 +1661,8 @@ impl AetherController {
     /// runs the slow teardown on the tick thread, off the UI's IPC path.
     fn disconnect(&mut self) {
         self.cleanup_native(false);
+        // AETHER-APP-PATCH custom-configs: پروفایلِ کاربر برمی‌گردد.
+        self.custom_end();
         // v16: تیک‌های سبز Diagnostics باید بلافاصله بعد از دیسکانکت
         // ریست شوند تا برای اتصال بعدی آماده باشند (معادل resetChecks اندروید).
         diagnostics::reset_checks();
@@ -1399,7 +1680,7 @@ impl AetherController {
         self.deadline = None;
         self.reconnect_at = None;
         self.verify_slot = None;
-        self.chain_slot = None;
+        self.chain_waiting = false;
         self.prep_slot = None;
         self.plan.clear();
         self.plan_index = 0;
@@ -1409,6 +1690,8 @@ impl AetherController {
     /// ترتیب ۱.۲.۲: اول پروکسی سیستمی (تا مرورگر به پل مُرده نچسبد)، بعد
     /// اشتراک، بعد تونل، بعد موتور — بدون فریز.
     fn cleanup_native(&mut self, preserve_kill_switch: bool) {
+        // An abandoned attempt must not keep probing through the next one.
+        diagnostics::cancel_self_test();
         if self.sysproxy_on {
             sysproxy::disable();
             self.sysproxy_on = false;
@@ -1424,15 +1707,17 @@ impl AetherController {
         }
         self.webrtc_leak = None;
         self.share.stop();
+        crate::smart_routes::set_front(None);
+        crate::smart_routes::set_guest_front(None);
+        crate::smart_routes::set_front_udp_passthrough(false);
         // استیج ۲ بعد از پل و پیش از موتور می‌رود: همان ترتیب معکوسِ بالا آمدن.
         // اگر پیش از پل برود، پل برای چند صد میلی‌ثانیه به یک پروکسی مرده وصل
         // می‌ماند و مرورگر خطای واقعی می‌بیند.
-        self.psiphon.stop();
         // خروجی به موتور برمی‌گردد، وگرنه پلهٔ بعدی نردبان (یا نشست بعدی) به
         // پورت استیج ۲ که دیگر وجود ندارد وصل می‌ماند.
         engine::reset_exit_socks_port();
         self.chain_exit_port = None;
-        self.chain_slot = None;
+        self.chain_waiting = false;
         // >>> AETHER-APP-PATCH the-tor-in-front-is-the-real-tor
         // دو نیمهٔ نشستِ قبلی نباید به نشستِ بعدی برسد: موتوری که با
         // `AETHER_UPSTREAM` به توری وصل می‌ماند که دیگر نیست، همان «وصل شد
@@ -1440,6 +1725,9 @@ impl AetherController {
         // منتظرِ توری ماندن که هرگز اجرا نمی‌شود.
         self.tor_stage = TorStage::None;
         self.engine.set_upstream_socks(None);
+        // >>> AETHER-APP-PATCH tor-reverse-latch
+        self.tor_front_ready = false;
+        // <<< AETHER-APP-PATCH tor-reverse-latch
         // پنجرهٔ مدار مالِ یک نشست است و با آن بسته می‌شود.
         self.circuit_hunt_until = None;
         self.circuit_tries = 0;
@@ -1448,6 +1736,8 @@ impl AetherController {
             t.close();
         }
         self.engine.stop();
+        // AETHER-APP-PATCH custom-configs: Xrayِ این پله هم می‌رود (نشست می‌ماند).
+        self.custom_stop_xray();
         // >>> AETHER-APP-PATCH tor-native-carrier
         // پس از موتور، چون در نشستِ زنجیره‌ای موتور جلوترِ تور است و ترتیبِ
         // معکوسِ بالاآمدن یعنی هرکس آخر آمد، اول برود.
@@ -1455,13 +1745,104 @@ impl AetherController {
             tor.stop();
         }
         // <<< AETHER-APP-PATCH tor-native-carrier
+        // >>> AETHER-APP-PATCH tor-aether-fast-path
+        self.tor_relay = None;
+        self.tor_reverse_respawns = 0;
+        // >>> AETHER-APP-FIX tor-psiphon-waits-for-psiphon
+        self.psiphon_gate_since = None;
+        self.psiphon_next_probe = None;
+        self.psiphon_probe = None;
+        self.psiphon_port_latched = false;
+        // <<< AETHER-APP-FIX tor-psiphon-waits-for-psiphon
+        // <<< AETHER-APP-PATCH tor-aether-fast-path
     }
+
+    // >>> AETHER-APP-FIX tor-psiphon-waits-for-psiphon
+    /// `Tor → Psiphon` readiness, as mobile `PsiphonTransport.start` decides it:
+    /// ready once the engine has printed `[+] psiphon is ready`, or once a real
+    /// CONNECT to 1.1.1.1:80 through Psiphon succeeds (one probe every 4 s, 5 s
+    /// timeout, off the tick thread). `Some(false)` after 200 s without either;
+    /// `None` = keep waiting. Engine/tor death is caught by `carrier_alive`.
+    fn psiphon_hop_ready(&mut self) -> Option<bool> {
+        let since = *self.psiphon_gate_since.get_or_insert_with(Instant::now);
+        let ready_by = if engine::psiphon_ready() {
+            Some("the engine reported psiphon ready")
+        } else if self
+            .psiphon_probe
+            .as_ref()
+            .and_then(|slot| slot.lock().take())
+            == Some(true)
+        {
+            Some("a CONNECT through psiphon reached 1.1.1.1:80")
+        } else {
+            None
+        };
+        if let Some(why) = ready_by {
+            DiagnosticsLog::i(
+                TAG,
+                &format!(
+                    "Tor → Psiphon: Psiphon is ready after {:.1}s ({why}) — bringing up the data path.",
+                    since.elapsed().as_secs_f32()
+                ),
+            );
+            self.psiphon_gate_since = None;
+            self.psiphon_probe = None;
+            self.psiphon_next_probe = None;
+            return Some(true);
+        }
+        if since.elapsed() >= PSIPHON_READY_TIMEOUT {
+            return Some(false);
+        }
+        let probe_finished = self
+            .psiphon_probe
+            .as_ref()
+            .map(|slot| slot.lock().is_some())
+            .unwrap_or(true);
+        if probe_finished
+            && self
+                .psiphon_next_probe
+                .map(|at| Instant::now() >= at)
+                .unwrap_or(true)
+        {
+            self.psiphon_next_probe = Some(Instant::now() + PSIPHON_PROBE_INTERVAL);
+            let slot: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+            self.psiphon_probe = Some(slot.clone());
+            let port = engine::LOCAL_SOCKS_PORT;
+            std::thread::Builder::new()
+                .name("aether-psiphon-probe".into())
+                .spawn(move || {
+                    let ok = probe::socks5_stream_on(port, "1.1.1.1", 80, PSIPHON_PROBE_TIMEOUT)
+                        .is_some();
+                    *slot.lock() = Some(ok);
+                })
+                .ok();
+        }
+        None
+    }
+    // <<< AETHER-APP-FIX tor-psiphon-waits-for-psiphon
 
     /// شکست یک پله → پلهٔ بعدی نردبان؛ تمام‌شدن نردبان → Failed با پیام روشن.
     fn advance_or_fail(&mut self, why: &str) {
         DiagnosticsLog::w(TAG, &format!("{why} — tearing down this attempt."));
+        // >>> AETHER-APP-FIX forget-a-gateway-that-failed-its-proof
+        // Plain Aether only: chains share the cache files with the direct modes,
+        // and their failures are usually the other hop's. Decided before the
+        // teardown (`stop` clears `was_started`), done after it (the engine must
+        // not be writing the file). See `AetherProcess::forget_cached_gateways`.
+        let forget_gateway = self.engine.was_started()
+            && self
+                .plan
+                .get(self.plan_index)
+                .map(|c| c.profile.backend == crate::profile::TransportBackend::Aether)
+                .unwrap_or(false);
+        // <<< AETHER-APP-FIX forget-a-gateway-that-failed-its-proof
         // فقط موتور/مسیر داده را جمع می‌کنیم، وضعیت UI همچنان busy می‌ماند.
         self.cleanup_native(true);
+        // >>> AETHER-APP-FIX forget-a-gateway-that-failed-its-proof
+        if forget_gateway {
+            self.engine.forget_cached_gateways();
+        }
+        // <<< AETHER-APP-FIX forget-a-gateway-that-failed-its-proof
         self.verify_slot = None;
         diagnostics::reset_checks();
         self.plan_index += 1;
@@ -1470,6 +1851,11 @@ impl AetherController {
             // through the off-lock prep instead of blocking the tick for 3s.
             self.set_state(ConnectionState::StartingEngine, "Starting engine…");
             self.begin_prep(Prep::Candidate);
+        } else if let Some(chain) = self.custom_chain_label() {
+            // AETHER-APP-PATCH custom-configs
+            self.fail(&format!("{chain} could not be established: {why}"));
+        } else if self.profile.backend == crate::profile::TransportBackend::TorPsiphon {
+            self.fail(&format!("Tor → Psiphon could not be established: {why}"));
         } else if self.profile.protocol == Protocol::Smart {
             self.fail(
                 "Smart Auto tried every strategy and none passed the self-test on this network.",
@@ -1513,6 +1899,35 @@ impl AetherController {
             return;
         }
 
+        // ۱.۵.۰: کارت‌های شبکه برای اشتراک LAN (خودش هر ۳ ثانیه یک بار).
+        self.share.refresh_lan();
+
+        // >>> AETHER-APP-PATCH zt-login-code-prompt
+        // «حالا نه» در دیالوگِ کدِ ورود: اتصال همین حالا متوقف می‌شود، نه
+        // بعد از ۳۰۰ ثانیه انتظارِ هسته. (همین مسیر وقتی Cloudflare فقط از راهِ
+        // پروکسیِ بالادستی در دسترس است هم صدق می‌کند.)
+        if crate::login_code::take_abandon() && self.state.is_active() {
+            DiagnosticsLog::w(
+                TAG,
+                "Zero Trust: no login code was given (Not now); stopping the connection.",
+            );
+            self.disconnect();
+            self.error = Some(
+                "Zero Trust sign-in was cancelled, so the connection was stopped. Sign in under Settings → Zero Trust, or connect again when you have the code."
+                    .to_string(),
+            );
+            return;
+        }
+        // تا وقتی هسته منتظرِ کد است، بودجهٔ اتصال نباید موتور را بکُشد: کاربر
+        // دارد ایمیلش را می‌خواند. هسته خودش بعد از ۳۰۰ ثانیه منصرف می‌شود.
+        if crate::login_code::pending().is_some() {
+            let floor = Instant::now() + Duration::from_secs(20);
+            if self.deadline.is_some_and(|d| d < floor) {
+                self.deadline = Some(floor);
+            }
+        }
+        // <<< AETHER-APP-PATCH zt-login-code-prompt
+
         self.apply_pending_security_refresh();
 
         match self.state {
@@ -1521,9 +1936,20 @@ impl AetherController {
                 let outcome = self.prep_slot.as_ref().and_then(|s| s.lock().take());
                 if let Some(outcome) = outcome {
                     self.prep_slot = None;
-                    let result = match self.prep_kind {
-                        Prep::Plan => self.launch_plan(outcome.fingerprint),
-                        Prep::Candidate => self.launch_candidate(),
+                    if let Some(reason) = outcome.blocked {
+                        // Every rung would bind the same port: retrying is futile.
+                        self.fail(&reason);
+                        return;
+                    }
+                    // AETHER-APP-PATCH custom-configs: نشستِ سفارشی پله را خودش
+                    // اجرا می‌کند (Xray جلوتر، یا سایفونِ خالص)؛ بقیه مثل قبل.
+                    let result = if self.custom.is_some() {
+                        self.custom_launch(self.prep_kind, outcome.fingerprint)
+                    } else {
+                        match self.prep_kind {
+                            Prep::Plan => self.launch_plan(outcome.fingerprint),
+                            Prep::Candidate => self.launch_candidate(),
+                        }
                     };
                     if let Err(e) = result {
                         let msg = e.to_string();
@@ -1532,13 +1958,24 @@ impl AetherController {
                 }
             }
             ConnectionState::Connecting => {
+                // AETHER-APP-PATCH custom-configs: فازهای Xray (جلو/پشت).
+                if self.custom_poll() {
+                    return;
+                }
                 // >>> AETHER-APP-PATCH tor-native-carrier
                 if !self.carrier_alive() {
+                    // >>> AETHER-APP-PATCH tor-aether-fast-path
+                    if self.respawn_engine_behind_tor() {
+                        return;
+                    }
+                    // <<< AETHER-APP-PATCH tor-aether-fast-path
                     // در «تور تنها» هیچ موتوری اجرا نشده، پس گفتنِ «Engine exited»
                     // عیب‌یاب را دنبالِ موتوری می‌فرستاد که وجود ندارد: در لاگِ
                     // ۱۷ سپتامبر همین سطر کنارِ خطای واقعیِ تور نشسته بود و
                     // خواننده را به موتور مشکوک می‌کرد.
-                    let carrier = if self.native_tor.is_some() {
+                    let carrier = if self.engine.was_started() && !self.engine.is_alive() {
+                        "Engine exited before it opened the SOCKS5 port"
+                    } else if self.native_tor.is_some() {
                         "tor exited before it opened the SOCKS5 port"
                     } else {
                         "Engine exited before it opened the SOCKS5 port"
@@ -1547,11 +1984,54 @@ impl AetherController {
                     return;
                 }
                 // <<< AETHER-APP-PATCH tor-native-carrier
+                // >>> AETHER-APP-FIX tor-fresh-circuit-for-the-engine
+                // «تور → اتر»: موتور گفت درخواستش از راهِ تور بی‌جواب ماند (ثبت‌نامِ
+                // WARP یا اسکنِ MASQUE). مدارِ وصل‌شده‌ای که خروجی‌اش داده را خفه
+                // می‌کند هرگز خودبه‌خود عوض نمی‌شود — تور فقط مدارِ *وصل‌نشده* را
+                // کنار می‌گذارد — پس تلاشِ بعدیِ موتور روی همان مدار می‌افتاد. حالا
+                // یک NEWNYM تلاشِ بعدی را روی مدارِ تازه می‌برد.
+                if self.tor_front_ready && crate::tor_native::take_fresh_circuit_request() {
+                    if let Some(tor) = self.native_tor.as_ref() {
+                        match tor.new_circuit(Duration::from_secs(3)) {
+                            Ok(()) => DiagnosticsLog::i(
+                                TAG,
+                                "Tor → Aether: the engine's request through tor went unanswered; \
+                                 tor now puts its next ones on fresh circuits (NEWNYM).",
+                            ),
+                            Err(e) => DiagnosticsLog::w(
+                                TAG,
+                                &format!(
+                                    "Tor → Aether: NEWNYM after an unanswered request failed: {e}"
+                                ),
+                            ),
+                        }
+                    }
+                }
+                // <<< AETHER-APP-FIX tor-fresh-circuit-for-the-engine
                 // >>> AETHER-APP-PATCH the-tor-in-front-is-the-real-tor
                 // یک نشستِ توریِ دونیمه، پیش از هر چیزِ دیگر: تا نیمهٔ دوم اجرا
                 // نشده، پورتِ همیشگی (۱۸۱۹) مالِ هیچ‌کس نیست و منتظرِ آن ماندن
                 // یعنی انتظارِ چیزی که قرار نیست بیاید.
                 match self.tor_stage {
+                    TorStage::TorThenPsiphon => {
+                        match self.tor_gate() {
+                            TorGate::Ready => {
+                                if let Err(e) = self.start_psiphon_behind_tor() {
+                                    self.advance_or_fail(&e.to_string());
+                                }
+                            }
+                            TorGate::Waiting if self.past_deadline() => {
+                                let msg = diagnostics::stage_failure_message(self.tor_shape());
+                                self.advance_or_fail(&msg);
+                            }
+                            TorGate::Stalled => {
+                                let msg = diagnostics::stage_failure_message(self.tor_shape());
+                                self.advance_or_fail(&msg);
+                            }
+                            TorGate::Waiting => {}
+                        }
+                        return;
+                    }
                     TorStage::TorThenEngine => {
                         match self.tor_gate() {
                             TorGate::Ready => {
@@ -1590,6 +2070,12 @@ impl AetherController {
                     }
                     TorStage::EngineThenTor => {
                         if probe::socks_ready(engine::LOCAL_SOCKS_PORT) {
+                            if let Some(reason) =
+                                crate::procguard::stranger_on(engine::LOCAL_SOCKS_PORT)
+                            {
+                                self.fail(&reason);
+                                return;
+                            }
                             self.tor_stage = TorStage::None;
                             if let Err(e) = self.start_tor_behind_engine() {
                                 let msg = e.to_string();
@@ -1607,11 +2093,29 @@ impl AetherController {
                 // <<< AETHER-APP-PATCH the-tor-in-front-is-the-real-tor
                 // یک زنجیرهٔ در حال بالا آمدن، فاز خودش را دارد: استیج ۱ آماده
                 // است و استیج ۲ در ترد پس‌زمینه برقرار می‌شود.
-                if self.chain_slot.is_some() {
+                if self.chain_waiting {
                     self.poll_chain();
                     return;
                 }
-                if probe::socks_ready(engine::LOCAL_SOCKS_PORT) {
+                // >>> AETHER-APP-FIX psiphon-port-latch
+                // `Psiphon → Config` / `Tor → Psiphon`: پورتِ ۱۸۱۹ لیسنرِ خودِ
+                // psiphon-tunnel-core است. هر تیک (۲۰۰ms) یک connect/close روی آن
+                // باز می‌کرد و سایفون هر بار «SOCKS proxy accept error:
+                // socksPeekByte() failed: EOF» می‌نوشت — ۵ خط در ثانیه در لاگ،
+                // پارس و رندرِ بی‌فایده. یک بار باز دیده شد، تا پایانِ تلاش باز
+                // حساب می‌شود؛ مرگِ موتور بالاتر با `is_alive` گرفته می‌شود.
+                let psiphon_gate = self.psiphon_exit_session();
+                let port_up = if psiphon_gate && self.psiphon_port_latched {
+                    true
+                } else {
+                    let up = probe::socks_ready(engine::LOCAL_SOCKS_PORT);
+                    if up && psiphon_gate {
+                        self.psiphon_port_latched = true;
+                    }
+                    up
+                };
+                // <<< AETHER-APP-FIX psiphon-port-latch
+                if port_up {
                     // ۱.۲.۵ — روی حالت‌های تور، پورتِ باز هنوز چیزی را اثبات
                     // نمی‌کند: bootstrap باید تمام شده باشد.
                     match self.tor_gate() {
@@ -1648,7 +2152,30 @@ impl AetherController {
                         }
                         TorGate::Ready => {}
                     }
-                    if self.profile.is_chained() {
+                    // >>> AETHER-APP-FIX tor-psiphon-waits-for-psiphon
+                    // 127.0.0.1:1819 is psiphon-tunnel-core's own listener: it
+                    // answers the SOCKS5 handshake seconds after the engine
+                    // starts, long before Psiphon has a server. Field log
+                    // 2026-10-08 (Tor → Psiphon, run 2): the data path and the
+                    // self-test started on that open port, the probes went out
+                    // before Psiphon was up, and the session was failed
+                    // ("self-test failed") although Psiphon became ready later.
+                    // Mobile (`PsiphonTransport.start`) waits for exactly this.
+                    if self.psiphon_exit_session() {
+                        match self.psiphon_hop_ready() {
+                            Some(true) => {}
+                            Some(false) => {
+                                self.advance_or_fail(&format!(
+                                    "Psiphon found no usable server through Tor within {}s",
+                                    PSIPHON_READY_TIMEOUT.as_secs()
+                                ));
+                                return;
+                            }
+                            None => return,
+                        }
+                    }
+                    // <<< AETHER-APP-FIX tor-psiphon-waits-for-psiphon
+                    if self.profile.is_chained() && !self.psiphon_exit_session() {
                         self.begin_chain();
                     } else {
                         // ۱.۲.۵ — خروجی خط لوله همیشه پورت همیشگی نیست. هر چیزی
@@ -1665,6 +2192,21 @@ impl AetherController {
                                     self.profile.backend.pipeline_label()
                                 ),
                             );
+                        }
+                        // 1.3.0 port-guard: a port that answers is not proof that
+                        // *our* engine answers. In the 2026-10-08 log a leftover
+                        // listener passed the SOCKS5 handshake 4ms after spawn
+                        // while the real engine had already died with 10048.
+                        if let Some(reason) =
+                            crate::procguard::stranger_on(engine::LOCAL_SOCKS_PORT)
+                        {
+                            self.fail(&reason);
+                            return;
+                        }
+                        // AETHER-APP-PATCH custom-configs: `… → Config` — Xray از دلِ
+                        // همین خروجی؛ مسیرِ داده پس از آمدنِ پورتِ آن.
+                        if self.custom_hold_for_last(exit) {
+                            return;
                         }
                         DiagnosticsLog::i(TAG, "SOCKS5 port is up — bringing up the data path.");
                         self.bring_up_data_path();
@@ -1749,6 +2291,12 @@ impl AetherController {
                             .then(|| Instant::now() + CIRCUIT_HUNT_WINDOW);
                         // <<< AETHER-APP-PATCH a-bad-circuit-is-not-a-bad-network
                         self.set_state(ConnectionState::Connected, "");
+                        // ۱.۴.۰ — به‌روزرسانیِ هفتگیِ فهرست‌ها، از داخلِ همین تونل، روی ترد پس‌زمینه.
+                        crate::smart_lists::refresh_if_due(
+                            &self.data_dir,
+                            &self.profile,
+                            engine::exit_socks_port(),
+                        );
                         DiagnosticsLog::i(TAG, "All checks passed — tunnel is ready.");
                         if out.exit.is_none() {
                             spawn_ip_lookup(self.ip_slot.clone(), true);
@@ -1848,22 +2396,10 @@ impl AetherController {
                         })
                         .ok();
                 }
-                // سوپروایز **هر دو** هاپ. یک نشست زنجیره‌ای فقط به‌قدر ضعیف‌ترین
-                // استیجش زنده است، و استیج ۱ مرده یعنی استیج ۲ پروکسی‌ای در دست
-                // دارد که نمی‌تواند dial کند — «متصل» با هیچ چیزی در حرکت.
-                //
-                // `is_alive` استیج ۲ در طول یک چرخشِ عمدی عمداً true می‌ماند
-                // (نگاه کنید به psiphon.rs)، وگرنه واچ‌داگ همان نشستی را
-                // می‌کشت که قرار بود نجاتش بدهد.
-                if self.profile.is_chained() && !self.psiphon.is_alive() {
-                    DiagnosticsLog::e(
-                        TAG,
-                        "The Psiphon stage died while connected — rebuilding the session.",
-                    );
-                    self.cleanup_native(true);
-                    self.connected_at = None;
-                    self.reconnect_at = Some(Instant::now() + Duration::from_secs(2));
-                    self.set_state(ConnectionState::Reconnecting, "Rebuilding the chain…");
+                // The core owns and retries its Psiphon child. The desktop's
+                // normal end-to-end watchdog still verifies the finished route.
+                // AETHER-APP-PATCH custom-configs: پایشِ Xray (راه‌اندازیِ دوبارهٔ درجا).
+                if self.custom_monitor() {
                     return;
                 }
                 // >>> AETHER-APP-PATCH tor-native-carrier
@@ -1920,6 +2456,8 @@ impl AetherController {
     fn fail(&mut self, why: &str) {
         DiagnosticsLog::e(TAG, why);
         self.cleanup_native(true);
+        // AETHER-APP-PATCH custom-configs: پروفایلِ کاربر برمی‌گردد.
+        self.custom_end();
         self.error = Some(why.to_string());
         self.connected_at = None;
         self.deadline = None;
@@ -2063,6 +2601,11 @@ impl AetherController {
         }
     }
     // <<< AETHER-APP-PATCH a-bad-circuit-is-not-a-bad-network
+
+    /// ۱.۴.۰ — پوشه‌هایی که هویتِ تیمِ Zero Trust ممکن است در آن‌ها باشد.
+    pub fn identity_dirs(&self) -> Vec<PathBuf> {
+        vec![self.engine.run_dir(), self.data_dir.clone()]
+    }
 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir

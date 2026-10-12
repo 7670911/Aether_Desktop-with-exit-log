@@ -38,8 +38,11 @@ use crate::ai_client::GeminiModel;
 ///
 /// هر یک از این‌ها یک مدل ردهٔ Flash است: سریع، ارزان و پاسخ‌دادنی روی یک کلید
 /// رایگان.
-pub const ALLOWED: [&str; 5] = [
+pub const ALLOWED: [&str; 6] = [
     "gemini-3.8-flash",
+    // 1.4.0 (موبایل 1.3.1): 3.7-flash در ۱۳ اوت ۲۰۲۶ منتشر شد و در این فهرست نبود؛
+    // کلیدی که آن را می‌دید، پایین‌تر از مدل‌های قدیمی‌تر رتبه می‌گرفت.
+    "gemini-3.7-flash",
     "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
     "gemini-3.1-flash-lite-preview",
@@ -108,8 +111,45 @@ pub fn filter(models: &[GeminiModel]) -> Vec<GeminiModel> {
 /// هیچ اکتشافِ زیررشته‌ای. نردبان قدیمیِ `contains("flash")` برای سروکله‌زدن با
 /// یک فهرست بی‌کران وجود داشت؛ با فهرستی ثابت از پنج مورد، «اولی» هم درست است و
 /// هم قابل توضیح.
+/// ۱.۴.۰-r5 (پورت از `AiModelPolicy.DEFAULT_PREFERENCE`): پیش‌فرض دیگر «تازه‌ترین
+/// مدل» نیست.
+///
+/// تازه‌ترین مدل‌های Flash سریع‌ترند، ولی روی کلیدِ رایگان کمترین سهمیهٔ روزانه را
+/// دارند و شکایتِ میدانی این بود که چت وسطِ روز با ۴۲۹ از کار می‌افتاد. Gemini 3.1
+/// Flash-Lite بالاترین سقفِ روزانهٔ رایگان را میان مدل‌های مجاز دارد، پس کلیدِ
+/// تازه با آن شروع می‌کند. مدل‌های تازه‌تر یک کلیک دورتر در انتخابگر می‌مانند.
+///
+/// ترتیبِ جایگزین: اگر کلید 3.1 Flash-Lite را نبیند، نسخهٔ preview و نامِ مستعارِ
+/// `flash-lite-latest` بعدی‌اند و فقط پس از آن‌ها ترتیبِ نمایش.
+pub const DEFAULT_PREFERENCE: [&str; 3] = [
+    "gemini-3.1-flash-lite",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-flash-lite-latest",
+];
+
+/// مدلی که کلیدِ تازه، اگر ببیندش، با آن شروع می‌کند.
+pub const DEFAULT_MODEL: &str = "gemini-3.1-flash-lite";
+
+/// آیا این همان مدلِ پیش‌فرضِ توصیه‌شده است؟ (برای برچسبِ انتخابگر)
+pub fn is_default(raw_id: &str) -> bool {
+    normalise(raw_id) == DEFAULT_MODEL
+}
+
+/// انتخابِ پیش‌فرض روی شناسه‌های خام — مسیرِ فهرستِ کَش‌شده در استارتاپ.
+pub fn pick_default_id(ids: &[String]) -> Option<String> {
+    let usable = filter_ids(ids);
+    DEFAULT_PREFERENCE
+        .iter()
+        .find(|preferred| usable.iter().any(|id| id == *preferred))
+        .map(|id| id.to_string())
+        .or_else(|| usable.first().cloned())
+}
+
+/// مدلی که وقتی کاربر چیزی انتخاب نکرده (یا انتخابش دیگر پیشنهاد نمی‌شود)
+/// به کار می‌رود: اول [`DEFAULT_PREFERENCE`]، بعد اولین مدلِ مجاز.
 pub fn pick_default(models: &[GeminiModel]) -> Option<String> {
-    filter(models).first().map(|m| m.id.clone())
+    let ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
+    pick_default_id(&ids)
 }
 
 #[cfg(test)]
@@ -151,7 +191,27 @@ mod tests {
                 "gemini-flash-lite-latest"
             ]
         );
-        assert_eq!(pick_default(&models).unwrap(), "gemini-3.8-flash");
+        // ۱.۴.۰-r5: ترتیبِ نمایش همان است، ولی پیش‌فرض Flash-Lite است.
+        assert_eq!(pick_default(&models).unwrap(), "gemini-3.1-flash-lite");
+    }
+
+    #[test]
+    fn the_default_falls_back_in_preference_order_then_display_order() {
+        let only_alias = [model("gemini-3.8-flash"), model("gemini-flash-lite-latest")];
+        assert_eq!(
+            pick_default(&only_alias).unwrap(),
+            "gemini-flash-lite-latest"
+        );
+        let no_lite = [model("gemini-3.7-flash"), model("gemini-3.8-flash")];
+        assert_eq!(pick_default(&no_lite).unwrap(), "gemini-3.8-flash");
+        assert!(pick_default(&[]).is_none());
+        let cached = vec![
+            "models/gemini-3.1-flash-lite".to_string(),
+            "gemini-3.8-flash".to_string(),
+        ];
+        assert_eq!(pick_default_id(&cached).unwrap(), "gemini-3.1-flash-lite");
+        assert!(is_default("models/gemini-3.1-flash-lite"));
+        assert!(!is_default("gemini-3.8-flash"));
     }
 
     #[test]
@@ -168,7 +228,36 @@ mod tests {
 
     #[test]
     fn display_number_is_stable_when_a_model_is_unavailable() {
-        assert_eq!(display_number("gemini-3.1-flash-lite"), 3);
+        assert_eq!(display_number("gemini-3.1-flash-lite"), 4);
+        assert_eq!(display_number("gemini-3.7-flash"), 2);
         assert_eq!(display_number("something-else"), 0);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelTier {
+    pub tier: &'static str,
+    pub tokens: &'static str,
+    pub description: &'static str,
+}
+
+pub fn get_model_tier(model_name: &str) -> Option<ModelTier> {
+    match model_name {
+        "gemini-2.0-flash" => Some(ModelTier {
+            tier: "RECOMMENDED_DEFAULT",
+            tokens: "1M tokens",
+            description: "Fast, default model with 1M token context",
+        }),
+        "gemini-1.5-pro" => Some(ModelTier {
+            tier: "HIGH_QUOTA_ALT",
+            tokens: "2M tokens",
+            description: "High capacity with 2M token context for complex tasks",
+        }),
+        "gemini-1.5-flash" => Some(ModelTier {
+            tier: "FAST_LOW_QUOTA",
+            tokens: "1M tokens",
+            description: "Lightweight model with 1M token context",
+        }),
+        _ => None,
     }
 }

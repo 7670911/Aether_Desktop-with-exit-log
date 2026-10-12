@@ -14,7 +14,7 @@
 #>
 param(
   [Parameter(Mandatory = $true)][string]$Arch,
-  [string]$Version = '2.0.39'
+  [string]$Version = '83aa73b9b982e7421e00117f5b0c5aceb5dda452'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -25,15 +25,23 @@ New-Item -ItemType Directory -Force -Path $out | Out-Null
 # GOARCH از معماری بیلد. ویندوز ۳۲بیتی همان 386 است.
 $goarch = if ($Arch -eq 'x86') { '386' } else { 'amd64' }
 
-$src = Join-Path $env:RUNNER_TEMP 'psiphon-tunnel-core'
+$src = Join-Path $env:RUNNER_TEMP ('psiphon-tunnel-core-' + $Version)
+$repo = 'https://github.com/CluvexStudio/psiphon-tunnel-core.git'
 if (-not (Test-Path $src)) {
   Write-Host "==> Cloning psiphon-tunnel-core v$Version"
-  git clone --depth 1 --branch "v$Version" https://github.com/Psiphon-Labs/psiphon-tunnel-core.git $src
-  if ($LASTEXITCODE -ne 0) { throw "Could not fetch psiphon-tunnel-core v$Version" }
+  git clone --filter=blob:none --no-checkout $repo $src
+  if ($LASTEXITCODE -ne 0) { throw "Could not fetch psiphon-tunnel-core $Version" }
 }
 
 Push-Location $src
 try {
+  git fetch --depth 1 origin $Version
+  if ($LASTEXITCODE -ne 0) { throw "Could not fetch pinned Psiphon commit $Version" }
+  git checkout --detach $Version
+  if ($LASTEXITCODE -ne 0) { throw "Could not checkout pinned Psiphon commit $Version" }
+  $actual = (git rev-parse HEAD).Trim()
+  if ($LASTEXITCODE -ne 0 -or $actual -ne $Version) { throw "Psiphon commit mismatch: $actual" }
+
   $env:GOOS = 'windows'
   $env:GOARCH = $goarch
   # CGO لازم نیست و روی ویندوز فقط بیلد را شکننده می‌کند.
@@ -41,6 +49,7 @@ try {
   $target = Join-Path $out 'psiphon-tunnel-core.exe'
   Write-Host "==> Building ConsoleClient (GOOS=windows GOARCH=$goarch)"
   # -s -w: بدون سمبل و DWARF — همان روحیهٔ strip در پروفایل release هستهٔ Rust.
+  $env:GOFLAGS = "-mod=vendor"
   go build -trimpath -ldflags "-s -w" -o $target ./ConsoleClient
   if ($LASTEXITCODE -ne 0) { throw 'psiphon-tunnel-core build failed' }
   Write-Host "==> stage 2 -> dist-engine/psiphon-tunnel-core.exe"

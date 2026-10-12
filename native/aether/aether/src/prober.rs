@@ -1,6 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::stream::StreamExt;
@@ -42,6 +42,15 @@ pub const MASQUE_SEEDS: &[&str] = &[
     "162.159.193.1",
 ];
 
+pub const MASQUE_VERIFIED_GATEWAYS: &[&str] = &[
+    "162.159.199.1",
+    "162.159.199.2",
+    "162.159.198.2",
+    "162.159.198.1",
+];
+
+pub const MASQUE_ALT_PORTS: &[u16] = &[1701, 8095, 500, 4500];
+
 pub const MASQUE_PORTS: &[u16] = &[443, 500, 1701, 4500, 4443, 8443, 8095];
 
 pub const MASQUE_CIDRS_V6: &[&str] = &[
@@ -79,194 +88,11 @@ pub fn prioritize(all: &[&'static str], first: &[&'static str]) -> Vec<&'static 
     out
 }
 
-// >>> AETHER-APP-PATCH scan-cidrs
-//
-// «بازهٔ آدرس» در تنظیمات برنامه (EndpointMode::ManualRange).
-//
-// برنامه سه متغیر AETHER_SCAN_CIDRS / AETHER_MASQUE_CIDRS / AETHER_WG_CIDRS را
-// به موتور می‌دهد، ولی آپ‌استریم هیچ‌کدام را نمی‌خواند: بدون این پچ کاربر بازه
-// می‌نویسد و اسکن، بی‌صدا، همان بازه‌های توکار خودش را جارو می‌کند — تنظیمی که
-// فقط ادای کار کردن درمی‌آورد.
-//
-// قاعده‌ها:
-//   * متغیر مخصوص پروتکل بر AETHER_SCAN_CIDRS مقدم است.
-//   * این ورودیِ کاربر است: هر تکه اعتبارسنجی می‌شود و تکهٔ نامعتبر دور
-//     انداخته می‌شود، نه اینکه اسکن را بترکاند.
-//   * اگر هیچ تکهٔ معتبری نماند، رفتار توکار برمی‌گردد. اسکنِ خالی یعنی «اصلاً
-//     وصل نشو»، و کاربری که بازه را غلط تایپ کرده انتظارِ آن را ندارد.
-//   * ترتیبِ نوشتهٔ کاربر حفظ می‌شود؛ prioritize (چیدنِ Zero Trust جلوتر) روی
-//     بازهٔ دستی اعمال نمی‌شود، چون خودِ کاربر گفته چه چیزی اول بیاید.
-
-/// یک تکهٔ ورودی → بازه‌ای که سازندهٔ کاندیدها می‌فهمد، یا None.
-///
-/// دقت در طولِ پیشوند لازم است: `parse_cidr_v4` هر عددی را که در u8 جا شود
-/// می‌پذیرد، پس «10.0.0.0/64» از آن رد می‌شود و بعد در `sample_cidr_v4` به یک
-/// آدرسِ تنها فرومی‌پاشد. یعنی بازهٔ غلط، بی هیچ پیامی، به یک آی‌پی تبدیل
-/// می‌شود. اینجا جلویش گرفته می‌شود.
-fn normalize_cidr(entry: &str) -> Option<String> {
-    let entry = entry.trim();
-    if entry.is_empty() {
-        return None;
-    }
-
-    if let Some((ip, prefix)) = entry.split_once('/') {
-        let len: u8 = prefix.trim().parse().ok()?;
-        let ip = ip.trim();
-        if ip.parse::<Ipv4Addr>().is_ok() && len <= 32 {
-            return Some(format!("{ip}/{len}"));
-        }
-        if ip.parse::<Ipv6Addr>().is_ok() && len <= 128 {
-            return Some(format!("{ip}/{len}"));
-        }
-        return None;
-    }
-
-    // یک آدرس تنها هم بازهٔ یک‌میزبانه است. کاربری که «188.114.98.7» نوشته
-    // منظورش همان یک آدرس است، نه ورودیِ خراب.
-    if let Ok(a) = entry.parse::<Ipv4Addr>() {
-        return Some(format!("{a}/32"));
-    }
-    if let Ok(a) = entry.parse::<Ipv6Addr>() {
-        return Some(format!("{a}/128"));
-    }
-    None
-}
-
-/// متنِ خامِ متغیر → فهرست بازه‌های معتبر. جدا از خواندنِ محیط نگه داشته شده تا
-/// آزمون‌پذیر باشد بدون دست‌زدن به محیطِ فرایند.
-fn parse_pinned(raw: &str) -> Option<Vec<&'static str>> {
-    let mut out: Vec<&'static str> = Vec::new();
-    for piece in raw.split([',', ';', ' ', '\t', '\n', '\r']) {
-        if let Some(norm) = normalize_cidr(piece) {
-            if out.iter().any(|existing| *existing == norm.as_str()) {
-                continue;
-            }
-            // یک‌بار در طول عمر فرایند و فقط برای چند بازه؛ سازندهٔ کاندیدها
-            // &'static می‌خواهد و همان چیزی است که بازه‌های توکار هستند.
-            out.push(Box::leak(norm.into_boxed_str()));
-        }
-    }
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
-}
-
-fn pinned_all(specific: &str) -> Option<&'static [&'static str]> {
-    static CACHE: OnceLock<Mutex<HashMap<String, Option<&'static [&'static str]>>>> =
-        OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = cache
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(hit) = guard.get(specific) {
-        return *hit;
-    }
-
-    let raw = std::env::var(specific)
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .or_else(|| {
-            std::env::var("AETHER_SCAN_CIDRS")
-                .ok()
-                .filter(|v| !v.trim().is_empty())
-        });
-    let value = raw
-        .as_deref()
-        .and_then(parse_pinned)
-        .map(|list| &*Box::leak(list.into_boxed_slice()));
-    guard.insert(specific.to_string(), value);
-    value
-}
-
-/// بازه‌های IPv4 که کاربر پین کرده، اگر لااقل یکی معتبر باشد.
-pub fn pinned_cidrs_v4(specific: &str) -> Option<Vec<&'static str>> {
-    let picked: Vec<&'static str> = pinned_all(specific)?
-        .iter()
-        .copied()
-        .filter(|c| c.contains('.'))
-        .collect();
-    (!picked.is_empty()).then_some(picked)
-}
-
-/// همان برای IPv6.
-pub fn pinned_cidrs_v6(specific: &str) -> Option<Vec<&'static str>> {
-    let picked: Vec<&'static str> = pinned_all(specific)?
-        .iter()
-        .copied()
-        .filter(|c| c.contains(':'))
-        .collect();
-    (!picked.is_empty()).then_some(picked)
-}
-
-fn cidr_v4_contains(cidr: &str, addr: Ipv4Addr) -> bool {
-    match parse_cidr_v4(cidr) {
-        Some((base, len)) if len <= 32 => {
-            let mask = if len == 0 { 0 } else { u32::MAX << (32 - len) };
-            (u32::from(addr) & mask) == (base & mask)
-        }
-        _ => false,
-    }
-}
-
-fn cidr_v6_contains(cidr: &str, addr: Ipv6Addr) -> bool {
-    match parse_cidr_v6(cidr) {
-        Some((base, len)) if len <= 128 => {
-            let mask = if len == 0 {
-                0
-            } else {
-                u128::MAX << (128 - len)
-            };
-            (u128::from(addr) & mask) == (base & mask)
-        }
-        _ => false,
-    }
-}
-
-/// دانه‌های توکار وقتی کاربر بازه پین کرده است.
-///
-/// دانه‌ها اول از همه پروب می‌شوند، پس اگر دست‌نخورده بمانند، پین‌شدنِ بازه
-/// بی‌معنی می‌شود: تونل با احتمال زیاد روی آدرسی بسته می‌شود که کاربر آن را
-/// نخواسته. آن‌هایی که *داخل* بازه هستند می‌مانند — سرعتِ راه‌اندازی را نگه
-/// می‌دارند بی آنکه از بازه بیرون بزنند.
-pub fn seeds_within(seeds: &[&'static str], specific: &str) -> Vec<&'static str> {
-    if pinned_all(specific).is_none() {
-        return seeds.to_vec();
-    }
-    let v4 = pinned_cidrs_v4(specific).unwrap_or_default();
-    let v6 = pinned_cidrs_v6(specific).unwrap_or_default();
-    seeds
-        .iter()
-        .copied()
-        .filter(|seed| {
-            if let Ok(a) = seed.parse::<Ipv4Addr>() {
-                return v4.iter().any(|c| cidr_v4_contains(c, a));
-            }
-            if let Ok(a) = seed.parse::<Ipv6Addr>() {
-                return v6.iter().any(|c| cidr_v6_contains(c, a));
-            }
-            false
-        })
-        .collect()
-}
-// <<< AETHER-APP-PATCH scan-cidrs
-
 pub fn masque_cidrs_v4() -> Vec<&'static str> {
-    // >>> AETHER-APP-PATCH scan-cidrs
-    if let Some(pinned) = pinned_cidrs_v4("AETHER_MASQUE_CIDRS") {
-        return pinned;
-    }
-    // <<< AETHER-APP-PATCH scan-cidrs
     prioritize(MASQUE_CIDRS_V4, MASQUE_ZT_CIDRS_V4)
 }
 
 pub fn masque_cidrs_v6() -> Vec<&'static str> {
-    // >>> AETHER-APP-PATCH scan-cidrs
-    if let Some(pinned) = pinned_cidrs_v6("AETHER_MASQUE_CIDRS") {
-        return pinned;
-    }
-    // <<< AETHER-APP-PATCH scan-cidrs
     prioritize(MASQUE_CIDRS_V6, MASQUE_ZT_CIDRS_V6)
 }
 
@@ -322,7 +148,7 @@ pub enum ScanMode {
     Turbo,
     Balanced,
     Thorough,
-    Stealth,
+    Verified,
     Ironclad,
 }
 
@@ -331,7 +157,7 @@ impl ScanMode {
         match s.trim().to_lowercase().as_str() {
             "turbo" | "fast" => ScanMode::Turbo,
             "thorough" | "deep" | "pro" => ScanMode::Thorough,
-            "stealth" | "quiet" => ScanMode::Stealth,
+            "verified" | "proven" | "stealth" | "quiet" => ScanMode::Verified,
             "ironclad" | "real" | "verify" | "guaranteed" => ScanMode::Ironclad,
             _ => ScanMode::Balanced,
         }
@@ -342,7 +168,7 @@ impl ScanMode {
             ScanMode::Turbo => "turbo",
             ScanMode::Balanced => "balanced",
             ScanMode::Thorough => "thorough",
-            ScanMode::Stealth => "stealth",
+            ScanMode::Verified => "verified",
             ScanMode::Ironclad => "ironclad",
         }
     }
@@ -379,15 +205,15 @@ impl ScanMode {
                 full_subnet: true,
                 sample_per_cidr: 0,
             },
-            ScanMode::Stealth => Strategy {
-                concurrency: 3,
-                per_probe_timeout: Duration::from_millis(12000),
-                overall_deadline: Duration::from_secs(180),
-                quiet_after_first: Duration::from_secs(25),
+            ScanMode::Verified => Strategy {
+                concurrency: 16,
+                per_probe_timeout: Duration::from_millis(5000),
+                overall_deadline: Duration::from_secs(60),
+                quiet_after_first: Duration::from_secs(8),
                 target_successes: 4,
                 early_exit_first: false,
                 full_subnet: false,
-                sample_per_cidr: 64,
+                sample_per_cidr: 48,
             },
             ScanMode::Ironclad => Strategy {
                 concurrency: 4,
@@ -401,78 +227,6 @@ impl ScanMode {
             },
         }
     }
-}
-
-/// The scan budget the launcher hands down in `AETHER_SCAN_BUDGET_MS`.
-///
-/// ## 1.2.3-p3: the scan and the stopwatch used to be strangers
-///
-/// The app waits a fixed window for SOCKS5 to open (35 s for the first rung of
-/// the ladder, 60 s afterwards) and kills the engine when it expires. The turbo
-/// strategy below gives itself a 45 s scan budget - and only starts counting
-/// after the identity is loaded, an ECH lookup may have run and the cached
-/// gateway has been verified. The two numbers were never reconciled, so on any
-/// network that needed a real scan the first rung could not finish one:
-///
-/// ```text
-///   14:20:04  Waiting for SOCKS5 ... (timeout=35s)
-///   14:20:09  scanning fresh, budget=45s
-///   14:20:39  Engine still scanning - tearing down this attempt
-/// ```
-///
-/// Thirty seconds of probing, thrown away three quarters of the way through,
-/// twice in a row, on a plan that then spent another minute repeating it.
-///
-/// With the budget passed down, a scan is sized to the window it is actually
-/// being held to: it either finishes, or it reports `no clean endpoint` in time
-/// for the ladder to advance on its own terms rather than on a stopwatch.
-pub fn scan_budget_override() -> Option<Duration> {
-    std::env::var("AETHER_SCAN_BUDGET_MS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&ms| ms > 0)
-        .map(Duration::from_millis)
-}
-
-/// Caps a strategy deadline with the launcher's budget. Never lengthens it: a
-/// generous window is not permission to scan for longer than the mode allows.
-pub fn apply_scan_budget(default_deadline: Duration, what: &str) -> Duration {
-    match scan_budget_override() {
-        Some(budget) if budget < default_deadline => {
-            log::info!(
-                "[*] {what} scan budget trimmed to {:?} to fit the launcher's attempt window (mode default {:?})",
-                budget,
-                default_deadline
-            );
-            budget
-        }
-        _ => default_deadline,
-    }
-}
-
-/// Consecutive probe failures, with nothing whatsoever having answered, after
-/// which the carrier itself is treated as blocked rather than the endpoints.
-///
-/// ## Why give up early at all
-///
-/// When QUIC is filtered, every candidate fails identically - by timing out. At
-/// 20 in flight and a 6 s per-probe timeout that is about three verdicts a
-/// second, so the full budget buys ~150 hopeless attempts and learns nothing
-/// from any of them. The documented gateway seeds are probed FIRST and answer in
-/// well under a second on a network where the carrier works, so dozens of
-/// consecutive failures is not evidence about individual endpoints, it is
-/// evidence about the transport. Reporting that immediately is what lets the
-/// ladder move to a carrier that can work while the user is still watching.
-const CARRIER_DEAD_FAILURES: usize = 64;
-
-/// ...and never before this much time has passed, so a merely slow or lossy
-/// network can never be mistaken for a filtered one.
-const CARRIER_DEAD_MIN_ELAPSED: Duration = Duration::from_secs(12);
-
-/// Escape hatch: `AETHER_SCAN_NO_EARLY_ABORT=1` restores the previous behaviour
-/// of always spending the entire budget.
-fn early_abort_enabled() -> bool {
-    std::env::var("AETHER_SCAN_NO_EARLY_ABORT").is_err()
 }
 
 const IRONCLAD_TCPING_TIMEOUT: Duration = Duration::from_secs(10);
@@ -512,7 +266,6 @@ pub async fn host_has_ipv6() -> bool {
 pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<ProbeResult> {
     let mut st = mode.strategy();
     st.concurrency = crate::sysprofile::cap_concurrency(st.concurrency);
-    st.overall_deadline = apply_scan_budget(st.overall_deadline, "MASQUE");
     let timeout = st.per_probe_timeout;
     let mut effective_ip = probe.ip;
     if probe.ip.want_v6() && !host_has_ipv6().await {
@@ -547,11 +300,9 @@ pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<Pr
     .buffer_unordered(st.concurrency);
     tokio::pin!(stream);
 
-    let scan_started = Instant::now();
-    let deadline = scan_started + st.overall_deadline;
+    let deadline = Instant::now() + st.overall_deadline;
     let mut best: Option<ProbeResult> = None;
     let mut found = 0usize;
-    let mut failures = 0usize;
     let mut quiet_until: Option<Instant> = None;
 
     loop {
@@ -577,26 +328,7 @@ pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<Pr
             item = stream.next() => {
                 match item {
                     None => break,
-                    Some(None) => {
-                        // Nothing has answered yet and dozens of candidates in a
-                        // row have failed: this is the transport being blocked,
-                        // not a run of unlucky endpoints. See
-                        // [`CARRIER_DEAD_FAILURES`].
-                        failures += 1;
-                        if best.is_none()
-                            && early_abort_enabled()
-                            && failures >= CARRIER_DEAD_FAILURES
-                            && scan_started.elapsed() >= CARRIER_DEAD_MIN_ELAPSED
-                        {
-                            log::warn!(
-                                "[-] {failures} candidates failed and none answered in {:?}: this carrier looks blocked on this network - abandoning the scan instead of spending the rest of the {:?} budget on it",
-                                scan_started.elapsed(),
-                                st.overall_deadline
-                            );
-                            break;
-                        }
-                        continue;
-                    }
+                    Some(None) => continue,
                     Some(Some(pr)) => {
                         log::info!("[+] candidate ok {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
                         if st.early_exit_first {
@@ -658,6 +390,7 @@ async fn verify_one(
             path: probe.path.clone(),
             cert_pem: probe.cert_pem.to_vec(),
             key_pem: probe.key_pem.to_vec(),
+            ech_config_list: probe.ech_config_list.as_ref().map(|a| a.to_vec()),
             noize: probe.noize.clone(),
             local_ipv4: probe.local_ipv4,
             local_ipv4_str: probe.local_ipv4.to_string(),
@@ -693,6 +426,7 @@ async fn verify_one(
                 .iter()
                 .map(|p| p.to_vec())
                 .collect(),
+            ech_config_list: probe.ech_config_list.as_ref().map(|a| a.to_vec()),
         };
         return match crate::masque_h2::verify_h2(&cfg, timeout).await {
             Ok(rtt) => Some(ProbeResult { ip, port, rtt }),
@@ -730,16 +464,11 @@ fn build_candidates(st: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u1
     let mut out: Vec<(IpAddr, u16)> = Vec::new();
     let mut seen: HashSet<(IpAddr, u16)> = HashSet::new();
 
-    // >>> AETHER-APP-PATCH scan-cidrs — دانه‌ها هم به بازهٔ پین‌شده محدود می‌شوند
-    let seeds: Vec<Ipv4Addr> = seeds_within(MASQUE_SEEDS, "AETHER_MASQUE_CIDRS")
+    let seeds: Vec<Ipv4Addr> = MASQUE_SEEDS.iter().filter_map(|s| s.parse().ok()).collect();
+    let seeds6: Vec<Ipv6Addr> = MASQUE_SEEDS_V6
         .iter()
         .filter_map(|s| s.parse().ok())
         .collect();
-    let seeds6: Vec<Ipv6Addr> = seeds_within(MASQUE_SEEDS_V6, "AETHER_MASQUE_CIDRS")
-        .iter()
-        .filter_map(|s| s.parse().ok())
-        .collect();
-    // <<< AETHER-APP-PATCH scan-cidrs
 
     if ip.want_v4() {
         for a in &seeds {
@@ -780,16 +509,10 @@ fn build_candidates(st: &Strategy, ports: &[u16], ip: IpScan) -> Vec<(IpAddr, u1
         } else {
             st.sample_per_cidr
         };
-        // >>> AETHER-APP-PATCH scan-cidrs
-        // آدرس v6 وارپ یک آدرس v4 را در خودش جا می‌دهد؛ اگر کاربر بازهٔ v4 پین
-        // کرده باشد، همان باید جاسازی شود، وگرنه v6 از بازه بیرون می‌زند.
-        let embed_v4: Vec<&'static str> =
-            pinned_cidrs_v4("AETHER_MASQUE_CIDRS").unwrap_or_else(|| MASQUE_CIDRS_V4.to_vec());
         let cidr6: Vec<Vec<Ipv6Addr>> = masque_cidrs_v6()
             .iter()
-            .map(|c| sample_cidr_v6(c, per, &embed_v4))
+            .map(|c| sample_cidr_v6(c, per, MASQUE_CIDRS_V4))
             .collect();
-        // <<< AETHER-APP-PATCH scan-cidrs
         let max6 = cidr6.iter().map(|v| v.len()).max().unwrap_or(0);
         for i in 0..max6 {
             for hosts in &cidr6 {
@@ -922,75 +645,6 @@ fn sample_cidr_v6(cidr: &str, n: usize, v4_cidrs: &[&str]) -> Vec<Ipv6Addr> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // >>> AETHER-APP-PATCH scan-cidrs — آزمون‌های «بازهٔ آدرس»
-    #[test]
-    fn a_pinned_range_list_keeps_what_is_valid_and_drops_what_is_not() {
-        let parsed = parse_pinned("162.159.192.0/24, 188.114.98.7 ;2606:4700:d0::/64").unwrap();
-        assert_eq!(
-            parsed,
-            vec!["162.159.192.0/24", "188.114.98.7/32", "2606:4700:d0::/64"],
-            "یک آدرس تنها باید بازهٔ یک‌میزبانه شود و ترتیب کاربر حفظ بماند"
-        );
-
-        // بازهٔ ناممکن روی v4: parse_cidr_v4 عدد را می‌پذیرد و بعد بی‌صدا به یک
-        // آدرس فرومی‌پاشد، پس اینجا باید رد شود.
-        assert!(parse_pinned("10.0.0.0/64").is_none());
-        assert!(parse_pinned("not-an-ip, ,, /24").is_none());
-        assert_eq!(
-            parse_pinned("1.1.1.0/24,1.1.1.0/24").unwrap(),
-            vec!["1.1.1.0/24"]
-        );
-    }
-
-    #[test]
-    fn a_pinned_range_replaces_the_built_in_ranges_and_trims_the_seeds() {
-        // متغیر مخصوصِ همین آزمون تا با آزمون‌های دیگر (و AETHER_SCAN_CIDRS) قاطی نشود.
-        std::env::set_var(
-            "AETHER_TEST_PIN_CIDRS",
-            "188.114.98.0/24, 2606:4700:d0::/64",
-        );
-
-        let v4 = pinned_cidrs_v4("AETHER_TEST_PIN_CIDRS").unwrap();
-        assert_eq!(v4, vec!["188.114.98.0/24"]);
-        let v6 = pinned_cidrs_v6("AETHER_TEST_PIN_CIDRS").unwrap();
-        assert_eq!(v6, vec!["2606:4700:d0::/64"]);
-
-        // دانهٔ داخل بازه می‌ماند، دانهٔ بیرون می‌رود.
-        let kept = seeds_within(
-            &["188.114.98.1", "162.159.192.1", "2606:4700:d0::a29f:c602"],
-            "AETHER_TEST_PIN_CIDRS",
-        );
-        assert_eq!(kept, vec!["188.114.98.1", "2606:4700:d0::a29f:c602"]);
-
-        // بی هیچ پینی، دانه‌ها دست‌نخورده‌اند.
-        assert_eq!(
-            seeds_within(MASQUE_SEEDS, "AETHER_TEST_PIN_NOTHING_SET"),
-            MASQUE_SEEDS.to_vec()
-        );
-    }
-
-    #[test]
-    fn range_membership_is_computed_on_the_prefix_not_on_the_text() {
-        assert!(cidr_v4_contains(
-            "162.159.192.0/24",
-            "162.159.192.77".parse().unwrap()
-        ));
-        assert!(!cidr_v4_contains(
-            "162.159.192.0/24",
-            "162.159.193.1".parse().unwrap()
-        ));
-        assert!(cidr_v4_contains("0.0.0.0/0", "8.8.8.8".parse().unwrap()));
-        assert!(cidr_v6_contains(
-            "2606:4700:d0::/48",
-            "2606:4700:d0::a29f:c602".parse().unwrap()
-        ));
-        assert!(!cidr_v6_contains(
-            "2606:4700:d0::/48",
-            "2606:4700:100::1".parse().unwrap()
-        ));
-    }
-    // <<< AETHER-APP-PATCH scan-cidrs
 
     #[test]
     fn the_documented_zero_trust_masque_ingress_range_is_scanned() {
@@ -1292,5 +946,43 @@ mod tests {
         for seed in MASQUE_SEEDS_V6 {
             assert!(seed.parse::<Ipv6Addr>().is_ok(), "{seed}");
         }
+    }
+
+    #[tokio::test]
+    async fn the_ironclad_check_offers_the_ech_key_of_its_scan() {
+        let _setting = crate::upstream::hold_setting().await;
+        // The check builds its TLS with the fingerprint the options give.
+        let _options = crate::tls::hold_options().await;
+        let identity = crate::account::handshake_identity();
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = peer.local_addr().unwrap();
+        let probe = |ech: Option<Vec<u8>>| MasqueProbe {
+            sni: crate::consts::CONNECT_SNI.to_string(),
+            authority: quic::default_authority().to_string(),
+            path: quic::default_path().to_string(),
+            cert_pem: Arc::from(identity.cert_pem.clone()),
+            key_pem: Arc::from(identity.key_pem.clone()),
+            ech_config_list: ech.map(Arc::from),
+            noize: crate::noize::from_profile("off"),
+            ports: vec![address.port()],
+            ip: IpScan::V4,
+            local_ipv4: Ipv4Addr::new(172, 16, 0, 2),
+        };
+        let timeout = Duration::from_secs(5);
+
+        // Given a key BoringSSL offers nothing from (its one config is of another version), the
+        // check sends no ClientHello; the version bait may go out before it.
+        let unusable = probe(Some(vec![0, 6, 0xfe, 0x0c, 0, 2, 0, 0]));
+        let checked = verify_one(&unusable, address.ip(), address.port(), timeout, true).await;
+        assert!(checked.is_none());
+        assert!(!quic::hears_a_client_hello(&peer, Duration::from_millis(300)).await);
+
+        // Without a key, the same check does send one, with the server name in the clear.
+        let plain = probe(None);
+        let check = tokio::spawn(async move {
+            verify_one(&plain, address.ip(), address.port(), timeout, true).await
+        });
+        assert!(quic::hears_a_client_hello(&peer, Duration::from_secs(4)).await);
+        check.abort();
     }
 }

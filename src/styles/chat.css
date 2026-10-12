@@ -248,3 +248,32 @@
   cursor: pointer;
 }
 .aibubble__ask:hover { color: #d4ccff; text-decoration: underline; }
+
+/* ۱.۴.۰-r4 — پاسخِ Markdownِ مدل (src/ui/markdown.js). فاصله‌ها با بلوک‌ها
+   ساخته می‌شوند، پس pre-wrapِ حباب اینجا خاموش است. */
+.chat__text.md { white-space: normal; }
+.md__p { margin: 0 0 .55em; }
+.md__p:last-child, .md__list:last-child, .md__pre:last-child { margin-bottom: 0; }
+.md__h { font-weight: 700; margin: .6em 0 .3em; }
+.md__h:first-child { margin-top: 0; }
+.md__list { margin: 0 0 .55em; padding-inline-start: 1.4em; }
+.md__list li { margin: .15em 0; }
+.md__li--nested { margin-inline-start: 1.2em; }
+.md__code {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: .92em;
+  padding: 0 .3em;
+  border-radius: 4px;
+  background: rgba(127, 127, 127, .16);
+  unicode-bidi: isolate;
+}
+.md__pre {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: .88em;
+  white-space: pre-wrap;
+  margin: 0 0 .55em;
+  padding: .5em .7em;
+  border-radius: 6px;
+  background: rgba(127, 127, 127, .14);
+  text-align: left;
+}

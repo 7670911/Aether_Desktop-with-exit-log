@@ -19,9 +19,13 @@
 
 import { app, onChange, refreshTab, emit, STATE_LABEL } from '../main.js'
 import { renderAdvanced } from './advanced.js'
-import { aiHintButton } from '../ai.js'
+import { aiHintButton, refreshAi } from '../ai.js'
 import { t, getLang } from '../i18n.js'
 import { invoke } from '@tauri-apps/api/core'
+// AETHER-APP-PATCH custom-configs
+import { renderCustomConfigs, customConfigsValue, refreshCustomConfigs } from './customconfigs.js'
+// AETHER-APP-PATCH whats-new
+import { renderAnnouncements, MEGAPHONE } from './announcements.js'
 
 const CHEVRON =
   '<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 5l7 7-7 7"/></svg>'
@@ -37,6 +41,7 @@ const ICON = {
   badge: '<svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><path d="M12 3l2.4 1.7 2.9-.2.9 2.8 2.3 1.8-1.1 2.7 1.1 2.7-2.3 1.8-.9 2.8-2.9-.2L12 21l-2.4-1.7-2.9.2-.9-2.8L3.5 15l1.1-2.7L3.5 9.6l2.3-1.8.9-2.8 2.9.2z"/></svg>',
   apps: '<svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="6.5" height="6.5" rx="1.6"/><rect x="13.5" y="4" width="6.5" height="6.5" rx="1.6"/><rect x="4" y="13.5" width="6.5" height="6.5" rx="1.6"/><rect x="13.5" y="13.5" width="6.5" height="6.5" rx="1.6"/></svg>',
   globe: '<svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.4 2.3 2.4 14.7 0 17M12 3.5c-2.4 2.3-2.4 14.7 0 17"/></svg>',
+  custom: '<svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M8 7h-2a3 3 0 0 0 0 6h2"/><path d="M16 7h2a3 3 0 0 1 0 6h-2"/><path d="M9 10h6"/><path d="M12 15v5M9.5 17.5h5"/></svg>',
   reset: '<svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M4 12a8 8 0 1 1 2.6 5.9"/><path d="M4 5.5V12h6"/></svg>',
 }
 
@@ -92,6 +97,21 @@ const GROUPS = [
       },
     ],
   },
+  // >>> AETHER-APP-PATCH custom-configs (mobile 1.5.0 `CustomConfigsPage`)
+  // زیرصفحهٔ خودش را دارد (`render`)، نه بخش‌های advanced.js: کانفیگ‌ها عضوِ
+  // پروفایل نیستند و در انبارِ مهرشدهٔ جداگانه می‌مانند.
+  {
+    title: 'Custom configs',
+    rows: [
+      {
+        id: 'custom', icon: ICON.custom, sections: [], render: () => renderCustomConfigs(),
+        title: 'Custom configs',
+        subtitle: 'Your own VLESS, VMess, Trojan, Shadowsocks, SOCKS, WireGuard or npvt server, alone or chained',
+        value: () => customConfigsValue(),
+      },
+    ],
+  },
+  // <<< AETHER-APP-PATCH custom-configs
   {
     title: 'Connection safety',
     rows: [
@@ -124,6 +144,16 @@ const GROUPS = [
         subtitle: 'Interface language',
         value: () => (getLang() === 'fa' ? 'فارسی' : 'English'),
       },
+      // >>> AETHER-APP-PATCH whats-new (mobile 1.5.0 `AnnouncementsPage`)
+      // زیرصفحهٔ خودش را دارد (`render`): بایگانیِ پیام‌ها عضوِ پروفایل نیست.
+      {
+        id: 'announcements', icon: MEGAPHONE, sections: [], render: () => renderAnnouncements(),
+        controlless: true, // فقط خواندنی؛ tests/settings-smoke.mjs کنترل نمی‌خواهد
+        title: 'Messages & announcements',
+        subtitle: "What's new in this version and the connection guide, any time",
+        value: () => '',
+      },
+      // <<< AETHER-APP-PATCH whats-new
     ],
   },
 ]
@@ -214,6 +244,7 @@ function resetRow() {
     // بازنشانی برگشت‌ناپذیر است و در a2 هم دیالوگ تأیید دارد.
     if (!window.confirm(t('Reset every setting to its default?'))) return
     app.profile = await invoke('reset_profile')
+    refreshAi() // ai-gate-follows-tunnel: بک‌اند پیش‌فرض ممکن است دروازه را عوض کند
     refreshTab('advanced')
   }
   el.addEventListener('click', run)
@@ -292,7 +323,7 @@ function subPage(row, back) {
   page.appendChild(bar)
   page.appendChild(noticeBar())
 
-  const panel = renderAdvanced(row.sections)
+  const panel = row.render ? row.render() : renderAdvanced(row.sections)
   decorateFields(panel)
   page.appendChild(panel)
   return page
@@ -355,6 +386,9 @@ export function renderSettings() {
   danger.className = 'sethub__card sethub__card--danger'
   danger.appendChild(resetRow())
   hub.appendChild(danger)
+
+  // AETHER-APP-PATCH custom-configs: مقدارِ ردیفِ هاب از انبارِ کانفیگ‌ها.
+  refreshCustomConfigs()
 
   const reopen = OPEN ? ROWS.find((r) => r.id === OPEN) : null
   if (reopen) show(subPage(reopen, goHub))

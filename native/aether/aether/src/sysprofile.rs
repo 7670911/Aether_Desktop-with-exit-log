@@ -13,23 +13,7 @@ pub struct Tuning {
     pub cpus: usize,
     pub mem_mb: Option<u64>,
     pub scan_concurrency_cap: usize,
-    // >>> AETHER-APP-PATCH udp-socket-buffer-split
-    /// `SO_RCVBUF` هر سوکت دیتاگرامِ مسیر داده.
-    ///
-    /// بافر دریافت برای هیچ‌کس هزینهٔ تأخیر ندارد: پرشدنش یعنی بسته‌های
-    /// رسیده‌ای که هنوز خوانده نشده‌اند، و سرریزش را طرف مقابل به‌صورت گم‌شدن
-    /// بسته می‌بیند و پنجره‌اش را می‌بندد — همان چیزی که کاربر «دانلود کند»
-    /// می‌خواندش.
-    pub udp_socket_rcv_buf: usize,
-    /// `SO_SNDBUF` هر سوکت دیتاگرامِ مسیر داده.
-    ///
-    /// عمداً خیلی کوچک‌تر از سمت دریافت، و به دلیل معکوس: این آخرین صف بین
-    /// کنترل‌کنندهٔ ازدحام و کارت شبکه است و `send()` روی سوکت دیتاگرام فقط
-    /// وقتی این بافر پر باشد فشار برمی‌گرداند. اندازه‌اش را با بودجهٔ تأخیر
-    /// بگیر، نه با حجم RAM: بافر ارسالی که هرگز پر نشود، هر throttle بالای
-    /// خودش را بی‌صدا خاموش می‌کند.
-    pub udp_socket_snd_buf: usize,
-    // <<< AETHER-APP-PATCH udp-socket-buffer-split
+    pub udp_socket_buf: usize,
     pub netstack_tcp_rx_buf: usize,
     pub netstack_tcp_tx_buf: usize,
     pub netstack_udp_buf: usize,
@@ -178,25 +162,11 @@ fn build_tuning() -> Tuning {
     let mem_mb = total_mem_mb();
     let tier = detect_tier(cpus, mem_mb);
 
-    // >>> AETHER-APP-PATCH udp-socket-buffer-split
-    let (
-        scan_concurrency_cap,
-        udp_socket_rcv_buf,
-        udp_socket_snd_buf,
-        netstack_udp_buf,
-        channel_capacity,
-    ) = match tier {
-        Tier::Low => (4usize, 512 * 1024, 64 * 1024, 32 * 1024, 128usize),
-        Tier::Medium => (10usize, 2 * 1024 * 1024, 192 * 1024, 64 * 1024, 512usize),
-        Tier::High => (
-            usize::MAX,
-            7 * 1024 * 1024,
-            384 * 1024,
-            128 * 1024,
-            1024usize,
-        ),
+    let (scan_concurrency_cap, udp_socket_buf, netstack_udp_buf, channel_capacity) = match tier {
+        Tier::Low => (4usize, 256 * 1024, 32 * 1024, 128usize),
+        Tier::Medium => (10usize, 2 * 1024 * 1024, 64 * 1024, 512usize),
+        Tier::High => (usize::MAX, 7 * 1024 * 1024, 128 * 1024, 1024usize),
     };
-    // <<< AETHER-APP-PATCH udp-socket-buffer-split
 
     // smoltcp advertises whatever room is left in a socket's receive buffer as
     // that connection's TCP window, so this buffer is the second ceiling on a
@@ -230,10 +200,7 @@ fn build_tuning() -> Tuning {
         cpus,
         mem_mb,
         scan_concurrency_cap,
-        // >>> AETHER-APP-PATCH udp-socket-buffer-split
-        udp_socket_rcv_buf,
-        udp_socket_snd_buf,
-        // <<< AETHER-APP-PATCH udp-socket-buffer-split
+        udp_socket_buf,
         netstack_tcp_rx_buf,
         netstack_tcp_tx_buf,
         netstack_udp_buf,
@@ -259,15 +226,12 @@ pub fn log_summary() {
         t.scan_concurrency_cap.to_string()
     };
     log::info!(
-        "[*] performance profile: {:?} (cpus={} mem={}); scan concurrency cap={}, udp socket rcv/snd={}KB/{}KB, netstack tcp buffers={}KB rx/{}KB tx, netstack udp buffer={}KB, channel capacity={}, h2 windows={}KB/{}KB",
+        "[*] performance profile: {:?} (cpus={} mem={}); scan concurrency cap={}, udp socket buffer={}KB, netstack tcp buffers={}KB rx/{}KB tx, netstack udp buffer={}KB, channel capacity={}, h2 windows={}KB/{}KB",
         t.tier,
         t.cpus,
         mem,
         cap,
-        // >>> AETHER-APP-PATCH udp-socket-buffer-split
-        t.udp_socket_rcv_buf / 1024,
-        t.udp_socket_snd_buf / 1024,
-        // <<< AETHER-APP-PATCH udp-socket-buffer-split
+        t.udp_socket_buf / 1024,
         t.netstack_tcp_rx_buf / 1024,
         t.netstack_tcp_tx_buf / 1024,
         t.netstack_udp_buf / 1024,
@@ -360,15 +324,9 @@ pub fn cap_concurrency(requested: usize) -> usize {
     requested.min(tuning().scan_concurrency_cap)
 }
 
-// >>> AETHER-APP-PATCH udp-socket-buffer-split
-pub fn udp_socket_rcv_buf_bytes() -> usize {
-    tuning().udp_socket_rcv_buf
+pub fn udp_socket_buf_bytes() -> usize {
+    tuning().udp_socket_buf
 }
-
-pub fn udp_socket_snd_buf_bytes() -> usize {
-    tuning().udp_socket_snd_buf
-}
-// <<< AETHER-APP-PATCH udp-socket-buffer-split
 
 /// The receive buffer of a netstack TCP socket, which is also the window that
 /// connection advertises, and so the ceiling on what it can pull down.

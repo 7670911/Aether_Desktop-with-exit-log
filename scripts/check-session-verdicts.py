@@ -66,15 +66,18 @@ def main() -> int:
                 "Bedingung gilt sie auch ohne jeden Schutz (fail-open)"
             )
 
-    # 3) Backend war nicht mehr Aether: die Migration muss es einmal zurückholen.
+    # 3) Fresh installs default to Aether, but a saved backend must survive
+    #    restarts and older-settings migrations (regression reported in 1.3.0).
     profile = code("profile.rs")
-    m = re.search(r"pub const SETTINGS_REV: u32 = (\d+);", profile)
-    if not m:
-        fehler.append("SETTINGS_REV ist nicht zu finden")
-    elif int(m.group(1)) < 4:
-        fehler.append(f"SETTINGS_REV ist {m.group(1)}; ab 4 holt die Migration Aether zurück")
-    if "profile.backend = TransportBackend::Aether" not in code("store.rs"):
-        fehler.append("die Migration setzt das Backend nicht auf Aether zurück")
+    store = code("store.rs")
+    if 'backend: TransportBackend::Aether' not in profile:
+        fehler.append("ein neues Profil beginnt nicht mehr mit Aether")
+    if 'changed = migrate(&mut profile)' not in store:
+        fehler.append("die Migration fehlt beim Laden des Profils")
+    if re.search(r"profile\.backend\s*=\s*TransportBackend::Aether", store):
+        fehler.append("gespeicherter Backend-Wunsch wird beim Laden wieder überschrieben")
+    if 'load_preserves_saved_backend_across_launches' not in store or 'migration_preserves_legacy_backend' not in store:
+        fehler.append("Regressionstests für gespeicherte Backends fehlen")
 
     # 4) 1,96 s Trennen: die Registry-Wiederherstellung darf nicht seriell sein.
     if "fn restore_policies(" not in guard or "fn reg_spawn(" not in guard:
@@ -99,7 +102,7 @@ def main() -> int:
 
     print(
         "✓ Sitzungslogik: Anlauf zählt als lebendig, Leak-Urteil kennt die Sperr-Reichweite "
-        "(fail-closed ohne Schutz), Backend-Migration ≥ rev 4, Policy-Rückgabe parallel, "
+        "(fail-closed ohne Schutz), gespeichertes Backend bleibt erhalten, Policy-Rückgabe parallel, "
         "Fingerprint bei Tor allein übersprungen"
     )
     return 0

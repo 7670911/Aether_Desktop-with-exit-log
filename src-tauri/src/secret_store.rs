@@ -102,6 +102,19 @@ impl SecretStore {
     }
 }
 
+// >>> AETHER-APP-PATCH custom-configs-sealed (1.3.0)
+/// همان مهرِ DPAPI برای انبارِ کانفیگ‌های سفارشی (`custom/store.rs`):
+/// اطلاعاتِ ورودِ سرورها هرگز به‌صورتِ متنِ ساده روی دیسک نمی‌نشینند.
+pub(crate) fn seal(plain: &[u8]) -> Result<Vec<u8>> {
+    protect(plain)
+}
+
+/// بازکردنِ مهرِ [`seal`].
+pub(crate) fn unseal(sealed: &[u8]) -> Result<Vec<u8>> {
+    unprotect(sealed)
+}
+// <<< AETHER-APP-PATCH custom-configs-sealed
+
 // ---------------------------------------------------------------- ویندوز: DPAPI
 
 #[cfg(windows)]

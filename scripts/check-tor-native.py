@@ -83,10 +83,10 @@ def main() -> int:
         fehler.append("carrier_alive fehlt; eine Sitzung ohne Engine gilt sofort als tot")
     else:
         rufe = state.count("self.carrier_alive()")
-        if rufe < 4:
+        if rufe < 3:
             fehler.append(
-                f"nur {rufe} von 4 Lebendigkeits-Prüfungen fragen den Carrier "
-                "(Aufbau, Selbsttest, Wächter, poll_chain)"
+                f"nur {rufe} von 3 Lebendigkeits-Prüfungen fragen den Carrier "
+                "(Aufbau, Selbsttest, Wächter; Psiphon-Ketten gehören jetzt zum Kern)"
             )
         # Und der Carrier sind BEIDE Hälften: "nie gestartet" ist nicht "tot".
         # Genau diese Verwechslung riss im Feldlog vom 17.09. die
@@ -97,18 +97,14 @@ def main() -> int:
                 "(engine.was_started fehlt)"
             )
 
-    # 2b) und poll_chain fragt nicht mehr die Engine nach Stufe 1.
-    #
-    # In `Tor → Psiphon` IST Stufe 1 das tor.exe; `engine.is_alive()` sagt dort
-    # immer "tot". Feldlog 17.09.: "tor is ready on 127.0.0.1:1819" →
-    # "Starting the Psiphon stage…" → "Stage 1 (the engine) exited…", alles in
-    # derselben Sekunde.
-    chain = state.find("fn poll_chain(")
-    if chain >= 0 and "self.engine.is_alive()" in state[chain:chain + 4000]:
-        fehler.append(
-            "poll_chain fragt die Engine nach Stufe 1; in Tor → Psiphon ist Stufe 1 "
-            "aber tor.exe und die Sitzung stirbt sofort"
-        )
+    # 2b) Tor → Psiphon läuft jetzt mit --tor-only --psiphon IM Kern. Daher
+    # gehört die Engine zur Kette, und poll_chain darf ihr Ende erkennen.
+    # Der native Tor-Pfad bleibt für Tor alleine / Tor → Aether unverändert.
+    profile = code(ROOT / "src-tauri/src/profile.rs")
+    if 'args.push("--psiphon".into())' not in profile or '"--tor-only"' not in profile:
+        fehler.append("Tor → Psiphon übergibt Tor/Psiphon nicht an den Kern")
+    if "TransportBackend::TorPsiphon" not in block(state, "fn start_native_tor("):
+        fehler.append("Tor → Psiphon könnte tor.exe und Kern-Tor zugleich starten")
 
     # 3) der Port der App — für "Tor allein", das die Sitzung ALLEIN trägt.
     #    Die Kettenmodi binden absichtlich 1820 und speisen die Engine damit.
@@ -298,6 +294,21 @@ def main() -> int:
         if "circuit_hunt_until" not in rot:
             fehler.append("der Kreiswechsel ist nicht auf das Fenster nach dem Verbinden begrenzt")
 
+    # 14) AETHER-APP-FIX tor-auto-like-mobile (Logs vom 8. Oktober): `Auto` heißt wie
+    # auf dem Handy „direkt UND Brücken“, nicht „nur Brücken“.
+    if "TorBridges::Auto => crate::tor_native::BridgeMode::Auto" not in state:
+        fehler.append("TorBridges::Auto wird nicht auf BridgeMode::Auto abgebildet (nie direkt versucht)")
+    if "fn race(" not in modul or "return self.race(launch);" not in modul:
+        fehler.append("BridgeMode::Auto startet kein Rennen direkt gegen Brücken")
+    if "SETCONF SocksPort=" not in modul:
+        fehler.append("der Gewinner des Rennens zieht nicht auf den festen SOCKS-Port um")
+    # 15) Kein CircuitStreamTimeout 30 mehr: eine schlechte Exit hielt jede Probe 30 s fest.
+    if re.search(r'push_str\("CircuitStreamTimeout', modul):
+        fehler.append("CircuitStreamTimeout steht wieder in der torrc (Scan durch Tor verhungert)")
+    # 16) Der Exit-Beweis läuft parallel auf isolierten Kreisen.
+    if "PROOF_PARALLEL_ATTEMPT" not in modul or "[0x05, 0x01, 0x02]" not in modul:
+        fehler.append("der Exit-Beweis läuft nicht parallel auf isolierten Kreisen")
+
     if fehler:
         print("✗ nativer Tor-Carrier:")
         for f in fehler:
@@ -307,8 +318,8 @@ def main() -> int:
     print(
         "✓ Tor: offizielles tor.exe in allen drei Formen (allein auf 1819, vor der "
         "Engine mit Upstream-SOCKS, hinter dem Tunnel ohne Brücken), "
-        "Carrier-Lebendigkeit an 4 Stellen und beide Hälften, poll_chain fragt nicht "
-        "die Engine, Stufe-1-Sonde fragt nach Namen, Land aus der lokalen geoip-Datei, "
+        "Carrier-Lebendigkeit an 3 Stellen und beide Hälften; Tor → Psiphon "
+        "wird vom Kern verwaltet. Stufe-1-Sonde fragt nach Namen, Land aus der lokalen geoip-Datei, "
         "schlechter Kreis wird begrenzt gewechselt, Abbau stoppt tor, engine/tor als "
         "Transportpfad, geduldiger Control-Port mit Log als zweitem Pfad, Budget aus "
         "der App, Wellen obfs4 → snowflake nur mit vorhandener Binärdatei"

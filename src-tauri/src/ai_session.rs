@@ -22,12 +22,13 @@
 use crate::ai_client::{self, AiError, AiErrorKind, GeminiModel, GeminiTurn};
 use crate::ai_gate::{self, AiGate};
 use crate::ai_model_policy as policy;
-use crate::ai_patch::{self, PatchOutcome};
+use crate::ai_patch::{self, PatchOutcome, Problem, Refusal, Scope};
 use crate::ai_prompts::{self, Lang};
 use crate::ai_redaction;
 use crate::log::DiagnosticsLog;
 use crate::profile::{ConnectionProfile, TransportBackend};
 use crate::secret_store::{SecretStore, GEMINI_KEY};
+use crate::state::ConnectionState;
 use crate::store::PrefsStore;
 use serde::Serialize;
 use serde_json::Value;
@@ -157,6 +158,8 @@ pub struct AdvisorResult {
 pub struct AiSnapshot {
     pub gate: AiGate,
     pub gate_code: String,
+    /// Current tunnel state; independent of key/model and exit-mode policy.
+    pub tunnel_connected: bool,
     /// کلید ذخیره شده است یا نه. **هرگز خودِ کلید.**
     pub has_key: bool,
     /// چهار نویسهٔ آخرِ کلید، برای اینکه کاربر بفهمد کدام کلید ذخیره است.
@@ -302,8 +305,12 @@ pub struct AiSession {
 /// پر می‌کند تا جایی که پاسخ‌ها بی‌صدا بریده شوند. دنبالهٔ ۱۶ نوبت، زمینهٔ کافی
 /// برای «همان را دوباره ولی کوتاه‌تر بگو» است.
 const MAX_HISTORY_TURNS: usize = 16;
-const CHAT_TEMPERATURE: f64 = 0.7;
+/// ۱.۴.۰ (پورت از موبایل): ۰٫۷ → ۰٫۳۵. دقت مهم‌تر از تنوع است: مدلی که
+/// «خلاقانه» یک تنظیمِ ناموجود یا یک مقدارِ تکراری پیشنهاد کند، اعتماد را می‌سوزاند.
+const CHAT_TEMPERATURE: f64 = 0.35;
 const CHAT_MAX_TOKENS: u32 = 1_400;
+/// بودجهٔ دورِ بازنویسی: پاسخِ کامل دوباره نوشته می‌شود، پس کمی جای بیشتر.
+const CHAT_REVISION_MAX_TOKENS: u32 = 2_000;
 const EXPLAIN_TEMPERATURE: f64 = 0.3;
 const EXPLAIN_MAX_TOKENS: u32 = 600;
 /// مشاور با دمای صفر: این مسیر باید تصمیمِ *یکسان* را برای همان لاگ بگیرد.
@@ -335,7 +342,8 @@ impl AiSession {
         let selected = if policy::is_allowed(&selected) {
             policy::normalise(&selected)
         } else {
-            allowed_ids.first().cloned().unwrap_or_default()
+            // ۱.۴.۰-r5: Flash-Lite پیش‌فرض است، نه اولین مدلِ فهرست.
+            policy::pick_default_id(&allowed_ids).unwrap_or_default()
         };
         Self {
             inner: Mutex::new(Inner {
@@ -366,6 +374,7 @@ impl AiSession {
         AiSnapshot {
             gate,
             gate_code: gate.code().to_string(),
+            tunnel_connected: state == ConnectionState::Connected,
             has_key: !key.is_empty(),
             key_hint: key
                 .chars()
@@ -623,11 +632,12 @@ impl AiSession {
     pub fn send_chat(
         &self,
         profile: &ConnectionProfile,
+        status: ConnectionState,
         lang_code: &str,
         text: &str,
     ) -> Result<(), String> {
         let text = self.append_user_message(text)?;
-        self.dispatch(profile, lang_code, &text)
+        self.dispatch(profile, status, lang_code, &text)
     }
 
     /// همان پرسش را **بدون** افزودنِ حبابِ تازه برای آن می‌فرستد — رجوع به
@@ -635,10 +645,11 @@ impl AiSession {
     pub fn ask_existing(
         &self,
         profile: &ConnectionProfile,
+        status: ConnectionState,
         lang_code: &str,
         prompt: &str,
     ) -> Result<(), String> {
-        self.dispatch(profile, lang_code, prompt)
+        self.dispatch(profile, status, lang_code, prompt)
     }
 
     /// همان پرسش را **بدون** افزودنِ حبابِ تازه برای آن می‌فرستد.
@@ -650,6 +661,7 @@ impl AiSession {
     fn dispatch(
         &self,
         profile: &ConnectionProfile,
+        status: ConnectionState,
         lang_code: &str,
         prompt: &str,
     ) -> Result<(), String> {
@@ -684,11 +696,18 @@ impl AiSession {
         };
         let lang = Lang::from_code(lang_code);
         let port = ai_gate::socks_port_for(profile);
+        // ۱.۴.۰-r4: snapshotِ حاشیه‌دار + نامِ مدل + وضعیتِ زندهٔ اتصال.
+        let system = ai_prompts::chat_system(
+            lang,
+            &ai_patch::chat_snapshot(profile),
+            &model,
+            status_for_prompt(status),
+        );
         let result = ai_client::generate(
             &key,
             port,
             &model,
-            &ai_prompts::chat_system(lang, &ai_patch::chat_snapshot(profile)),
+            &system,
             &history,
             CHAT_TEMPERATURE,
             CHAT_MAX_TOKENS,
@@ -698,7 +717,67 @@ impl AiSession {
             Ok(reply) => {
                 // بلوکِ پیشنهاد از متن جدا و **پیش از رسم حباب** اعتبارسنجی
                 // می‌شود؛ رجوع به `ChatMessage::changes`.
-                let (visible, changes) = self.vet_changes(profile, &reply);
+                let (mut visible, mut changes, refusals) =
+                    self.vet_changes_verified(profile, &reply);
+
+                // ۱.۴.۰-r4: بررسی، و بعد یک بار خوداصلاحیِ مدل (پورت از
+                // `AiSession.kt`). حذفِ دکمهٔ تکراری کافی نبود: متنِ بالای آن هنوز
+                // می‌گفت «MTU را ۱۲۸۰ کن» به کاربری که ۱۲۸۰ داشت. پس وقتی چیزی از
+                // پیشنهاد رد شود، مدل واقعیت‌های سنجیده را می‌گیرد و کلِ پاسخ را پیش
+                // از آنکه کاربر چیزی ببیند بازنویسی می‌کند. پاسخِ بازنویسی‌شده از همان
+                // فیلتر رد می‌شود؛ دورِ دومی وجود ندارد.
+                if let Some(feedback) =
+                    ai_patch::verification_feedback(profile, &refusals, Scope::Chat)
+                {
+                    let stopped = self.inner.lock().unwrap().epoch != epoch;
+                    if !stopped {
+                        DiagnosticsLog::i(
+                            "ai",
+                            &format!(
+                                "chat: {} proposal(s) failed verification; asking the model to revise",
+                                refusals.len()
+                            ),
+                        );
+                        let mut turns = history.clone();
+                        turns.push(GeminiTurn {
+                            from_user: false,
+                            text: reply.clone(),
+                        });
+                        turns.push(GeminiTurn {
+                            from_user: true,
+                            text: ai_prompts::chat_revision(&feedback),
+                        });
+                        match ai_client::generate(
+                            &key,
+                            port,
+                            &model,
+                            &system,
+                            &turns,
+                            CHAT_TEMPERATURE,
+                            CHAT_REVISION_MAX_TOKENS,
+                            false,
+                        ) {
+                            Ok(revised) => {
+                                let (v, c, _) = self.vet_changes_verified(profile, &revised);
+                                if !v.trim().is_empty() {
+                                    visible = v;
+                                    changes = c;
+                                }
+                            }
+                            Err(error) => DiagnosticsLog::w(
+                                "ai",
+                                &format!(
+                                    "chat: revision round failed ({:?}); showing the verified original",
+                                    error.kind
+                                ),
+                            ),
+                        }
+                    }
+                }
+                if visible.trim().is_empty() {
+                    // پاسخی که فقط بلوک بود: حباب خالی نمی‌ماند (همان `ifBlank` موبایل).
+                    visible = reply.trim().to_string();
+                }
                 let mut inner = self.inner.lock().unwrap();
                 inner.busy = false;
                 if inner.epoch != epoch {
@@ -805,11 +884,12 @@ impl AiSession {
     pub fn retry(
         &self,
         profile: &ConnectionProfile,
+        status: ConnectionState,
         lang_code: &str,
         message_id: u64,
     ) -> Result<(), String> {
         let prompt = self.take_failed_prompt(message_id)?;
-        self.dispatch(profile, lang_code, &prompt)
+        self.dispatch(profile, status, lang_code, &prompt)
     }
 
     /// یکی از پیام‌های خودِ کاربر را بازنویسی می‌کند و از همان نقطه دوباره می‌پرسد.
@@ -820,6 +900,7 @@ impl AiSession {
     pub fn edit_message(
         &self,
         profile: &ConnectionProfile,
+        status: ConnectionState,
         lang_code: &str,
         message_id: u64,
         new_text: &str,
@@ -847,7 +928,7 @@ impl AiSession {
             inner.messages[index].text = prompt.clone();
             inner.messages[index].edited = true;
         }
-        self.dispatch(profile, lang_code, &prompt)
+        self.dispatch(profile, status, lang_code, &prompt)
     }
 
     /// چند حباب را در یک رفت حذف می‌کند.
@@ -892,43 +973,83 @@ impl AiSession {
         profile: &ConnectionProfile,
         reply: &str,
     ) -> (String, Vec<ProposedChange>) {
+        let (visible, vetted, _) = self.vet_changes_verified(profile, reply);
+        (visible, vetted)
+    }
+
+    /// همان [`Self::vet_changes`]، به‌علاوهٔ فهرستِ ردشده‌ها برای بازخورد به مدل.
+    ///
+    /// ۱.۴.۰-r4: سه نوع رد که قبلاً بی‌صدا گم می‌شدند حالا ثبت می‌شوند — مقداری
+    /// که کاربر از قبل دارد، کلیدی که دو بار آمده، و (مثل قبل) کلید/مقدارِ
+    /// نامعتبر — تا [`ai_patch::verification_feedback`] بتواند به مدل بگوید.
+    /// تکراری بودن با پروفایلِ **اصلی** سنجیده می‌شود، نه با کپیِ در حالِ تغییر.
+    fn vet_changes_verified(
+        &self,
+        profile: &ConnectionProfile,
+        reply: &str,
+    ) -> (String, Vec<ProposedChange>, Vec<Refusal>) {
         let (visible, proposed) = ai_prompts::split_chat_reply(reply);
         if proposed.is_empty() {
-            return (visible, Vec::new());
+            return (visible, Vec::new(), Vec::new());
         }
         let mut trial = profile.clone();
         let mut vetted = Vec::new();
+        let mut refusals = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
         // کلیدبه‌کلید و نه یک‌کاسه: یک پیشنهادِ چهارتایی که یکی‌اش بد است، باید
         // سه دکمهٔ درست بدهد و نه هیچ.
         for change in proposed {
-            let patch = serde_json::json!({ change.key.clone(): change.value.clone() });
-            let before = ai_patch::read_key(&trial, &change.key);
+            let key = change.key.trim().to_string();
+            // یک پیشنهاد، یک مقدار برای هر کلید. مدلی که `mtu` را دو بار می‌آورد
+            // با خودش تناقض دارد؛ اعمالِ هر دو بی‌صدا آخری را نگه می‌داشت.
+            if seen.contains(&key) {
+                refusals.push(Refusal {
+                    key,
+                    proposed: change.value.clone(),
+                    problem: Problem::Duplicate,
+                });
+                continue;
+            }
+            seen.push(key.clone());
+            let patch = serde_json::json!({ key.clone(): change.value.clone() });
+            let before = ai_patch::read_key(&trial, &key);
             let outcome = ai_patch::apply_chat(&mut trial, &patch);
             match outcome.applied.first() {
-                Some((key, value)) => vetted.push(ProposedChange {
-                    key: key.clone(),
+                Some((applied_key, value)) => vetted.push(ProposedChange {
+                    key: applied_key.clone(),
                     // مقدارِ **نرمال‌شدهٔ** نگهبان و نه متنِ خامِ مدل: «on» در کارت
                     // باید همان چیزی باشد که واقعاً نوشته می‌شود.
                     value: value.clone(),
                     before,
                     why: change.why.clone(),
                 }),
-                None => DiagnosticsLog::i(
-                    "ai",
-                    &format!(
-                        "chat proposed \"{}\" = \"{}\" — not offered to the user: {}",
-                        change.key,
-                        change.value,
-                        outcome
+                None => {
+                    let refusal = if !outcome.redundant.is_empty() {
+                        Refusal {
+                            key: key.clone(),
+                            proposed: change.value.clone(),
+                            problem: Problem::AlreadySet,
+                        }
+                    } else {
+                        let reason = outcome
                             .rejected
                             .first()
-                            .map(|(_, reason)| reason.as_str())
-                            .unwrap_or("no change"),
-                    ),
-                ),
+                            .map(|(_, reason)| reason.clone())
+                            .unwrap_or_else(|| "no change".to_string());
+                        Refusal::from_rejection(&key, &change.value, &reason)
+                    };
+                    DiagnosticsLog::i(
+                        "ai",
+                        &format!(
+                            "chat proposed \"{}\" = \"{}\" — not offered to the user: {:?}",
+                            change.key, change.value, refusal.problem,
+                        ),
+                    );
+                    refusals.push(refusal);
+                }
             }
         }
-        (visible, vetted)
+        (visible, vetted, refusals)
     }
 
     /// تغییراتِ یک حباب را روی پروفایل می‌نشاند و پروفایلِ تازه را برمی‌گرداند.
@@ -1023,15 +1144,22 @@ impl AiSession {
         // `accessSecret`/`accessToken` است و مدل هرگز نباید یک اعتبارنامه ببیند.
         let settings_json = redacted_settings(profile);
 
+        // ۱.۴.۰-r4: snapshotِ حاشیه‌دار تا گام‌های GROUNDING چیزی برای مقایسه داشته باشند.
+        let user_text = ai_prompts::advisor_user(
+            &ai_patch::advisor_snapshot(profile),
+            &settings_json,
+            &digest,
+        );
+        let system = ai_prompts::advisor_system(Lang::from_code(lang_code));
         let turns = [GeminiTurn {
             from_user: true,
-            text: ai_prompts::advisor_user(&settings_json, &digest),
+            text: user_text.clone(),
         }];
         let reply = match ai_client::generate(
             &key,
             port,
             &model,
-            &ai_prompts::advisor_system(Lang::from_code(lang_code)),
+            &system,
             &turns,
             ADVISOR_TEMPERATURE,
             ADVISOR_MAX_TOKENS,
@@ -1045,38 +1173,79 @@ impl AiSession {
             }
         };
 
-        let Some(object) = ai_prompts::extract_json_object(&reply) else {
-            self.finish(Some(AiError {
-                message: "The advisor's answer was not in the expected form.".into(),
-                kind: AiErrorKind::Protocol,
-                retry_after_seconds: None,
-            }));
-            return Err("The advisor's answer was not in the expected form.".into());
-        };
-        let parsed: Value = match serde_json::from_str(&object) {
-            Ok(v) => v,
-            Err(_) => {
+        let (object, parsed) = match parse_advisor_reply(&reply) {
+            Ok(pair) => pair,
+            Err(message) => {
                 self.finish(Some(AiError {
-                    message: "The advisor's answer was not valid JSON.".into(),
+                    message: message.into(),
                     kind: AiErrorKind::Protocol,
                     retry_after_seconds: None,
                 }));
-                return Err("The advisor's answer was not valid JSON.".into());
+                return Err(message.into());
             }
         };
 
-        let reason = parsed
-            .get("reason")
-            .and_then(|r| r.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        let mut patched = profile.clone();
-        let outcome: PatchOutcome = match parsed.get("patch") {
-            Some(patch) => ai_patch::apply(&mut patched, patch),
-            // پچِ خالی پاسخِ **درست** است وقتی لاگ یک اتصال سالم را نشان می‌دهد.
-            None => PatchOutcome::default(),
-        };
+        let (mut reason, mut patched, mut outcome) = judge_advice(profile, &parsed);
+
+        // ۱.۴.۰-r4: همان دورِ «بررسی و بازنویسی» چت. پیشنهادی که مقدارِ فعلیِ
+        // کاربر را تکرار کند (یا مقدارِ نامعتبر بدهد) یک بار با مقادیرِ واقعی به
+        // مدل برمی‌گردد؛ پاسخِ اصلاح‌شده اگر خوانا بود جای اولی را می‌گیرد.
+        let refusals = advisor_refusals(&parsed, &outcome);
+        if let Some(feedback) = ai_patch::verification_feedback(profile, &refusals, Scope::Advisor)
+        {
+            DiagnosticsLog::i(
+                "ai",
+                &format!(
+                    "advisor: {} proposal(s) failed verification; re-asking",
+                    refusals.len()
+                ),
+            );
+            let revision_turns = [
+                GeminiTurn {
+                    from_user: true,
+                    text: user_text,
+                },
+                GeminiTurn {
+                    from_user: false,
+                    text: object,
+                },
+                GeminiTurn {
+                    from_user: true,
+                    text: ai_prompts::advisor_revision(&feedback),
+                },
+            ];
+            match ai_client::generate(
+                &key,
+                port,
+                &model,
+                &system,
+                &revision_turns,
+                ADVISOR_TEMPERATURE,
+                ADVISOR_MAX_TOKENS,
+                true,
+            ) {
+                Ok(revised) => match parse_advisor_reply(&revised) {
+                    Ok((_, reparsed)) => {
+                        let judged = judge_advice(profile, &reparsed);
+                        reason = judged.0;
+                        patched = judged.1;
+                        outcome = judged.2;
+                    }
+                    Err(_) => DiagnosticsLog::w(
+                        "ai",
+                        "advisor: revised answer was unreadable; keeping the verified original",
+                    ),
+                },
+                Err(error) => DiagnosticsLog::w(
+                    "ai",
+                    &format!(
+                        "advisor: revision round failed ({:?}); keeping the verified original",
+                        error.kind
+                    ),
+                ),
+            }
+        }
+
         let result = AdvisorResult {
             reason,
             applied: outcome.applied,
@@ -1102,6 +1271,76 @@ impl AiSession {
 ///
 /// روی نمایشِ JSONِ خودِ پروفایل کار می‌کند و یک ساختارِ دوم نمی‌سازد، به همان
 /// دلیلِ [`crate::ai_patch::apply`]: `serde` تنها مرجعِ نام‌ها بماند.
+/// وضعیتِ اتصال، به زبانی که مدل می‌فهمد (پورت از `statusForPrompt` موبایل).
+pub fn status_for_prompt(state: ConnectionState) -> &'static str {
+    match state {
+        ConnectionState::Connected => "connected",
+        ConnectionState::Reconnecting => "reconnecting",
+        ConnectionState::Verifying => "tunnel up, end-to-end self-test still running",
+        ConnectionState::StartingEngine | ConnectionState::Connecting => "connecting",
+        ConnectionState::Disconnecting => "disconnecting",
+        ConnectionState::Disconnected => "disconnected",
+        ConnectionState::Failed => "error",
+    }
+}
+
+/// پاسخِ مشاور را به `(متنِ JSON، مقدارِ پارس‌شده)` تبدیل می‌کند.
+fn parse_advisor_reply(reply: &str) -> Result<(String, Value), &'static str> {
+    let object = ai_prompts::extract_json_object(reply)
+        .ok_or("The advisor's answer was not in the expected form.")?;
+    let parsed: Value =
+        serde_json::from_str(&object).map_err(|_| "The advisor's answer was not valid JSON.")?;
+    Ok((object, parsed))
+}
+
+/// پچِ مشاور را روی یک کپی از پروفایل داوری می‌کند: `(reason، پروفایلِ نتیجه، نتیجه)`.
+fn judge_advice(
+    profile: &ConnectionProfile,
+    parsed: &Value,
+) -> (String, ConnectionProfile, PatchOutcome) {
+    let reason = parsed
+        .get("reason")
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let mut patched = profile.clone();
+    let outcome: PatchOutcome = match parsed.get("patch") {
+        Some(patch) => ai_patch::apply(&mut patched, patch),
+        // پچِ خالی پاسخِ **درست** است وقتی لاگ یک اتصال سالم را نشان می‌دهد.
+        None => PatchOutcome::default(),
+    };
+    (reason, patched, outcome)
+}
+
+/// ردشده‌ها و تکراری‌های یک پچِ مشاور، با مقداری که مدل خواسته بود.
+fn advisor_refusals(parsed: &Value, outcome: &PatchOutcome) -> Vec<Refusal> {
+    let proposed = |key: &str| -> String {
+        match parsed.get("patch").and_then(|p| p.get(key)) {
+            Some(Value::String(s)) => s.clone(),
+            Some(other) => other.to_string(),
+            None => String::new(),
+        }
+    };
+    let mut out: Vec<Refusal> = outcome
+        .redundant
+        .iter()
+        .map(|(key, _)| Refusal {
+            key: key.clone(),
+            proposed: proposed(key),
+            problem: Problem::AlreadySet,
+        })
+        .collect();
+    out.extend(
+        outcome
+            .rejected
+            .iter()
+            .filter(|(key, _)| !key.starts_with('<'))
+            .map(|(key, reason)| Refusal::from_rejection(key, &proposed(key), reason)),
+    );
+    out
+}
+
 fn redacted_settings(profile: &ConnectionProfile) -> String {
     let mut value = match serde_json::to_value(profile) {
         Ok(v) => v,
@@ -1114,6 +1353,29 @@ fn redacted_settings(profile: &ConnectionProfile) -> String {
         // فهرست فرآیندهای split هم می‌رود: نامِ برنامه‌های نصب‌شدهٔ کاربر برای
         // تنظیم ضد‌DPI بی‌ربط است و در همان حال یک نمای دقیق از این ماشین است.
         object.remove("splitApps");
+        // >>> AETHER-APP-PATCH security-audit-1.3.0 (S-03)
+        // Upstream URL may embed user:pass; Zero Trust identity, private bridge
+        // lines and routing lists identify the user. Presence only, never values.
+        for key in [
+            "upstream",
+            "team",
+            "accessEmail",
+            "accessId",
+            "torBridgeLines",
+            "routeDirect",
+            "routeBlock",
+            "manualPeer",
+        ] {
+            if let Some(v) = object.get_mut(key) {
+                let set = match v {
+                    serde_json::Value::String(s) => !s.trim().is_empty(),
+                    serde_json::Value::Array(a) => !a.is_empty(),
+                    _ => false,
+                };
+                *v = serde_json::Value::String(if set { "(set)".into() } else { "(none)".into() });
+            }
+        }
+        // <<< AETHER-APP-PATCH security-audit-1.3.0
     }
     serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string())
 }
@@ -1293,6 +1555,73 @@ mod tests {
         assert!(ai.changes_for(&profile, id).is_ok());
         ai.mark_applied(id);
         assert!(ai.changes_for(&profile, id).is_err());
+    }
+
+    #[test]
+    fn a_redundant_or_duplicate_proposal_is_refused_with_a_reason() {
+        let ai = session();
+        let profile = ConnectionProfile::default();
+        let reply = format!(
+            "Set the MTU.\n```{}\n{{\"changes\":[{{\"key\":\"mtu\",\"value\":\"{}\"}},\
+             {{\"key\":\"fragment\",\"value\":\"true\"}},{{\"key\":\"fragment\",\"value\":\"false\"}},\
+             {{\"key\":\"upstream\",\"value\":\"socks5://1.2.3.4:1\"}}]}}\n```",
+            ai_prompts::APPLY_FENCE,
+            crate::profile::DEFAULT_MTU
+        );
+        let (_, changes, refusals) = ai.vet_changes_verified(&profile, &reply);
+        assert_eq!(changes.len(), 1, "only the real change becomes a button");
+        assert_eq!(changes[0].key, "fragment");
+        let problems: Vec<_> = refusals
+            .iter()
+            .map(|r| (r.key.as_str(), r.problem.clone()))
+            .collect();
+        assert!(
+            problems.contains(&("mtu", Problem::AlreadySet)),
+            "{problems:?}"
+        );
+        assert!(
+            problems.contains(&("fragment", Problem::Duplicate)),
+            "{problems:?}"
+        );
+        assert!(
+            problems.contains(&("upstream", Problem::NotChangeable)),
+            "{problems:?}"
+        );
+        let feedback = ai_patch::verification_feedback(&profile, &refusals, Scope::Chat).unwrap();
+        assert!(feedback.contains("REDUNDANT"), "{feedback}");
+    }
+
+    #[test]
+    fn the_advisor_reports_a_value_the_user_already_has() {
+        let profile = ConnectionProfile::default();
+        let parsed = serde_json::json!({
+            "reason": "x",
+            "patch": { "mtu": crate::profile::DEFAULT_MTU, "fragment": true, "leakGuard": false }
+        });
+        let (reason, patched, outcome) = judge_advice(&profile, &parsed);
+        assert_eq!(reason, "x");
+        assert!(patched.fragment);
+        let refusals = advisor_refusals(&parsed, &outcome);
+        assert!(refusals
+            .iter()
+            .any(|r| r.key == "mtu" && r.problem == Problem::AlreadySet));
+        assert!(refusals
+            .iter()
+            .any(|r| r.key == "leakGuard" && r.problem == Problem::NotChangeable));
+        assert!(!refusals.iter().any(|r| r.key == "fragment"));
+    }
+
+    #[test]
+    fn the_status_line_covers_every_state() {
+        assert_eq!(status_for_prompt(ConnectionState::Connected), "connected");
+        assert_eq!(
+            status_for_prompt(ConnectionState::Disconnected),
+            "disconnected"
+        );
+        assert_eq!(
+            status_for_prompt(ConnectionState::StartingEngine),
+            "connecting"
+        );
     }
 
     #[test]

@@ -105,6 +105,64 @@ pub fn reset() -> u64 {
     GENERATION.fetch_add(1, Ordering::SeqCst) + 1
 }
 
+// >>> AETHER-APP-PATCH tor-reverse-gate (mobile 1.4.0 `AetherVpnService`: torFronted gate)
+/// bootstrap را «تمام» ثبت می‌کند، بی آنکه سطری از موتور آمده باشد.
+///
+/// # چرا لازم است (`loge3`، حالتِ `Tor → Aether`)
+///
+/// در این حالت تورِ جلوی موتور `tor.exe` است، نه موتور: tor.exe به ۱۰۰٪ رسید،
+/// بعد `aether.exe --masque` اجرا شد و [`crate::engine`] هنگامِ اجرای موتور
+/// [`reset`] را صدا زد. موتورِ MASQUE هرگز سطرِ «tor reaching the network»
+/// چاپ نمی‌کند، پس `done()` دیگر هیچ‌وقت درست نمی‌شد: پورتِ ۱۸۱۹ باز بود،
+/// خروجیِ WARP (`masque exit: 104.28.225.221`) هم آمده بود، و دروازهٔ تور باز
+/// هم «Reaching the Tor network…» و ۴۵ ثانیه بعد «Tor is not getting through
+/// directly — trying bridges…» نشان می‌داد تا کاربر دستی قطع کرد.
+///
+/// موبایل همین مرحله را با دست‌دادنِ واقعی روی پراکسی می‌سنجد، نه با درصدی که
+/// موتور نمی‌گوید. اینجا هم پس از آمادگیِ تور، معیار به خودآزمای مسیرِ داده
+/// سپرده می‌شود.
+pub fn mark_done(detail: &str) {
+    let mut inner = STATE.lock();
+    let now = Instant::now();
+    inner.snap.percent = Some(100);
+    inner.snap.done = true;
+    if !detail.is_empty() {
+        inner.snap.detail = detail.to_string();
+    }
+    inner.advanced_at = Some(now);
+    if inner.watching_since.is_none() {
+        inner.watching_since = Some(now);
+    }
+}
+// <<< AETHER-APP-PATCH tor-reverse-gate
+
+// >>> AETHER-APP-PATCH tor-cold-cache-waves
+/// پیشرفتی که درصد را عوض نکرده — دیسکریپتورِ پلِ تازه، بایت‌های تازه، یا
+/// نوبت/موجِ تازه — ساعتِ گیرکردن را صفر می‌کند (همان `as_frac` موبایل).
+pub fn touch() {
+    let mut inner = STATE.lock();
+    if inner.snap.done {
+        return;
+    }
+    let now = Instant::now();
+    inner.advanced_at = Some(now);
+    if inner.watching_since.is_none() {
+        inner.watching_since = Some(now);
+    }
+}
+
+/// آیا این سطرِ `tor_native` خودش پیشرفت است؟
+pub fn is_native_headway(line: &str) -> bool {
+    line.contains("new bridge descriptor")
+        || line.contains("Learned fingerprint")
+        || line.starts_with("[*] tor is still loading the directory")
+        || line.starts_with("[*] tor bridge wave")
+        // AETHER-APP-FIX tor-proves-its-exit: اثباتِ خروجی تا ۴۵ ثانیه طول می‌کشد.
+        || line.starts_with("[*] tor is proving its way out")
+        || (line.starts_with("[*] ") && line.contains(": go "))
+}
+// <<< AETHER-APP-PATCH tor-cold-cache-waves
+
 /// نسل فعلی — [`reset`].
 pub fn generation() -> u64 {
     GENERATION.load(Ordering::SeqCst)
@@ -208,6 +266,41 @@ mod tests {
     /// تست‌ها یک وضعیت جهانی مشترک دارند، پس هر کدام با `reset` شروع می‌شود
     /// و این قفل جلوی درهم‌رفتنشان را می‌گیرد.
     static SERIAL: Mutex<()> = Mutex::new(());
+
+    // >>> AETHER-APP-PATCH tor-reverse-gate
+    #[test]
+    fn a_tor_in_front_survives_the_engine_reset() {
+        let _guard = SERIAL.lock();
+        reset();
+        ingest("[*] tor reaching the network: 100%: Done");
+        assert!(done());
+        // موتورِ پشتِ تور اجرا می‌شود و درصد را صفر می‌کند…
+        reset();
+        assert!(!done());
+        // …و دروازه با علامتِ صریح دوباره «تمام» می‌بیند.
+        mark_done("tor.exe in front of the engine");
+        assert!(done());
+        assert!(!stalled(0));
+    }
+    // <<< AETHER-APP-PATCH tor-reverse-gate
+
+    // >>> AETHER-APP-PATCH tor-cold-cache-waves
+    #[test]
+    fn a_descriptor_download_is_not_a_stall() {
+        assert!(is_native_headway(
+            "[tor] Oct 04 15:53:28.000 [notice] new bridge descriptor 'torfnase' (fresh)"
+        ));
+        assert!(is_native_headway(
+            "[*] tor is still loading the directory at 50% (812 KiB read so far)"
+        ));
+        assert!(is_native_headway(
+            "[*] obfs4: go 2 of 2 — the first go reached 50%"
+        ));
+        assert!(!is_native_headway(
+            "[tor] Oct 04 15:46:23.000 [notice] Ignoring directory request, since no bridge nodes are available yet."
+        ));
+    }
+    // <<< AETHER-APP-PATCH tor-cold-cache-waves
 
     #[test]
     fn parses_the_engine_line() {

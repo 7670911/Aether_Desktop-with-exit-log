@@ -17,39 +17,8 @@ use crate::{consts, error::AetherError, error::Result};
 pub const MAX_DATAGRAM_SIZE: usize = 1350;
 pub const MIN_DATAGRAM_SIZE: usize = 1200;
 
-/// Depth of the two packet handoff queues between the netstack and the MASQUE
-/// carrier, in packets.
-///
-/// 1.2.3-p2 BUFFERBLOAT FIX. p1 capped the equivalent WireGuard queues in
-/// `lib.rs::packet_queue_capacity()` for exactly this reason and then missed
-/// these two, which are the ones the MASQUE carrier - the desktop's actual
-/// default data plane - uses.
-///
-/// `channel_capacity()` is an *application* queue depth and is 1024 on a normal
-/// PC. 1024 packets at a 1280-byte tunnel MTU is ~1.3 MB of standing queue in
-/// EACH direction, on top of the netstack's own retained burst. On a download
-/// that queue sits in front of every ACK, and per-flow throughput is
-/// window / RTT, so a megabyte of local queue lowers the ceiling just as
-/// effectively as a small window does. In chained mode the entire machine rides
-/// one Psiphon connection, so every flow pays the same queue at once - which is
-/// what the log's "waiting behind data already queued in the tunnel's send
-/// buffer" latency spikes were measuring.
-///
-/// This is a device transmit/receive ring, not a congestion window: throughput
-/// is governed by the smoltcp socket buffers and by HTTP/2 flow control, so a
-/// short ring costs no bandwidth and buys back the whole queueing delay.
-///
-/// 1.2.3-p3: trimmed again, from 256 to 128. 256 packets at a 1280-byte MTU is
-/// ~330 KB per direction, and at the packet rate a saturated download actually
-/// runs at (~640 in / ~480 out per second in the field log) that is about half a
-/// second of queue in each direction on top of every other buffer in the path.
-/// 128 is still eight times the largest burst the carrier can hand over in one
-/// DATA frame, so it cannot cost a single byte of bandwidth.
 fn net_queue() -> usize {
-    const NET_QUEUE_MAX: usize = 128;
     crate::sysprofile::channel_capacity()
-        .min(NET_QUEUE_MAX)
-        .max(64)
 }
 
 async fn bind_udp_fast(bind_addr: SocketAddr) -> Result<UdpSocket> {
@@ -62,13 +31,11 @@ async fn bind_udp_fast(bind_addr: SocketAddr) -> Result<UdpSocket> {
     let sock = Socket::new(domain, Type::DGRAM, None).map_err(AetherError::Io)?;
     sock.set_nonblocking(true).map_err(AetherError::Io)?;
 
-    // 1.2.3-p1: rcv and snd are separate budgets. See
-    // upstream::tune_udp_buffers for why one figure for both is wrong in both
-    // directions at once.
-    let _ = sock.set_recv_buffer_size(crate::sysprofile::udp_socket_rcv_buf_bytes());
-    let _ = sock.set_send_buffer_size(crate::sysprofile::udp_socket_snd_buf_bytes());
-    // 2.0.0: the egress module owns socket marking/binding policy now.
+    let buf_size = crate::sysprofile::udp_socket_buf_bytes();
+    let _ = sock.set_recv_buffer_size(buf_size);
+    let _ = sock.set_send_buffer_size(buf_size);
     crate::egress::apply(socket2::SockRef::from(&sock)).map_err(AetherError::Io)?;
+
     sock.bind(&bind_addr.into()).map_err(AetherError::Io)?;
     UdpSocket::from_std(sock.into()).map_err(AetherError::Io)
 }
@@ -483,6 +450,10 @@ pub async fn run(
         }
 
         if conn.is_established() && h3_conn.is_none() {
+            // Nothing goes over a handshake that went without the key it was given.
+            if current_ech.is_some() && !tls::ech_accepted(&mut conn) {
+                return Err(AetherError::Ech("the handshake went without ECH".into()));
+            }
             established_ever = true;
             log_or_debug(
                 quiet,
@@ -541,31 +512,40 @@ pub async fn run(
 
         flush(&mut conn, &sockets, datagram).await?;
 
-        if conn.is_closed() {
-            if !established_ever && !ech_retried && current_ech.is_some() {
-                if let Some(retry) = tls::extract_ech_retry_configs(&mut conn) {
-                    log::warn!(
-                        "ech_required: retrying handshake with server retry_configs ({} bytes)",
-                        retry.len()
-                    );
-                    ech_retried = true;
-                    current_ech = Some(retry);
+        // A handshake turned down for its ECH key is made again at once: the alert that
+        // says so is final as soon as it is sent, and the connection need not drain first.
+        if (conn.is_draining() || conn.is_closed())
+            && !established_ever
+            && !ech_retried
+            && current_ech.is_some()
+            && tls::ech_rejected(&conn)
+        {
+            if let Some(retry) = tls::extract_ech_retry_configs(&mut conn) {
+                log::warn!(
+                    "ech_required: retrying handshake with server retry_configs ({} bytes)",
+                    retry.len()
+                );
+                // Later handshakes of the session offer it as well, on either carrier.
+                tls::adopt_ech_retry(&retry);
+                ech_retried = true;
+                current_ech = Some(retry);
 
-                    let scid_bytes = random_scid();
-                    let scid = quiche::ConnectionId::from_ref(&scid_bytes);
-                    conn = quiche::connect(Some(&cfg.sni), &scid, local, peer, &mut config)?;
-                    if let Some(ref ech) = current_ech {
-                        tls::inject_ech(&mut conn, ech)?;
-                    }
-
-                    h3_conn = None;
-                    req_stream = None;
-                    capsules = CapsuleParser::new();
-                    flush(&mut conn, &sockets, datagram).await?;
-                    continue;
+                let scid_bytes = random_scid();
+                let scid = quiche::ConnectionId::from_ref(&scid_bytes);
+                conn = quiche::connect(Some(&cfg.sni), &scid, local, peer, &mut config)?;
+                if let Some(ref ech) = current_ech {
+                    tls::inject_ech(&mut conn, ech)?;
                 }
-            }
 
+                h3_conn = None;
+                req_stream = None;
+                capsules = CapsuleParser::new();
+                flush(&mut conn, &sockets, datagram).await?;
+                continue;
+            }
+        }
+
+        if conn.is_closed() {
             log_or_debug(quiet, format!("connection closed: {:?}", conn.stats()));
             if let Some(e) = conn.peer_error() {
                 log_or_debug(
@@ -850,9 +830,11 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
     let scid = quiche::ConnectionId::from_ref(&scid_bytes);
     let mut conn = quiche::connect(Some(&p.sni), &scid, local, p.peer, &mut config)?;
 
+    // A key that cannot be set fails the check: left aside, the name would go in the clear.
     if let Some(ref ech) = p.ech_config_list {
-        let _ = tls::inject_ech(&mut conn, ech);
+        tls::inject_ech(&mut conn, ech)?;
     }
+    let mut ech_retried = false;
 
     let h3_config = h3::Config::new()?;
     let mut h3_conn: Option<h3::Connection> = None;
@@ -915,6 +897,10 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
         }
 
         if conn.is_established() && h3_conn.is_none() {
+            // As in the tunnel: nothing goes over a handshake that went without its key.
+            if p.ech_config_list.is_some() && !tls::ech_accepted(&mut conn) {
+                return Err(AetherError::Ech("the handshake went without ECH".into()));
+            }
             let mut h3c = h3::Connection::with_transport(&mut conn, &h3_config)?;
             let headers = masque::connect_ip_request(&p.authority, &p.path);
             let sid = h3c.send_request(&mut conn, &headers, false)?;
@@ -991,6 +977,28 @@ pub async fn verify_masque(p: &VerifyParams) -> Result<Duration> {
 
         flush_connected(&mut conn, &sock).await?;
 
+        // As the tunnel does: once more, at once, with the ECHConfigList the server handed
+        // back as it turned the session's down, which later handshakes offer as well.
+        if (conn.is_draining() || conn.is_closed()) && !ech_retried && tls::ech_rejected(&conn) {
+            if let Some(retry) = tls::extract_ech_retry_configs(&mut conn) {
+                log::debug!(
+                    "ech_required: verifying {} again with the server's retry_configs ({} bytes)",
+                    p.peer,
+                    retry.len()
+                );
+                tls::adopt_ech_retry(&retry);
+                ech_retried = true;
+                let scid_bytes = random_scid();
+                let scid = quiche::ConnectionId::from_ref(&scid_bytes);
+                conn = quiche::connect(Some(&p.sni), &scid, local, p.peer, &mut config)?;
+                tls::inject_ech(&mut conn, &retry)?;
+                h3_conn = None;
+                req_stream = None;
+                flush_connected(&mut conn, &sock).await?;
+                continue;
+            }
+        }
+
         if conn.is_closed() {
             return Err(AetherError::Other(
                 "closed before data-plane confirmation".into(),
@@ -1015,6 +1023,23 @@ async fn flush_connected(conn: &mut quiche::Connection, sock: &UdpSocket) -> Res
         }
     }
     Ok(())
+}
+
+/// Whether a QUIC v1 Initial, the packet that carries a ClientHello, reaches `peer` within
+/// `wait`. The version bait (QUIC v2) and the junk of the obfuscation are no Initial.
+#[cfg(test)]
+pub(crate) async fn hears_a_client_hello(peer: &UdpSocket, wait: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut packet = [0u8; 2048];
+    while let Ok(Ok((read, _))) =
+        tokio::time::timeout_at(deadline, peer.recv_from(&mut packet)).await
+    {
+        // A long header of the Initial type, and version 1.
+        if read > 5 && packet[0] & 0xf0 == 0xc0 && packet[1..5] == [0, 0, 0, 1] {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]

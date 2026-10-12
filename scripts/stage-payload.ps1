@@ -71,6 +71,21 @@ if (Test-Path $torSrc) {
   Write-Host "==> no dist-engine/tor; this payload carries no tor binary"
 }
 
+# >>> AETHER-APP-PATCH custom-configs-xray
+# هستهٔ Xray برای «کانفیگ‌های سفارشی» (scripts/stage-xray.ps1). نبودنش فقط
+# همان قابلیت را از کار می‌اندازد — شش حالتِ اصلی به آن دست نمی‌زنند — پس
+# این‌جا خطا نیست؛ گیتِ انتشار در ورک‌فلو جلوی بیلدِ منتشرشدهٔ بی‌Xray را می‌گیرد.
+$xraySrc = Join-Path $root 'dist-engine/xray'
+if (Test-Path (Join-Path $xraySrc 'xray.exe')) {
+  $xrayOut = Join-Path $out 'engine/xray'
+  New-Item -ItemType Directory -Force -Path $xrayOut | Out-Null
+  Copy-Item (Join-Path $xraySrc '*') $xrayOut -Force
+  Write-Host "==> xray core bundled: engine/xray/xray.exe"
+} else {
+  Write-Host "==> NOTE: no dist-engine/xray - custom configs will report a missing core."
+}
+# <<< AETHER-APP-PATCH custom-configs-xray
+
 $ptSrc = Join-Path $root 'dist-engine/pt'
 if (Test-Path (Join-Path $ptSrc 'lyrebird.exe')) {
   $ptOut = Join-Path $out 'engine/pt'

@@ -2,7 +2,6 @@
 pub mod account;
 pub mod aethernoize;
 pub mod api;
-pub mod apifront;
 pub mod bridges;
 pub mod cli;
 pub mod config;
@@ -10,18 +9,22 @@ pub mod consts;
 pub mod dns;
 pub mod egress;
 pub mod error;
+pub mod exitloc;
 pub mod ffi;
 pub mod fragment;
+pub mod https;
 pub mod lastconn;
 pub mod masque;
 pub mod masque_h2;
 pub mod netstack;
 pub mod noize;
 pub mod prober;
+pub mod psiphon;
 pub mod quic;
 pub mod routing;
 pub mod sniff;
 pub mod socks;
+pub mod stats;
 pub mod sysprofile;
 pub mod tls;
 pub mod tor;
@@ -48,14 +51,8 @@ fn parse_local_v4(s: &str) -> Ipv4Addr {
 const TUNNEL_MTU: usize = 1280;
 const INNER_MTU: usize = 1200;
 
-/// MASQUE over HTTP/2 carries its capsules on a TCP stream, where nothing has
-/// to fit inside a single UDP datagram. The 1280 that keeps a QUIC datagram
-/// whole only buys the netstack more segments to cut on that path, so it gets
-/// an ordinary ethernet MTU instead.
 const H2_TUNNEL_MTU: usize = 1500;
 
-/// The inner MTU for the MASQUE tunnel. `AETHER_MASQUE_MTU` overrides it, for a
-/// path where the edge turns out not to carry full-size packets.
 fn masque_tunnel_mtu() -> usize {
     if let Some(mtu) = std::env::var("AETHER_MASQUE_MTU")
         .ok()
@@ -94,43 +91,26 @@ pub async fn run_with(args: Vec<String>) -> Result<()> {
             .try_init();
 
     log::info!("Aether v{}", env!("CARGO_PKG_VERSION"));
-    // >>> AETHER-APP-PATCH build-provenance
-    // The line above is the UPSTREAM core version. It is identical in every
-    // patch level of the core, so it identifies nothing: a stale engine and a
-    // fresh one print the same banner. This line identifies the build.
-    //
-    // `AETHER-BUILD-STAMP:` is also embedded as a literal in the binary (see
-    // build.rs), which is what `stage-payload.ps1` and CI grep for; printing it
-    // here is what lets the Rust side cross-check the engine against the app and
-    // what makes any future field log self-identifying in its second line.
-    //
-    // The capability list is DESKTOP-SPECIFIC and deliberately not copied from
-    // the Android build, which claims `device backpressure=on` and
-    // `uplink admission=rate-x-500ms`. Those three netstack patches are NOT in
-    // this core (counted in netstack.rs: `MAX_DEVICE_TX` 0 hits, `admission` 0,
-    // `liveness` 0). Copying that line would produce a log that lies about the
-    // data plane, which is the exact failure this stamp exists to prevent.
-    log::info!(
-        "[*] {} (app patch level {}; netstack congestion control=cubic, \
-         uplink sndbuf=bounded, wg writer waits=on; device backpressure=off, \
-         flow liveness=off, uplink admission=off)",
-        env!("AETHER_BUILD_STAMP"),
-        env!("AETHER_APP_PATCHLEVEL"),
-    );
-    if env!("AETHER_APP_PATCHLEVEL") == "unstamped" {
-        log::warn!(
-            "[-] this engine carries no PATCHLEVEL stamp, so nothing can tell it \
-             apart from any other build of core {}. Build it from the repository \
-             root, or set APP_PATCHLEVEL, so the stamp is picked up.",
-            env!("CARGO_PKG_VERSION"),
-        );
-    }
-    // <<< AETHER-APP-PATCH build-provenance
     sysprofile::log_summary();
     sysprofile::raise_fd_limit();
     egress::init()?;
+    stats::init();
+    stats::spawn_reporter();
 
     install_netstack_panic_guard();
+    // A cipher string or a group list BoringSSL does not take, or an address the calls to the
+    // WARP API cannot use, stops the core here, with its option named.
+    tls::check_tls_options()?;
+    account::check_enroll_address()?;
+    // The key of the WARP API calls of an earlier run of the library is not this run's.
+    account::forget_api_ech();
+
+    let base_config = std::env::var("AETHER_CONFIG").unwrap_or_else(|_| DEFAULT_CONFIG.to_string());
+
+    // A registration serves no proxy, so it needs none of the listeners checked below.
+    if let Some(wanted) = register_request()? {
+        return register_identities(wanted, &base_config).await;
+    }
 
     let listen: SocketAddr = std::env::var("AETHER_SOCKS")
         .ok()
@@ -140,19 +120,27 @@ pub async fn run_with(args: Vec<String>) -> Result<()> {
     drop(socks::bind_listener("socks5", listen).await?);
     drop(bind_http_proxy().await?);
 
-    let base_config = std::env::var("AETHER_CONFIG").unwrap_or_else(|_| DEFAULT_CONFIG.to_string());
-
     if tor::mode() == tor::Mode::Only {
         return tor::run_only(listen, tor::state_dir(&base_config)).await;
     }
 
-    // A malformed address is worth reporting before an account is provisioned.
+    if psiphon::mode() == psiphon::Mode::Only {
+        return psiphon::run_only(listen, psiphon::state_dir(&base_config)).await;
+    }
+
+    if tor::mode() == tor::Mode::Reverse && psiphon::mode() == psiphon::Mode::Reverse {
+        return Err(AetherError::Other(
+            "--tor-reverse and --psiphon-reverse both want to carry the tunnel; pick one, or put \
+             the other inside it with --tor or --psiphon"
+                .into(),
+        ));
+    }
+
     let pinned_wiw = wiw_endpoints_from_env()?;
     let pinned_mim = mim_endpoints_from_env()?;
 
     let protocol = match std::env::var("AETHER_PROTOCOL") {
         Ok(v) => Protocol::parse(&v),
-        // Naming a warp-in-warp hop only makes sense for warp-in-warp.
         Err(_) if !pinned_wiw.is_empty() => Protocol::WarpInWarp,
         Err(_) if !pinned_mim.is_empty() => Protocol::MasqueInMasque,
         Err(_)
@@ -165,6 +153,10 @@ pub async fn run_with(args: Vec<String>) -> Result<()> {
 
     if tor::mode() == tor::Mode::Only {
         return tor::run_only(listen, tor::state_dir(&base_config)).await;
+    }
+
+    if psiphon::mode() == psiphon::Mode::Only {
+        return psiphon::run_only(listen, psiphon::state_dir(&base_config)).await;
     }
 
     if protocol != Protocol::WarpInWarp && !pinned_wiw.is_empty() {
@@ -209,6 +201,34 @@ pub async fn run_with(args: Vec<String>) -> Result<()> {
         tor::Mode::Only | tor::Mode::Off => {}
     }
 
+    match psiphon::mode() {
+        psiphon::Mode::Chain => {
+            let through = listen;
+            let state = psiphon::state_dir(&base_config);
+            tokio::spawn(async move {
+                if let Err(e) = psiphon::run_chain(through, state).await {
+                    log::error!("[-] psiphon: {e}");
+                }
+            });
+        }
+        psiphon::Mode::Reverse => {
+            if matches!(protocol, Protocol::WireGuard | Protocol::WarpInWarp) {
+                return Err(AetherError::Other(format!(
+                    "psiphon carries tcp only and warp's wireguard endpoints answer on udp alone, \
+                     so {} can never be reached through psiphon; use --masque, which this mode \
+                     runs over http/2, or put psiphon inside the tunnel instead with --psiphon",
+                    protocol.label()
+                )));
+            }
+
+            let socks = psiphon::start_reverse(psiphon::state_dir(&base_config)).await?;
+            std::env::set_var("AETHER_UPSTREAM", format!("socks5://{socks}"));
+            std::env::set_var("AETHER_MASQUE_HTTP2", "1");
+            log::info!("[+] the tunnel is dialled through psiphon on the http/2 carrier");
+        }
+        psiphon::Mode::Only | psiphon::Mode::Off => {}
+    }
+
     match protocol {
         Protocol::Masque => {
             select_masque_transport().await;
@@ -220,24 +240,10 @@ pub async fn run_with(args: Vec<String>) -> Result<()> {
                 identity.ipv4,
                 identity.ipv6
             );
-            // 1.2.3-p3: the HTTP/2 carrier does not use an ECHConfigList ANYWHERE.
-            // `masque_h2::run` never receives one, `prober::MasqueProbe` is built
-            // with `ech_config_list: None`, and so is the cached-gateway check -
-            // the value is only ever handed to `quic::TunnelConfig`. So on an h2
-            // session this lookup was a DNS round trip whose result was dropped on
-            // the floor, and it sat on the critical path of every connect: the
-            // field log measures it at 9.1 seconds. Nothing is lost by skipping it
-            // and 9 seconds are returned to the user.
-            let ech = if masque_h2::enabled() {
-                log::info!(
-                    "[+] ECH lookup skipped: the HTTP/2 carrier does not use an ECHConfigList (saves a DNS round trip on every connect)"
-                );
-                None
-            } else {
-                resolve_ech().await
-            };
+            // Every MASQUE handshake of the session offers it, on either carrier, until it ends.
+            let _ech = tls::EchSession::start(resolve_ech().await?);
             let lastconn_path = lastconn_path(&config_path);
-            run_masque(identity, ech, listen, lastconn_path).await
+            run_masque(identity, listen, lastconn_path, None).await
         }
         Protocol::WireGuard => {
             let config_path = warp_config_path(&base_config);
@@ -251,6 +257,19 @@ pub async fn run_with(args: Vec<String>) -> Result<()> {
 
             let lastconn_path = lastconn_path(&config_path);
             run_wireguard(identity, listen, lastconn_path).await
+        }
+        Protocol::WarpInWarp if !gool_classic() => {
+            select_masque_transport().await;
+            let config_path = masque_config_path(&base_config);
+            let identity = load_or_provision_masque(&config_path).await?;
+            let inner_path = derive_sibling_path(&config_path, "gool");
+            log::info!(
+                "[+] gool: masque device={} carries the wireguard identity in {inner_path}",
+                identity.device_id
+            );
+            let _ech = tls::EchSession::start(resolve_ech().await?);
+            let lastconn_path = lastconn_path(&config_path);
+            run_masque(identity, listen, lastconn_path, Some(inner_path)).await
         }
         Protocol::WarpInWarp => {
             let primary_path = warp_config_path(&base_config);
@@ -279,19 +298,15 @@ pub async fn run_with(args: Vec<String>) -> Result<()> {
                 secondary.device_id,
                 secondary.ipv4
             );
-            let ech = resolve_ech().await;
-            run_mim(primary, secondary, ech, listen).await
+            // Every MASQUE handshake of the session offers it, on either carrier, until it ends.
+            let _ech = tls::EchSession::start(resolve_ech().await?);
+            run_mim(primary, secondary, listen).await
         }
     }
 }
 
-/// The port Cloudflare's WireGuard edges usually answer on. It is only ever
-/// shown as an example: an endpoint has to carry its own port, because which
-/// port gets through is exactly what differs between one network and the next.
 const WG_EXAMPLE_PORT: u16 = 2408;
 
-/// The two hops of a warp-in-warp tunnel, as far as they were chosen by hand. A
-/// hop left as `None` is one the scan still has to find.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct WiwEndpoints {
     outer: Option<SocketAddr>,
@@ -303,9 +318,6 @@ impl WiwEndpoints {
         self.outer.is_none() && self.inner.is_none()
     }
 
-    /// The hops have to leave through different edges: sending the inner tunnel
-    /// back out of the address it already arrived on gains nothing, and
-    /// `run_warp_in_warp` refuses it.
     fn checked(self) -> Result<Self> {
         match (self.outer, self.inner) {
             (Some(outer), Some(inner)) if outer.ip() == inner.ip() => {
@@ -319,9 +331,6 @@ impl WiwEndpoints {
     }
 }
 
-/// Reads one endpoint. The port has to be written out: which port answers is
-/// the part that differs from network to network, so filling one in on
-/// somebody's behalf would only send them at an address nobody offered.
 fn parse_endpoint(raw: &str) -> Result<SocketAddr> {
     let text = raw.trim();
 
@@ -329,8 +338,6 @@ fn parse_endpoint(raw: &str) -> Result<SocketAddr> {
         return Ok(peer);
     }
 
-    // An address with the port left off is the likely slip, so name what is
-    // missing rather than calling the whole thing unreadable.
     let portless = text.parse::<IpAddr>().ok().or_else(|| {
         text.strip_prefix('[')
             .and_then(|rest| rest.strip_suffix(']'))
@@ -350,8 +357,6 @@ fn parse_endpoint(raw: &str) -> Result<SocketAddr> {
     )))
 }
 
-/// Reads the one or two endpoints of a warp-in-warp pair, separated by commas,
-/// semicolons or spaces.
 fn parse_endpoint_list(raw: &str) -> Result<Vec<SocketAddr>> {
     let mut peers = Vec::new();
 
@@ -380,8 +385,6 @@ fn env_value(key: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-/// True when the endpoints were deliberately left to the scan, so there is
-/// nothing left to ask about.
 fn wiw_scan_requested(lookup: &dyn Fn(&str) -> Option<String>) -> bool {
     match lookup("AETHER_WIW_PEERS") {
         Some(value) => matches!(
@@ -452,8 +455,6 @@ fn mim_endpoints_from_env() -> Result<WiwEndpoints> {
     mim_endpoints_of(&env_value)
 }
 
-/// `--peer` and `--wg-peer` are older than the warp-in-warp settings and the
-/// guides already pair them with `--gool`, so they still name the outer hop.
 fn wiw_endpoints_with_fallback(lookup: &dyn Fn(&str) -> Option<String>) -> Result<WiwEndpoints> {
     let mut chosen = wiw_endpoints_of(lookup)?;
 
@@ -480,7 +481,6 @@ async fn run_gool(
     secondary: account::Identity,
     listen: SocketAddr,
 ) -> Result<()> {
-    // Scanning is what happens unless somebody named an endpoint themselves.
     let pinned = wiw_endpoints_with_fallback(&env_value)?;
 
     match (pinned.outer, pinned.inner) {
@@ -504,8 +504,6 @@ async fn run_gool(
 
     loop {
         if consecutive_fails >= MAX_CONSECUTIVE_FAILS {
-            // A hop that was given by hand is kept: it was asked for on purpose,
-            // and replacing it behind the user's back is not ours to do.
             let mut rescanning = false;
 
             if pinned.outer.is_none() {
@@ -563,6 +561,11 @@ async fn run_gool(
                         continue;
                     }
                 };
+
+                let mut found = found;
+                if verified_scan_selected(&scan_settings) {
+                    spread_hops(&mut found);
+                }
 
                 let mut found = found.into_iter();
                 let outer = known_outer.or_else(|| found.next());
@@ -878,6 +881,20 @@ async fn load_or_provision_warp(config_path: &str) -> Result<account::Identity> 
 }
 
 async fn load_or_provision_masque(config_path: &str) -> Result<account::Identity> {
+    let identity = load_or_enrol_masque(config_path).await?;
+    if identity.refused {
+        return Ok(identity);
+    }
+    match account::enable_warp(&identity.device_id, &identity.access_token).await {
+        Ok(()) => log::info!("[+] warp enabled for the masque device"),
+        Err(error) => log::warn!(
+            "[!] could not enable warp for the masque device, the edge may refuse it: {error}"
+        ),
+    }
+    Ok(identity)
+}
+
+async fn load_or_enrol_masque(config_path: &str) -> Result<account::Identity> {
     if let Some(identity) = config::load(config_path)? {
         log::info!("[+] loaded existing masque identity from {config_path}");
         let refused = if identity.has_masque_credentials() {
@@ -930,6 +947,134 @@ async fn load_or_provision_masque(config_path: &str) -> Result<account::Identity
     config::save(config_path, &identity)?;
     log::info!("[+] provisioned and saved new masque identity to {config_path}");
     Ok(identity)
+}
+
+/// The identities `--register` asks for: those of one protocol, both hops of a two-hop one, or
+/// all four.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RegisterSet {
+    wireguard: bool,
+    wireguard_inner: bool,
+    masque: bool,
+    masque_inner: bool,
+}
+
+impl RegisterSet {
+    fn parse(value: &str) -> Result<Self> {
+        let none = RegisterSet {
+            wireguard: false,
+            wireguard_inner: false,
+            masque: false,
+            masque_inner: false,
+        };
+        match value.trim().to_lowercase().as_str() {
+            "all" => Ok(RegisterSet {
+                wireguard: true,
+                wireguard_inner: true,
+                masque: true,
+                masque_inner: true,
+            }),
+            "masque" => Ok(RegisterSet {
+                masque: true,
+                ..none
+            }),
+            "wg" | "wireguard" | "warp" => Ok(RegisterSet {
+                wireguard: true,
+                ..none
+            }),
+            "gool" | "wiw" | "warp-in-warp" => Ok(RegisterSet {
+                wireguard: true,
+                wireguard_inner: true,
+                ..none
+            }),
+            "mim" | "masque-in-masque" => Ok(RegisterSet {
+                masque: true,
+                masque_inner: true,
+                ..none
+            }),
+            other => Err(AetherError::Other(format!(
+                "--register takes masque, wg, gool, mim or all, not '{other}'"
+            ))),
+        }
+    }
+}
+
+fn register_request() -> Result<Option<RegisterSet>> {
+    env_value("AETHER_REGISTER")
+        .map(|value| RegisterSet::parse(&value))
+        .transpose()
+}
+
+/// `--register`: makes sure the identities `wanted` names exist, registering the missing ones,
+/// and returns without scanning or opening a tunnel. An identity file already there is kept,
+/// never replaced. With a carrier around the tunnel the registrations go through it, whatever
+/// the protocol: they are https requests, which tor and psiphon carry, so the refusal of
+/// wireguard behind them concerns the tunnel alone. A carrier inside the tunnel, or on its own,
+/// plays no part in a registration.
+async fn register_identities(wanted: RegisterSet, base_config: &str) -> Result<()> {
+    let carrier = match (tor::mode(), psiphon::mode()) {
+        (tor::Mode::Reverse, psiphon::Mode::Reverse) => {
+            return Err(AetherError::Other(
+                "--tor-reverse and --psiphon-reverse both want to carry the registration; \
+                 pick one"
+                    .into(),
+            ));
+        }
+        (tor::Mode::Reverse, _) => Some((
+            "tor",
+            tor::start_reverse(tor::state_dir(base_config)).await?,
+        )),
+        (_, psiphon::Mode::Reverse) => Some((
+            "psiphon",
+            psiphon::start_reverse(psiphon::state_dir(base_config)).await?,
+        )),
+        _ => None,
+    };
+    if let Some((name, socks)) = carrier {
+        std::env::set_var("AETHER_UPSTREAM", format!("socks5://{socks}"));
+        log::info!("[+] the identities are registered through {name}");
+    }
+
+    let wireguard = warp_config_path(base_config);
+    let masque = masque_config_path(base_config);
+    let identities = [
+        (wanted.wireguard, "wireguard", wireguard.clone(), false),
+        (
+            wanted.wireguard_inner,
+            "wireguard inner",
+            derive_sibling_path(&wireguard, "secondary"),
+            false,
+        ),
+        (wanted.masque, "masque", masque.clone(), true),
+        (
+            wanted.masque_inner,
+            "masque inner",
+            derive_sibling_path(&masque, "secondary"),
+            true,
+        ),
+    ];
+
+    let mut ready = Vec::new();
+    for (asked, label, path, over_masque) in identities {
+        if !asked {
+            continue;
+        }
+        let identity = if over_masque {
+            load_or_provision_masque(&path).await?
+        } else {
+            load_or_provision_warp(&path).await?
+        };
+        log::info!(
+            "[+] {label} identity ready: device={} ipv4={} ipv6={}",
+            identity.device_id,
+            identity.ipv4,
+            identity.ipv6
+        );
+        ready.push(label);
+    }
+
+    log::info!("[+] identities ready: {}", ready.join(", "));
+    Ok(())
 }
 
 async fn select_peer(identity: &account::Identity, protocol: Protocol) -> Result<SocketAddr> {
@@ -986,9 +1131,6 @@ async fn select_peer(identity: &account::Identity, protocol: Protocol) -> Result
     }
 }
 
-/// Hunts for `want` endpoints, leaving out the addresses in `avoid`. Warp-in-warp
-/// passes the hop it already has there, so the scan cannot hand back the same
-/// edge for both ends of the tunnel.
 async fn select_wg_peers(
     identity: &account::Identity,
     mode_str: &str,
@@ -1037,8 +1179,6 @@ async fn select_wg_peers(
 
     let found = wg_prober::hunt_wg_endpoints(&probe, mode, want).await?;
 
-    // The exclusion above already keeps these out of the sweep; this is the
-    // belt to its braces, since handing a hop its own address back is fatal.
     let picked: Vec<wg_prober::WgProbeResult> = found
         .into_iter()
         .filter(|pr| !avoid.contains(&pr.ip))
@@ -1064,36 +1204,30 @@ async fn select_wg_peers(
         .collect())
 }
 
-async fn resolve_ech() -> Option<Vec<u8>> {
-    match std::env::var("AETHER_ECH") {
-        Ok(v) if v.eq_ignore_ascii_case("auto") => match dns::fetch_ech_config().await {
-            Ok(raw) => {
-                log::info!(
-                    "[+] fetched ECHConfigList automatically ({} bytes)",
-                    raw.len()
-                );
-                Some(raw)
-            }
-            Err(e) => {
-                log::warn!("[-] ECH auto-fetch failed ({e}); continuing without ECH");
-                None
-            }
-        },
-        Ok(b64) if !b64.is_empty() => match tls::decode_ech_config_list(&b64) {
-            Ok(v) => {
-                log::info!("[+] using ECHConfigList from AETHER_ECH");
-                Some(v)
-            }
-            Err(e) => {
-                log::warn!("[-] bad AETHER_ECH: {e}; continuing without ECH");
-                None
-            }
-        },
-        _ => {
-            log::info!("[+] ECH disabled (warp masque endpoint does not accept ECH); SNI sent in cleartext");
-            None
+/// The ECH key of the session, by --ech (AETHER_ECH): none without it; with it, the key it
+/// gives in base64, or with auto, the key the lookup of --ech-dns and --ech-domain finds; a
+/// key the calls to the WARP API offered in this run serves without a second lookup. With
+/// ECH asked for and no key BoringSSL can offer, the session does not start, so that the
+/// server name never goes out in the clear.
+async fn resolve_ech() -> Result<Option<Vec<u8>>> {
+    let setting = std::env::var(tls::SESSION_ECH_OPTION.variable).ok();
+    if setting.as_deref().is_some_and(|value| !value.is_empty()) {
+        if let Some(key) = account::api_ech_in_use() {
+            log::info!(
+                "[+] offering the ECHConfigList the WARP API took ({} bytes)",
+                key.len()
+            );
+            return Ok(Some(key));
         }
     }
+    let key = tls::ech_key(&tls::SESSION_ECH_OPTION, setting.as_deref(), || {
+        dns::fetch_ech_config(&dns::SESSION_ECH)
+    })
+    .await?;
+    if key.is_none() {
+        log::info!("[+] ECH off; the server name goes out in cleartext");
+    }
+    Ok(key)
 }
 
 fn masque_reconnect_delay() -> std::time::Duration {
@@ -1131,7 +1265,7 @@ async fn hunt_masque_peer(
         path: quic::default_path().to_string(),
         cert_pem: std::sync::Arc::from(identity.cert_pem.clone()),
         key_pem: std::sync::Arc::from(identity.key_pem.clone()),
-        ech_config_list: None,
+        ech_config_list: tls::session_ech().map(std::sync::Arc::from),
         noize: noize_config(),
         ports: prober::MASQUE_PORTS.to_vec(),
         ip,
@@ -1148,139 +1282,24 @@ async fn hunt_masque_peer(
     Ok(SocketAddr::new(best.ip, best.port))
 }
 
-/// How good a CACHED endpoint has to be before `--quick-reconnect` reuses it
-/// instead of scanning.
-///
-/// ## 1.2.3-p1: quick reconnect reused any cached endpoint that still answered
-///
-/// However slow it had become. TCP throughput is inversely proportional to RTT,
-/// so a session pinned to a cached edge three times slower than what is currently
-/// available downloads roughly three times slower - for as long as the cache
-/// survives, silently, with a healthy tunnel and no error anywhere. In chained
-/// `Aether -> Psiphon` mode that penalty is paid on both hops, which is why the
-/// chained mode felt worse than plain even though both were slow.
-///
-/// A cached endpoint is now only reused when it is not merely alive but still
-/// FAST. Over budget, the cache is skipped and a normal scan runs: that costs a
-/// few seconds once, and the better endpoint it finds is what gets re-cached.
-/// Discarding the cache is also registered as a FLOOR
-/// (`wg_prober::set_rtt_floor`), so a scan that fails to beat it hands the cached
-/// endpoint back rather than committing the session to something worse - the bet
-/// can only win or break even.
-///
-/// Budgets come from `AETHER_QUICK_RECONNECT_MAX_RTT_MS` for the WireGuard/WARP*2
-/// data-plane probe and `AETHER_QUICK_RECONNECT_MAX_HANDSHAKE_MS` for the MASQUE
-/// probe (a full QUIC/TLS handshake, therefore several times one RTT). Set either
-/// to `0` to disable the check and restore the previous behaviour exactly.
-fn env_budget_ms(name: &str, default_ms: u64) -> Option<std::time::Duration> {
-    match std::env::var(name) {
-        Ok(raw) => raw
-            .trim()
-            .parse::<u64>()
-            .ok()
-            .filter(|ms| *ms > 0)
-            .map(std::time::Duration::from_millis),
-        Err(_) => Some(std::time::Duration::from_millis(default_ms)),
+fn masque_carrier() -> &'static str {
+    if masque_h2::enabled() {
+        lastconn::CARRIER_MASQUE_H2
+    } else {
+        lastconn::CARRIER_MASQUE_H3
     }
-}
-
-fn within_budget(
-    peer: SocketAddr,
-    measured: std::time::Duration,
-    budget: Option<std::time::Duration>,
-    what: &str,
-) -> bool {
-    match budget {
-        Some(limit) if measured > limit => {
-            log::warn!(
-                "[-] cached endpoint {peer} answered but is slow ({what} {:?} over the {:?} budget); ignoring the cache and scanning for a faster endpoint",
-                measured,
-                limit
-            );
-            false
-        }
-        _ => true,
-    }
-}
-
-/// Data-plane RTT budget (WireGuard / WARP*2 cached endpoint).
-fn cached_peer_fast_enough(peer: SocketAddr, rtt: std::time::Duration) -> bool {
-    within_budget(
-        peer,
-        rtt,
-        env_budget_ms(
-            "AETHER_QUICK_RECONNECT_MAX_RTT_MS",
-            wg_prober::DEFAULT_GOOD_RTT_MS,
-        ),
-        "rtt",
-    )
-}
-
-// >>> AETHER-APP-PATCH keep-the-working-cached-endpoint
-/// آیا یک endpointِ کارکن ولی کند باید دور انداخته شود و اسکن راه بیفتد؟
-///
-/// پیش‌فرض: نه — ثانیه‌هایی که کاربر پای دکمهٔ Connect می‌نشیند از چند صد
-/// میلی‌ثانیه RTT گران‌ترند، و لاگ نشان داد که این اسکن معمولاً چیزی بهتر
-/// پیدا نمی‌کند. برای عیب‌یابی می‌توان با env برگرداندش.
-fn rescan_when_cache_is_slow() -> bool {
-    std::env::var("AETHER_QUICK_RECONNECT_RESCAN_SLOW")
-        .map(|v| {
-            let v = v.trim().to_ascii_lowercase();
-            v == "1" || v == "true" || v == "yes"
-        })
-        .unwrap_or(false)
-}
-// <<< AETHER-APP-PATCH keep-the-working-cached-endpoint
-
-/// Handshake budget (MASQUE cached gateway; one QUIC/TLS setup, not one RTT).
-fn cached_handshake_fast_enough(peer: SocketAddr, elapsed: std::time::Duration) -> bool {
-    within_budget(
-        peer,
-        elapsed,
-        env_budget_ms("AETHER_QUICK_RECONNECT_MAX_HANDSHAKE_MS", 1_500),
-        "handshake",
-    )
 }
 
 fn lastconn_path(config_path: &str) -> String {
     derive_sibling_path(config_path, "lastconn")
 }
 
-/// Fallback verification timeout for peers that are NOT subject to the quick
-/// reconnect handshake budget (a forced peer, an organization-assigned endpoint,
-/// or the last known-good gateway of a live session).
-const PEER_VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// How long to wait when verifying the CACHED gateway.
-///
-/// ## 1.2.3-p3: waiting longer than the budget can only ever waste the wait
-///
-/// The cached gateway was verified with a flat 5 s timeout, and then
-/// [`cached_handshake_fast_enough`] threw the result away if the handshake had
-/// taken more than 1.5 s. So every second between 1.5 s and 5 s was spent
-/// waiting for an answer that was already guaranteed to be rejected - three and a
-/// half seconds of connect latency, per attempt, with no outcome that could
-/// possibly benefit from it. On the ladder in the field log that ran twice before
-/// the successful rung.
-///
-/// The wait is now the budget plus a little slack for scheduling. If the user
-/// disables the budget entirely (`AETHER_QUICK_RECONNECT_MAX_HANDSHAKE_MS=0`)
-/// there is no cut-off to align with, so the old 5 s is kept exactly.
-fn cached_verify_timeout() -> std::time::Duration {
-    match env_budget_ms("AETHER_QUICK_RECONNECT_MAX_HANDSHAKE_MS", 1_500) {
-        Some(budget) => (budget + std::time::Duration::from_millis(500)).min(PEER_VERIFY_TIMEOUT),
-        None => PEER_VERIFY_TIMEOUT,
-    }
-}
-
-async fn quick_verify_masque_peer(identity: &account::Identity, peer: SocketAddr) -> bool {
-    verify_masque_peer_within(identity, peer, PEER_VERIFY_TIMEOUT).await
-}
-
-async fn verify_masque_peer_within(
+/// Whether `peer` serves MASQUE, by a quick check on the carrier the session uses, which
+/// offers `ech`: the session's key, or that of a job of the library.
+async fn quick_verify_masque_peer(
     identity: &account::Identity,
     peer: SocketAddr,
-    timeout: std::time::Duration,
+    ech: Option<Vec<u8>>,
 ) -> bool {
     let vp = quic::VerifyParams {
         peer,
@@ -1289,9 +1308,9 @@ async fn verify_masque_peer_within(
         path: quic::default_path().to_string(),
         cert_pem: identity.cert_pem.clone(),
         key_pem: identity.key_pem.clone(),
-        ech_config_list: None,
+        ech_config_list: ech.clone(),
         noize: noize_config(),
-        timeout,
+        timeout: std::time::Duration::from_secs(5),
         local_ipv4: parse_local_v4(&identity.ipv4),
     };
 
@@ -1307,8 +1326,11 @@ async fn verify_masque_peer_within(
             quiet: true,
             pin_endpoint: true,
             expected_pins: consts::MASQUE_PINS.iter().map(|p| p.to_vec()).collect(),
+            ech_config_list: ech,
         };
-        return masque_h2::verify_h2(&cfg, timeout).await.is_ok();
+        return masque_h2::verify_h2(&cfg, std::time::Duration::from_secs(5))
+            .await
+            .is_ok();
     }
 
     quic::verify_masque(&vp).await.is_ok()
@@ -1332,9 +1354,9 @@ async fn want_quick_reconnect(cached: &lastconn::LastConnection) -> bool {
 
 async fn run_masque(
     identity: account::Identity,
-    ech: Option<Vec<u8>>,
     listen: SocketAddr,
     lastconn_path: String,
+    gool_inner: Option<String>,
 ) -> Result<()> {
     let forced = std::env::var("AETHER_PEER").ok();
 
@@ -1346,7 +1368,7 @@ async fn run_masque(
             .and_then(|value| value.parse::<SocketAddr>().ok())
         {
             log::info!("[*] verifying the endpoint the organization assigned: {assigned}");
-            if quick_verify_masque_peer(&identity, assigned).await {
+            if quick_verify_masque_peer(&identity, assigned, tls::session_ech()).await {
                 log::info!("[+] the assigned endpoint {assigned} works; skipping the scan");
                 quick_peer = Some(assigned);
             } else {
@@ -1359,23 +1381,19 @@ async fn run_masque(
 
     if forced.is_none() && quick_peer.is_none() {
         if let Some(cached) = lastconn::load(&lastconn_path) {
-            if let Ok(peer) = cached.peer.parse::<SocketAddr>() {
-                if want_quick_reconnect(&cached).await {
-                    let verify_timeout = cached_verify_timeout();
-                    log::info!(
-                        "[*] verifying cached gateway {peer} before reuse (up to {:?}, matched to the handshake budget)",
-                        verify_timeout
-                    );
-                    let quick_probe_started = std::time::Instant::now();
-                    if verify_masque_peer_within(&identity, peer, verify_timeout).await {
+            let ring = lastconn::usable_peers(&cached, masque_carrier());
+            if !ring.is_empty() && want_quick_reconnect(&cached).await {
+                for peer in ring {
+                    log::info!("[*] verifying cached gateway {peer} before reuse");
+                    if quick_verify_masque_peer(&identity, peer, tls::session_ech()).await {
                         log::info!("[+] cached gateway {peer} still works; skipping scan");
                         quick_peer = Some(peer);
-                        if !cached_handshake_fast_enough(peer, quick_probe_started.elapsed()) {
-                            quick_peer = None;
-                        }
-                    } else {
-                        log::warn!("[-] cached gateway {peer} no longer works; scanning fresh");
+                        break;
                     }
+                    log::warn!("[-] cached gateway {peer} no longer answers; trying the next one");
+                }
+                if quick_peer.is_none() {
+                    log::warn!("[-] no remembered gateway answers; scanning fresh");
                 }
             }
         }
@@ -1398,7 +1416,7 @@ async fn run_masque(
             let retried = match last_good_peer {
                 Some(p) => {
                     log::info!("[*] retrying last known-good gateway {p} before rescanning");
-                    if quick_verify_masque_peer(&identity, p).await {
+                    if quick_verify_masque_peer(&identity, p, tls::session_ech()).await {
                         Some(p)
                     } else {
                         log::warn!(
@@ -1438,12 +1456,21 @@ async fn run_masque(
 
         if forced.is_none() {
             let profile = std::env::var("AETHER_NOIZE").unwrap_or_else(|_| "firewall".to_string());
-            lastconn::save(&lastconn_path, &peer.to_string(), &profile);
+            lastconn::save(
+                &lastconn_path,
+                &peer.to_string(),
+                &profile,
+                masque_carrier(),
+            );
         }
 
         last_good_peer = Some(peer);
 
-        match run_masque_tunnel(&identity, peer, ech.clone(), listen).await {
+        let ended = match &gool_inner {
+            Some(path) => run_gool_tunnel(&identity, peer, tls::session_ech(), listen, path).await,
+            None => run_masque_tunnel(&identity, peer, tls::session_ech(), listen).await,
+        };
+        match ended {
             Ok(()) => log::warn!("[-] MASQUE tunnel closed; reconnecting"),
             Err(e) => log::warn!("[-] MASQUE tunnel ended: {e}; reconnecting"),
         }
@@ -1511,6 +1538,7 @@ async fn establish_masque(
             quiet: false,
             pin_endpoint: true,
             expected_pins: consts::MASQUE_PINS.iter().map(|p| p.to_vec()).collect(),
+            ech_config_list: ech,
         };
         log::info!("[+] [{label}] MASQUE transport: HTTP/2 (TCP) to {peer} (inner mtu {mtu})");
         tokio::spawn(masque_h2::run(
@@ -1571,6 +1599,16 @@ async fn establish_masque(
     })
 }
 
+async fn exit_policy_guard(
+    stack: &netstack::StackHandle,
+    policy: &Option<exitloc::Policy>,
+) -> AetherError {
+    match policy {
+        Some(policy) => exitloc::watch(stack, policy).await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn run_masque_tunnel(
     identity: &account::Identity,
     peer: SocketAddr,
@@ -1593,6 +1631,9 @@ async fn run_masque_tunnel(
     )
     .await?;
 
+    let policy = exitloc::Policy::from_env();
+    exitloc::settle(&hop.stack, &policy, "masque").await?;
+
     let socks_listener = socks::bind_listener("socks5", listen).await?;
     let http_listener = bind_http_proxy().await?;
 
@@ -1607,7 +1648,10 @@ async fn run_masque_tunnel(
         tasks.push(task.abort_handle());
     }
 
-    let tunnel_result = (&mut hop.exit).await;
+    let tunnel_result = tokio::select! {
+        result = &mut hop.exit => result,
+        reason = exit_policy_guard(&hop.stack, &policy) => return Err(reason),
+    };
 
     if let Some(task) = &http_task {
         task.abort();
@@ -1646,7 +1690,108 @@ fn mim_inner_startup() -> std::time::Duration {
     masque_startup_timeout().min(std::time::Duration::from_secs(12))
 }
 
-fn inner_masque_candidates(outer: SocketAddr, count: usize) -> Vec<SocketAddr> {
+fn edge_network(ip: IpAddr) -> Option<[u8; 3]> {
+    match ip {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            Some([octets[0], octets[1], octets[2]])
+        }
+        IpAddr::V6(_) => None,
+    }
+}
+
+fn verified_scan_selected(settings: &Option<(String, prober::IpScan)>) -> bool {
+    let named = match settings {
+        Some((mode, _)) => mode.clone(),
+        None => std::env::var("AETHER_SCAN").unwrap_or_default(),
+    };
+    prober::ScanMode::parse(&named) == prober::ScanMode::Verified
+}
+
+fn spread_hops(found: &mut [SocketAddr]) {
+    if found.len() < 2 {
+        return;
+    }
+    let first = found[0];
+    let network = edge_network(first.ip());
+    if let Some(other) = found
+        .iter()
+        .position(|peer| edge_network(peer.ip()) != network)
+    {
+        if other >= 1 {
+            found.swap(1, other);
+        }
+    }
+}
+
+fn masque_verified_ladder(outer: SocketAddr, count: usize) -> Vec<SocketAddr> {
+    if outer.is_ipv6() {
+        return Vec::new();
+    }
+
+    let mut out: Vec<SocketAddr> = Vec::new();
+    let mut seen: HashSet<SocketAddr> = HashSet::new();
+    let outer_network = edge_network(outer.ip());
+
+    let verified: Vec<IpAddr> = prober::MASQUE_VERIFIED_GATEWAYS
+        .iter()
+        .filter_map(|entry| entry.parse().ok())
+        .collect();
+
+    let push =
+        |out: &mut Vec<SocketAddr>, seen: &mut HashSet<SocketAddr>, ip: IpAddr, port: u16| {
+            let peer = SocketAddr::new(ip, port);
+            if ip != outer.ip() && seen.insert(peer) {
+                out.push(peer);
+            }
+        };
+
+    for ip in verified
+        .iter()
+        .filter(|ip| edge_network(**ip) != outer_network)
+    {
+        push(&mut out, &mut seen, *ip, MASQUE_INNER_PORT);
+    }
+    for ip in &verified {
+        push(&mut out, &mut seen, *ip, MASQUE_INNER_PORT);
+    }
+    for &port in prober::MASQUE_ALT_PORTS {
+        for ip in &verified {
+            push(&mut out, &mut seen, *ip, port);
+        }
+    }
+
+    out.truncate(count.max(1));
+    out
+}
+
+fn inner_masque_candidates(outer: SocketAddr, count: usize, verified: bool) -> Vec<SocketAddr> {
+    let mut out: Vec<SocketAddr> = Vec::new();
+    let mut seen: HashSet<SocketAddr> = HashSet::new();
+
+    if verified {
+        let room = count.saturating_sub(2).max(1);
+        for peer in masque_verified_ladder(outer, room) {
+            if seen.insert(peer) {
+                out.push(peer);
+            }
+        }
+    }
+
+    for peer in sibling_candidates(outer, count) {
+        if out.len() >= count {
+            break;
+        }
+        if seen.insert(peer) {
+            out.push(peer);
+        }
+    }
+
+    out.truncate(count.max(1));
+    out
+}
+
+fn sibling_candidates(outer: SocketAddr, count: usize) -> Vec<SocketAddr> {
     use rand::RngExt;
 
     let mut rng = rand::rng();
@@ -1807,6 +1952,9 @@ async fn run_masque_in_masque(
         ));
     };
 
+    let policy = exitloc::Policy::from_env();
+    exitloc::settle(&inner.stack, &policy, "masque-in-masque").await?;
+
     let socks_listener = socks::bind_listener("socks5", listen).await?;
     let http_listener = bind_http_proxy().await?;
 
@@ -1828,12 +1976,14 @@ async fn run_masque_in_masque(
         Outer,
         Inner,
         Socks,
+        Policy,
     }
 
     let (outcome, winner) = tokio::select! {
         result = &mut outer.exit => (join_outcome("outer masque tunnel", result), Winner::Outer),
         result = &mut inner.exit => (join_outcome("inner masque tunnel", result), Winner::Inner),
         result = &mut socks_task => (join_outcome("socks5 server", result), Winner::Socks),
+        reason = exit_policy_guard(&inner.stack, &policy) => (Err(reason), Winner::Policy),
     };
 
     if winner != Winner::Outer {
@@ -1855,7 +2005,6 @@ async fn run_masque_in_masque(
 async fn run_mim(
     primary: account::Identity,
     secondary: account::Identity,
-    ech: Option<Vec<u8>>,
     listen: SocketAddr,
 ) -> Result<()> {
     let pinned = mim_endpoints_from_env()?;
@@ -1923,7 +2072,11 @@ async fn run_mim(
 
         let candidates = match inner_peer {
             Some(peer) => vec![peer],
-            None => inner_masque_candidates(outer, MIM_INNER_TRIES),
+            None => inner_masque_candidates(
+                outer,
+                MIM_INNER_TRIES,
+                verified_scan_selected(&scan_settings),
+            ),
         };
 
         if candidates.is_empty() {
@@ -1939,7 +2092,7 @@ async fn run_mim(
             &secondary,
             outer,
             &candidates,
-            ech.clone(),
+            tls::session_ech(),
             listen,
         )
         .await
@@ -2124,31 +2277,12 @@ async fn run_wireguard(
         }
     }
 
-    // >>> AETHER-APP-PATCH scan-once-after-a-slow-cache
-    // اگر این نشست یک کشِ کند را به‌هرحال پذیرفت، نشستِ بعدی باید بداند.
-    let mut accepted_slow: Option<(SocketAddr, std::time::Duration)> = None;
-    // <<< AETHER-APP-PATCH scan-once-after-a-slow-cache
-
     if forced.is_none() && quick.is_none() {
         if let Some(cached) = lastconn::load(&lastconn_path) {
-            if let Ok(peer) = cached.peer.parse::<SocketAddr>() {
-                // >>> AETHER-APP-PATCH scan-once-after-a-slow-cache
-                // کشی که دفعهٔ پیش کند بود دوباره بی‌چون‌وچرا برداشته نمی‌شود:
-                // یک اسکن می‌خریم و floor تضمین می‌کند اگر چیزی بهتر نبود، همین
-                // برگردد. پس در بدترین حالت هزینه‌اش یک اسکن در میانِ دو نشست است،
-                // نه در هر نشست — و همان وعده‌ای است که لاگ الان می‌دهد و عمل نمی‌کند.
-                if cached.slow_rtt_ms > 0 {
-                    let slow = std::time::Duration::from_millis(cached.slow_rtt_ms);
-                    wg_prober::set_rtt_floor(peer, slow);
-                    log::info!(
-                        "[*] last session settled for {peer} at {:?}, over the budget; this session \
-                         spends one scan trying to beat it. If nothing is faster, the recorded floor \
-                         brings {peer} straight back.",
-                        slow
-                    );
-                } else if want_quick_reconnect(&cached).await {
-                    // <<< AETHER-APP-PATCH scan-once-after-a-slow-cache
-                    let profile = aethernoize::from_profile(&cached.profile);
+            let ring = lastconn::usable_peers(&cached, lastconn::CARRIER_WIREGUARD);
+            if !ring.is_empty() && want_quick_reconnect(&cached).await {
+                let profile = aethernoize::from_profile(&cached.profile);
+                for peer in ring {
                     log::info!("[*] verifying cached WireGuard endpoint {peer} before reuse");
                     match wireguard::verify_endpoint(
                         peer,
@@ -2167,55 +2301,18 @@ async fn run_wireguard(
                                 "[+] cached endpoint {peer} still works (rtt {:?}); skipping scan",
                                 rtt
                             );
-                            quick = Some((peer, profile, cached.profile.clone()));
-                            // >>> AETHER-APP-PATCH keep-the-working-cached-endpoint
-                            // پیش از این، یک endpointِ کارکن ولی کندتر از بودجه
-                            // دور انداخته می‌شد و نشست به اسکن می‌رفت. لاگ
-                            // ۲۰۲۶-۰۹-۱۶ نشان می‌دهد این شرط‌بندی چه چیزی خرید:
-                            //
-                            //     cached endpoint 162.159.192.1:4500 answered but
-                            //     is slow (rtt 486ms over the 400ms budget);
-                            //     ignoring the cache and scanning for a faster
-                            //     endpoint
-                            //     … 5s اسکن …
-                            //     endpoint 188.114.98.224:1701 (rtt 3.6s)
-                            //
-                            // یعنی ۴۸۶ms را رد کرد تا ۳.۶ ثانیه پیدا کند. سازوکارِ
-                            // rtt_floor آخرش کش را برمی‌گرداند، پس دستاورد نهایی
-                            // صفر بود و هزینه‌اش ثانیه‌هایی که کاربر روی دکمهٔ
-                            // Connect می‌نشیند — و همین تفاوتِ «موبایل سریع وصل
-                            // می‌شود، ویندوز نه» است.
-                            //
-                            // تصمیم: endpointی که همین حالا جواب داده نگه داشته
-                            // می‌شود. floor ثبت می‌شود تا اسکنِ نشستِ بعدی — که
-                            // کاربر منتظرش نیست — بداند چه چیزی را باید بشکند.
-                            // با AETHER_QUICK_RECONNECT_RESCAN_SLOW=1 رفتار قبلی
-                            // برمی‌گردد.
-                            if !cached_peer_fast_enough(peer, rtt) {
-                                wg_prober::set_rtt_floor(peer, rtt);
-                                if rescan_when_cache_is_slow() {
-                                    quick = None;
-                                } else {
-                                    // همین سطر روی دیسک هم ثبت می‌شود، وگرنه «نشستِ بعدی»
-                                    // هرگز نمی‌رسد: لاگِ ۱۷ سپتامبر دو نشست دارد که هر دو
-                                    // همین endpointِ کند را بی‌اسکن برداشتند.
-                                    accepted_slow = Some((peer, rtt));
-                                    log::info!(
-                                        "[*] using {peer} anyway: it answers, and a scan costs the \
-                                         connect several seconds to beat {:?} — the next session \
-                                         will look for something faster",
-                                        rtt
-                                    );
-                                }
-                            }
-                            // <<< AETHER-APP-PATCH keep-the-working-cached-endpoint
+                            quick = Some((peer, profile.clone(), cached.profile.clone()));
+                            break;
                         }
                         Err(e) => {
                             log::warn!(
-                                "[-] cached endpoint {peer} no longer works ({e}); scanning fresh"
+                                "[-] cached endpoint {peer} no longer answers ({e}); trying the next one"
                             );
                         }
                     }
+                }
+                if quick.is_none() {
+                    log::warn!("[-] no remembered endpoint answers; scanning fresh");
                 }
             }
         }
@@ -2253,20 +2350,7 @@ async fn run_wireguard(
             q
         } else {
             let retried = match &last_good {
-                // >>> AETHER-APP-PATCH no-retry-on-a-peer-that-just-failed
-                // شرطِ `consecutive_fails_on_peer == 0` تازه است. پیش از این،
-                // این شاخه بی‌قیدوشرط اجرا می‌شد: تونل روی یک endpoint می‌مرد،
-                // حلقه برمی‌گشت، و ۶ ثانیه صرفِ یک handshakeِ تازه با **همان**
-                // endpoint می‌شد. handshake تقریباً همیشه جواب می‌دهد — چیزی که
-                // خراب بود حملِ ترافیک بود، نه handshake — پس نتیجه‌اش وصل‌شدنِ
-                // دوباره به همان endpointِ خراب بود و باز مردن. در لاگ
-                // ۲۰۲۶-۰۹-۱۶ همین رفت‌وبرگشت دیده می‌شود.
-                //
-                // آزمونی که نتیجه‌اش را از قبل می‌دانیم، آزمون نیست؛ فقط تأخیر
-                // است. پس وقتی تونلِ همین endpoint تازه افتاده، سراغ اسکن
-                // می‌رویم و شمارندهٔ cooldown کارِ خودش را می‌کند.
-                Some((p, profile, _)) if consecutive_fails_on_peer == 0 => {
-                    // <<< AETHER-APP-PATCH no-retry-on-a-peer-that-just-failed
+                Some((p, profile, _)) => {
                     log::info!(
                         "[*] retrying last known-good WireGuard endpoint {p} before rescanning"
                     );
@@ -2289,16 +2373,6 @@ async fn run_wireguard(
                         }
                     }
                 }
-                // >>> AETHER-APP-PATCH no-retry-on-a-peer-that-just-failed
-                Some((p, _, _)) => {
-                    log::info!(
-                        "[*] not re-testing {p}: the tunnel through it just failed \
-                         ({consecutive_fails_on_peer}x) and a fresh handshake would not show that; \
-                         scanning for a different endpoint"
-                    );
-                    None
-                }
-                // <<< AETHER-APP-PATCH no-retry-on-a-peer-that-just-failed
                 None => None,
             };
 
@@ -2371,13 +2445,12 @@ async fn run_wireguard(
         log::info!("[+] using cloudflare edge {peer}");
 
         if forced.is_none() {
-            // >>> AETHER-APP-PATCH scan-once-after-a-slow-cache
-            let slow = accepted_slow
-                .filter(|(slow_peer, _)| *slow_peer == peer)
-                .map(|(_, rtt)| rtt.as_millis().min(u128::from(u64::MAX)) as u64)
-                .unwrap_or(0);
-            lastconn::save_slow(&lastconn_path, &peer.to_string(), &profile_name, slow);
-            // <<< AETHER-APP-PATCH scan-once-after-a-slow-cache
+            lastconn::save(
+                &lastconn_path,
+                &peer.to_string(),
+                &profile_name,
+                lastconn::CARRIER_WIREGUARD,
+            );
         }
 
         let is_same_peer_as_before = last_good.as_ref().map(|(p, _, _)| *p) == Some(peer);
@@ -2438,11 +2511,9 @@ async fn run_wireguard_tunnel(
     .await
     .map_err(|e| AetherError::Other(format!("tunnel failed validation: {e}")))?;
     log::info!("[+] wireguard tunnel validated (end-to-end data confirmed); exposing socks5");
-    // The bet is settled; a later reconnect must be judged on its own numbers.
-    wg_prober::clear_rtt_floor();
 
-    let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(packet_queue_capacity());
-    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(packet_queue_capacity());
+    let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(sysprofile::channel_capacity());
+    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(sysprofile::channel_capacity());
 
     let tunnel = wireguard::WgTunnel::from_established(
         session,
@@ -2461,6 +2532,9 @@ async fn run_wireguard_tunnel(
 
     let mut tasks = TaskGuard::new();
 
+    let policy = exitloc::Policy::from_env();
+    exitloc::settle(&stack, &policy, "wireguard").await?;
+
     let socks_listener = socks::bind_listener("socks5", listen).await?;
     let http_listener = bind_http_proxy().await?;
 
@@ -2473,7 +2547,10 @@ async fn run_wireguard_tunnel(
         tasks.push(task.abort_handle());
     }
 
-    let tunnel_result = tunnel.run(outbound_rx).await;
+    let tunnel_result = tokio::select! {
+        result = tunnel.run(outbound_rx) => result,
+        reason = exit_policy_guard(&stack, &policy) => return Err(reason),
+    };
 
     if let Some(task) = &http_task {
         task.abort();
@@ -2562,8 +2639,8 @@ async fn establish_wg(
     .map_err(|e| AetherError::Other(format!("[{label}] tunnel failed validation: {e}")))?;
     log::info!("[+] [{label}] wireguard tunnel validated (end-to-end data confirmed)");
 
-    let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(packet_queue_capacity());
-    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(packet_queue_capacity());
+    let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(sysprofile::channel_capacity());
+    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(sysprofile::channel_capacity());
 
     let tunnel = wireguard::WgTunnel::from_established(
         session,
@@ -2609,69 +2686,35 @@ impl Drop for TaskGuard {
     }
 }
 
-/// Budget for handing one inner-tunnel datagram to the outer stack.
-const GOOL_RELAY_HANDOFF_BUDGET: std::time::Duration = std::time::Duration::from_millis(20);
-
 async fn spawn_udp_forwarder(
     outer: &netstack::StackHandle,
     remote: SocketAddr,
 ) -> Result<(SocketAddr, TaskGuard)> {
     let sock = std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await?);
-    // A download's worth of 1200-byte datagrams overruns the default loopback
-    // buffers long before this relay is slow enough to matter.
-    upstream::tune_udp_buffers(&sock);
     let local = sock.local_addr()?;
 
     let udp = outer.open_udp().await?;
     let (udp_tx, mut udp_rx) = udp.into_split();
 
-    // parking_lot, not tokio::sync: this lock is held for a couple of instructions
-    // on the hot path of every single packet of a WARP*2 session, and an async
-    // mutex there buys nothing but scheduler work - the same per-packet hand-off
-    // that capped the WireGuard writer.
-    let inner_peer: std::sync::Arc<parking_lot::Mutex<Option<SocketAddr>>> =
-        std::sync::Arc::new(parking_lot::Mutex::new(None));
+    let inner_peer: std::sync::Arc<tokio::sync::Mutex<Option<SocketAddr>>> =
+        std::sync::Arc::new(tokio::sync::Mutex::new(None));
 
     let up_sock = sock.clone();
     let up_peer = inner_peer.clone();
     let up_task = tokio::spawn(async move {
         let mut buf = vec![0u8; 65536];
-        loop {
-            match up_sock.recv_from(&mut buf).await {
-                Ok((n, from)) => {
-                    // 2.0.0: pin the relay to the first inner peer that answers
-                    // and ignore anything else, so a stray datagram from a third
-                    // party cannot be forwarded into the outer tunnel.
-                    {
-                        let mut known = up_peer.lock();
-                        match *known {
-                            Some(peer) if peer != from => continue,
-                            Some(_) => {}
-                            None => *known = Some(from),
-                        }
+        while let Ok((n, from)) = up_sock.recv_from(&mut buf).await {
+            {
+                let mut known = up_peer.lock().await;
+                if *known != Some(from) {
+                    if let Some(previous) = *known {
+                        log::debug!("inner udp forwarder follows {from} now, was {previous}");
                     }
-                    // 1.2.3-p1: this relay carries EVERY byte of a WARP*2 session
-                    // and it used to await the handoff with no bound at all, so
-                    // whenever the outer stack was momentarily behind, the only
-                    // reader of the inner tunnel's loopback socket parked - and
-                    // the loopback receive buffer, which is small, threw away
-                    // everything that arrived meanwhile, handshake traffic
-                    // included. Waiting a few milliseconds is fine; going deaf is
-                    // not.
-                    match tokio::time::timeout(
-                        GOOL_RELAY_HANDOFF_BUDGET,
-                        udp_tx.send_to(remote, buf[..n].to_vec()),
-                    )
-                    .await
-                    {
-                        // Handed over, or dropped on purpose because the outer
-                        // stack is congested - the loss signal the inner tunnel's
-                        // congestion control is built to read.
-                        Ok(Ok(())) | Err(_) => {}
-                        Ok(Err(_)) => break,
-                    }
+                    *known = Some(from);
                 }
-                Err(_) => break,
+            }
+            if udp_tx.send_to(remote, buf[..n].to_vec()).await.is_err() {
+                break;
             }
         }
     });
@@ -2680,7 +2723,7 @@ async fn spawn_udp_forwarder(
     let down_peer = inner_peer.clone();
     let down_task = tokio::spawn(async move {
         while let Some((_src, data)) = udp_rx.recv().await {
-            let dst = *down_peer.lock();
+            let dst = *down_peer.lock().await;
             if let Some(dst) = dst {
                 let _ = down_sock.send_to(&data, dst).await;
             }
@@ -2721,6 +2764,10 @@ async fn run_warp_in_warp(
         establish_wg(&secondary, forwarder, INNER_MTU, false, 20, "inner").await?;
     tasks.push(inner_exit.abort_handle());
 
+    let policy = exitloc::Policy::from_env();
+    exitloc::settle(&inner_stack, &policy, "warp-in-warp").await?;
+    let policy_stack = inner_stack.clone();
+
     let socks_listener = socks::bind_listener("socks5", listen).await?;
     let http_listener = bind_http_proxy().await?;
 
@@ -2737,21 +2784,20 @@ async fn run_warp_in_warp(
         Outer,
         Inner,
         Socks,
+        Policy,
     }
 
     let (outcome, winner) = tokio::select! {
         result = &mut outer_exit => (join_outcome("outer wireguard tunnel", result), Winner::Outer),
         result = &mut inner_exit => (join_outcome("inner wireguard tunnel", result), Winner::Inner),
         result = &mut socks_task => (join_outcome("socks5 server", result), Winner::Socks),
+        reason = exit_policy_guard(&policy_stack, &policy) => (Err(reason), Winner::Policy),
     };
 
     if let Some(task) = &http_task {
         task.abort();
     }
 
-    // Whichever handle already resolved inside the select! above must not be
-    // polled again: tokio panics with "JoinHandle polled after completion"
-    // if you .await a JoinHandle that has already yielded Ready.
     if winner != Winner::Outer {
         outer_exit.abort();
         let _ = outer_exit.await;
@@ -2766,6 +2812,182 @@ async fn run_warp_in_warp(
     }
 
     drop(outer_stack);
+
+    outcome
+}
+
+fn gool_classic() -> bool {
+    matches!(
+        std::env::var("AETHER_GOOL_MODE").as_deref(),
+        Ok("wiw") | Ok("wg") | Ok("classic")
+    ) || ["AETHER_WIW_OUTER_PEER", "AETHER_WIW_INNER_PEER", "AETHER_WIW_PEERS"]
+        .iter()
+        .any(|key| env_value(key).is_some())
+}
+
+fn gool_inner_peers(identity: &account::Identity) -> Result<Vec<SocketAddr>> {
+    if let Some(value) = env_value("AETHER_GOOL_INNER") {
+        return Ok(vec![parse_endpoint(&value)?]);
+    }
+    let mut peers: Vec<SocketAddr> = Vec::new();
+    let named = std::iter::once(identity.assigned_endpoint.trim())
+        .chain(wireguard::wg_seeds_v4());
+    for host in named {
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            let peer = SocketAddr::new(ip, WG_EXAMPLE_PORT);
+            if !peers.contains(&peer) {
+                peers.push(peer);
+            }
+        }
+    }
+    Ok(peers)
+}
+
+async fn gool_inner_identity(
+    outer: &netstack::StackHandle,
+    inner_path: &str,
+) -> Result<account::Identity> {
+    if let Some(identity) = config::load(inner_path)? {
+        log::info!("[+] loaded the gool wireguard identity from {inner_path}");
+        return Ok(identity);
+    }
+
+    let listener = socks::bind_listener("socks5", "127.0.0.1:0".parse().unwrap()).await?;
+    let through = listener.local_addr()?;
+    let stack = outer.clone();
+    let socks_task = tokio::spawn(async move { socks::serve(listener, stack).await });
+    let _socks_guard = TaskGuard(vec![socks_task.abort_handle()]);
+
+    log::info!("[*] registering the gool wireguard identity through the masque tunnel");
+    let previous = std::env::var("AETHER_UPSTREAM").ok();
+    std::env::set_var("AETHER_UPSTREAM", format!("socks5h://{through}"));
+    let registered = account::provision_wg(consts::DEFAULT_MODEL, consts::DEFAULT_LOCALE, None).await;
+    if let Ok(id) = &registered {
+        if let Err(e) = account::enable_warp(&id.device_id, &id.access_token).await {
+            log::warn!("[-] could not enable warp on the gool identity: {e}");
+        }
+    }
+    match previous {
+        Some(value) => std::env::set_var("AETHER_UPSTREAM", value),
+        None => std::env::remove_var("AETHER_UPSTREAM"),
+    }
+    let identity = registered?;
+    config::save(inner_path, &identity)?;
+    log::info!(
+        "[+] gool wireguard identity registered from inside warp and saved to {inner_path}: device={} ipv4={}",
+        identity.device_id,
+        identity.ipv4
+    );
+    Ok(identity)
+}
+
+const GOOL_INNER_ATTEMPTS: u32 = 2;
+
+async fn run_gool_tunnel(
+    identity: &account::Identity,
+    peer: SocketAddr,
+    ech: Option<Vec<u8>>,
+    listen: SocketAddr,
+    inner_path: &str,
+) -> Result<()> {
+    let h2 = masque_h2::enabled();
+    let dial = if h2 { masque_h2::h2_peer(peer) } else { peer };
+
+    let mut outer = establish_masque(
+        identity,
+        dial,
+        ech,
+        h2,
+        masque_tunnel_mtu(),
+        quic::MAX_DATAGRAM_SIZE,
+        true,
+        masque_startup_timeout(),
+        "outer",
+    )
+    .await?;
+
+    let inner_identity = gool_inner_identity(&outer.stack, inner_path).await?;
+    let candidates = gool_inner_peers(&inner_identity)?;
+
+    let mut established = None;
+    let mut last_error = AetherError::Other("no wireguard endpoint to try".into());
+    'peers: for inner_peer in candidates {
+        let (forwarder, forwarder_guard) = spawn_udp_forwarder(&outer.stack, inner_peer).await?;
+        log::info!("[*] wireguard to {inner_peer} rides inside the masque tunnel via {forwarder}");
+        for attempt in 1..=GOOL_INNER_ATTEMPTS {
+            match establish_wg(&inner_identity, forwarder, INNER_MTU, false, 25, "inner").await {
+                Ok(hop) => {
+                    established = Some((inner_peer, hop, forwarder_guard));
+                    break 'peers;
+                }
+                Err(e) => {
+                    log::warn!("[-] inner wireguard {inner_peer} attempt {attempt} failed: {e}");
+                    last_error = e;
+                }
+            }
+        }
+    }
+    let Some((inner_peer, (inner_stack, mut inner_exit), _forwarder_guard)) = established else {
+        return Err(last_error);
+    };
+    if inner_identity.assigned_endpoint != inner_peer.ip().to_string()
+        && env_value("AETHER_GOOL_INNER").is_none()
+    {
+        let remembered = account::Identity {
+            assigned_endpoint: inner_peer.ip().to_string(),
+            ..inner_identity.clone()
+        };
+        if config::save(inner_path, &remembered).is_ok() {
+            log::info!("[+] gool remembers {} as its wireguard endpoint", inner_peer.ip());
+        }
+    }
+
+    let policy = exitloc::Policy::from_env();
+    exitloc::settle(&inner_stack, &policy, "gool").await?;
+    let policy_stack = inner_stack.clone();
+
+    let socks_listener = socks::bind_listener("socks5", listen).await?;
+    let http_listener = bind_http_proxy().await?;
+
+    let mut tasks = TaskGuard::new();
+    let http_task = spawn_http_proxy(http_listener, &inner_stack);
+    if let Some(task) = &http_task {
+        tasks.push(task.abort_handle());
+    }
+    let socks_stack = inner_stack.clone();
+    let mut socks_task =
+        tokio::spawn(async move { socks::serve(socks_listener, socks_stack).await });
+    tasks.push(socks_task.abort_handle());
+
+    log::info!("[+] gool ready: masque {peer} carries wireguard {inner_peer}");
+
+    #[derive(PartialEq)]
+    enum Winner {
+        Outer,
+        Inner,
+        Socks,
+        Policy,
+    }
+
+    let (outcome, winner) = tokio::select! {
+        result = &mut outer.exit => (join_outcome("outer masque tunnel", result), Winner::Outer),
+        result = &mut inner_exit => (join_outcome("inner wireguard tunnel", result), Winner::Inner),
+        result = &mut socks_task => (join_outcome("socks5 server", result), Winner::Socks),
+        reason = exit_policy_guard(&policy_stack, &policy) => (Err(reason), Winner::Policy),
+    };
+
+    if winner != Winner::Outer {
+        outer.exit.abort();
+        let _ = (&mut outer.exit).await;
+    }
+    if winner != Winner::Inner {
+        inner_exit.abort();
+        let _ = (&mut inner_exit).await;
+    }
+    if winner != Winner::Socks {
+        socks_task.abort();
+        let _ = (&mut socks_task).await;
+    }
 
     outcome
 }
@@ -2802,10 +3024,8 @@ async fn prompt_line(prompt: &str) -> Option<String> {
     }
 }
 
-const SCAN_MODE_PROMPT: &str = "\nScan mode:\n  [1] turbo     (fast, first hit)\n  [2] balanced  (default)\n  [3] thorough  (deep, best ping)\n  [4] stealth   (quiet, patient)\n  [5] ironclad  (real tunnel + real HTTP check per candidate, guaranteed working)\nChoose [1-5] (default 2): ";
+const SCAN_MODE_PROMPT: &str = "\nScan mode:\n  [1] turbo     (fast, first hit)\n  [2] balanced  (default)\n  [3] thorough  (deep, best ping)\n  [4] verified  (measured edges only, never a guessed neighbour; on gool and\n                 mim it keeps the two hops in different ranges, which is what\n                 moves the exit address)\n  [5] ironclad  (real tunnel + real HTTP check per candidate, guaranteed working)\nChoose [1-5] (default 2): ";
 
-/// Shown above the scan mode question on warp-in-warp, where the addresses can
-/// be handed over instead of hunted for.
 const MIM_MANUAL_TIP: &str = "\n(tip: you can skip this scan and give the two masque hops yourself:\n        aether --mim --mim-outer <ip:port> --mim-inner <ip:port>\n      the port is required, and naming just the outer one lets aether pick\n      the inner edge for you)\n";
 
 const WIW_MANUAL_TIP: &str = "\n(tip: you can skip this scan and give the two gool hops yourself:\n        aether --gool --wiw-outer <ip:port> --wiw-inner <ip:port>\n      the port is required, and naming just one of the two lets the scan\n      find the other)\n";
@@ -2820,14 +3040,12 @@ async fn select_scan_mode() -> prober::ScanMode {
     match answer.as_deref() {
         Some("1") => prober::ScanMode::Turbo,
         Some("3") => prober::ScanMode::Thorough,
-        Some("4") => prober::ScanMode::Stealth,
+        Some("4") => prober::ScanMode::Verified,
         Some("5") => prober::ScanMode::Ironclad,
         _ => prober::ScanMode::Balanced,
     }
 }
 
-/// `tip` is printed above the question, for whatever the caller wants to point
-/// out about scanning in the mode it is about to run.
 async fn select_scan_mode_str(tip: &str) -> String {
     if let Ok(v) = std::env::var("AETHER_SCAN") {
         return v;
@@ -2838,7 +3056,7 @@ async fn select_scan_mode_str(tip: &str) -> String {
     match answer.as_deref() {
         Some("1") => "turbo".to_string(),
         Some("3") => "thorough".to_string(),
-        Some("4") => "stealth".to_string(),
+        Some("4") => "verified".to_string(),
         Some("5") => "ironclad".to_string(),
         _ => "balanced".to_string(),
     }
@@ -2850,17 +3068,40 @@ async fn select_protocol(base: &str) -> Protocol {
     }
 
     loop {
-        let (tor_entries, last) = if cfg!(feature = "tor") {
-            (
-                "  [5] Tor alone, with no warp under it\n  \
-                 [6] Tor and warp chained, either way round\n"
-                    .to_string(),
-                7,
-            )
-        } else {
-            (String::new(), 5)
+        let mut extra = String::new();
+        let mut next = 5u8;
+        let take = |line: &str, extra: &mut String, next: &mut u8| -> String {
+            let key = next.to_string();
+            extra.push_str(&format!("  [{key}] {line}\n"));
+            *next += 1;
+            key
         };
 
+        let (tor_alone, tor_chain) = if cfg!(feature = "tor") {
+            (
+                take("Tor alone, with no warp under it", &mut extra, &mut next),
+                take(
+                    "Tor and warp chained, either way round",
+                    &mut extra,
+                    &mut next,
+                ),
+            )
+        } else {
+            (String::new(), String::new())
+        };
+
+        let psiphon_alone = take(
+            "Psiphon alone, with no warp under it",
+            &mut extra,
+            &mut next,
+        );
+        let psiphon_chain = take(
+            "Psiphon and warp chained, either way round",
+            &mut extra,
+            &mut next,
+        );
+
+        let last = next;
         let zero_trust_key = last.to_string();
         let zero_trust = match team_scope() {
             Some(team) => {
@@ -2875,26 +3116,71 @@ async fn select_protocol(base: &str) -> Protocol {
             "\nProtocol:\n  [1] MASQUE (modern, QUIC/H3, default)\n  \
              [2] WireGuard (classic, faster)\n  [3] WARP-in-WARP / gool\n  \
              [4] MASQUE-in-MASQUE (two masque hops, for a different exit address)\n\
-             {tor_entries}{zero_trust}Choose [1-{last}] (default 1): "
+             {extra}{zero_trust}Choose [1-{last}] (default 1): "
         ))
         .await;
 
-        match answer.as_deref() {
-            Some("2") => return Protocol::WireGuard,
-            Some("3") => return Protocol::WarpInWarp,
-            Some("4") => return Protocol::MasqueInMasque,
-            Some(choice) if choice == zero_trust_key => {
+        let choice = answer.as_deref().unwrap_or_default();
+
+        match choice {
+            "2" => return Protocol::WireGuard,
+            "3" => return select_gool().await,
+            "4" => return Protocol::MasqueInMasque,
+            _ if choice == zero_trust_key => {
                 enrol_zero_trust(base).await;
                 continue;
             }
-            Some("5") if cfg!(feature = "tor") => {
+            _ if !tor_alone.is_empty() && choice == tor_alone => {
                 std::env::set_var("AETHER_TOR", "only");
                 return Protocol::Masque;
             }
-            Some("6") if cfg!(feature = "tor") => return select_tor_chain().await,
+            _ if !tor_chain.is_empty() && choice == tor_chain => return select_tor_chain().await,
+            _ if choice == psiphon_alone => {
+                std::env::set_var("AETHER_PSIPHON", "only");
+                return Protocol::Masque;
+            }
+            _ if choice == psiphon_chain => return select_psiphon_chain().await,
             _ => return Protocol::Masque,
         }
     }
+}
+
+async fn select_gool() -> Protocol {
+    let answer = prompt_line(
+        "\nWhich gool?\n  \
+         [1] gool over masque: wireguard carried inside a masque tunnel, for a foreign exit \
+         address (default)\n  \
+         [2] classic gool: wireguard carried inside wireguard, a plain warp exit\n\
+         Choose [1-2] (default 1): ",
+    )
+    .await;
+
+    if matches!(answer.as_deref(), Some("2")) {
+        std::env::set_var("AETHER_GOOL_MODE", "classic");
+    }
+    Protocol::WarpInWarp
+}
+
+async fn select_psiphon_chain() -> Protocol {
+    let answer = prompt_line(
+        "\nWhich way round?\n  \
+         [1] psiphon inside warp: you, warp, psiphon, the internet. The exit is a psiphon \
+         exit, and a network that blocks psiphon never sees it (default)\n  \
+         [2] warp inside psiphon: you, psiphon, warp, the internet. The exit is a warp exit \
+         reached from a psiphon exit, and your network never sees warp\n\
+         Choose [1-2] (default 1): ",
+    )
+    .await;
+
+    if matches!(answer.as_deref(), Some("2")) {
+        std::env::set_var("AETHER_PSIPHON", "reverse");
+        log::info!("[*] the tunnel will be dialled through psiphon, on the http/2 carrier");
+        return Protocol::Masque;
+    }
+
+    std::env::set_var("AETHER_PSIPHON", "chain");
+    log::info!("[*] psiphon will be carried inside the tunnel");
+    select_chain_carrier("psiphon").await
 }
 
 async fn select_tor_chain() -> Protocol {
@@ -2916,23 +3202,23 @@ async fn select_tor_chain() -> Protocol {
 
     std::env::set_var("AETHER_TOR", "chain");
     log::info!("[*] tor will be carried inside the tunnel");
-    select_chain_carrier().await
+    select_chain_carrier("tor").await
 }
 
-async fn select_chain_carrier() -> Protocol {
-    let answer = prompt_line(
-        "\nWhat carries tor?\n  \
+async fn select_chain_carrier(what: &str) -> Protocol {
+    let answer = prompt_line(&format!(
+        "\nWhat carries {what}?\n  \
          [1] MASQUE, over quic/h3 or http/2, asked next (default)\n  \
          [2] WireGuard, warp over udp\n  \
          [3] WARP-in-WARP / gool\n  \
          [4] MASQUE-in-MASQUE\n\
-         Choose [1-4] (default 1): ",
-    )
+         Choose [1-4] (default 1): "
+    ))
     .await;
 
     match answer.as_deref() {
         Some("2") => Protocol::WireGuard,
-        Some("3") => Protocol::WarpInWarp,
+        Some("3") => select_gool().await,
         Some("4") => Protocol::MasqueInMasque,
         _ => Protocol::Masque,
     }
@@ -3006,31 +3292,6 @@ async fn select_ip_version() -> prober::IpScan {
     }
 }
 
-// >>> AETHER-APP-PATCH packet-queue-depth
-/// Depth of the two PACKET handoff queues (netstack <-> WireGuard), in packets.
-///
-/// 1.2.3-p1 BUFFERBLOAT FIX. These two were sized from
-/// `sysprofile::channel_capacity()`, which is an *application* queue depth and is
-/// 1024 on a normal PC. 1024 packets at a 1280-byte MTU is ~1.3 MB of standing
-/// queue in EACH direction, on top of the netstack's own retained burst.
-///
-/// That queue is pure latency, and latency is the other half of the download
-/// speed problem: throughput per flow is window / RTT, so a megabyte of local
-/// queue in front of every ACK lowers the ceiling exactly as effectively as a
-/// small window does. In chained mode the whole machine rides one Psiphon
-/// connection, so the queue is shared by every flow at once.
-///
-/// These queues are a device transmit/receive ring, not a congestion window.
-/// Throughput is governed by smoltcp's own socket buffers
-/// (`sysprofile::netstack_tcp_rx_buf_bytes`), so keeping the ring short costs no
-/// bandwidth and buys back the whole queueing delay. 256 packets (~320 KB) is
-/// still an order of magnitude more than any scheduling hiccup needs.
-fn packet_queue_capacity() -> usize {
-    const PACKET_QUEUE_MAX: usize = 256;
-    sysprofile::channel_capacity().min(PACKET_QUEUE_MAX).max(64)
-}
-// <<< AETHER-APP-PATCH packet-queue-depth
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3042,6 +3303,30 @@ mod tests {
             .map(|(key, value)| (key.to_string(), value.to_string()))
             .collect();
         move |key: &str| values.get(key).cloned()
+    }
+
+    #[test]
+    fn register_names_the_identities_of_one_protocol_or_all_four() {
+        let all = RegisterSet::parse("all").expect("all");
+        assert!(all.wireguard && all.wireguard_inner && all.masque && all.masque_inner);
+
+        let masque = RegisterSet::parse(" MASQUE ").expect("masque");
+        assert!(masque.masque && !masque.masque_inner);
+        assert!(!masque.wireguard && !masque.wireguard_inner);
+
+        let wireguard = RegisterSet::parse("wg").expect("wg");
+        assert!(wireguard.wireguard && !wireguard.wireguard_inner);
+        assert!(!wireguard.masque && !wireguard.masque_inner);
+
+        let gool = RegisterSet::parse("gool").expect("gool");
+        assert!(gool.wireguard && gool.wireguard_inner);
+        assert!(!gool.masque && !gool.masque_inner);
+
+        let mim = RegisterSet::parse("mim").expect("mim");
+        assert!(mim.masque && mim.masque_inner);
+        assert!(!mim.wireguard && !mim.wireguard_inner);
+
+        assert!(RegisterSet::parse("everything").is_err());
     }
 
     #[test]
@@ -3124,7 +3409,7 @@ mod tests {
     #[test]
     fn the_inner_edges_come_from_the_range_that_answered() {
         let outer: SocketAddr = "162.159.198.104:8443".parse().unwrap();
-        let candidates = inner_masque_candidates(outer, MIM_INNER_TRIES);
+        let candidates = inner_masque_candidates(outer, MIM_INNER_TRIES, false);
 
         assert_eq!(candidates.len(), MIM_INNER_TRIES);
         for candidate in &candidates {
@@ -3155,9 +3440,65 @@ mod tests {
     }
 
     #[test]
+    fn the_verified_ladder_leaves_the_outer_range_first() {
+        let outer: SocketAddr = "162.159.198.1:443".parse().unwrap();
+        let candidates = inner_masque_candidates(outer, MIM_INNER_TRIES, true);
+
+        assert!(!candidates.is_empty());
+        assert!(candidates.iter().all(|peer| peer.ip() != outer.ip()));
+
+        let first = candidates[0];
+        assert_ne!(
+            edge_network(first.ip()),
+            edge_network(outer.ip()),
+            "the first inner candidate must leave the outer range"
+        );
+
+        let verified: HashSet<IpAddr> = prober::MASQUE_VERIFIED_GATEWAYS
+            .iter()
+            .filter_map(|entry| entry.parse().ok())
+            .collect();
+        let measured = candidates
+            .iter()
+            .take_while(|peer| verified.contains(&peer.ip()))
+            .count();
+        assert!(measured > 0, "the measured edges must come first");
+        assert!(
+            candidates.len() > measured,
+            "a guessed neighbour must stay on the end: a verified address is only \
+             verified for the path it was measured on"
+        );
+    }
+
+    #[test]
+    fn a_verified_ladder_is_not_used_for_an_ipv6_outer() {
+        let outer: SocketAddr = "[2606:4700:d0::a29f:c601]:443".parse().unwrap();
+        let candidates = inner_masque_candidates(outer, 4, true);
+
+        assert!(candidates.iter().all(|candidate| candidate.is_ipv6()));
+    }
+
+    #[test]
+    fn spreading_hops_puts_a_different_range_second() {
+        let mut found: Vec<SocketAddr> = vec![
+            "162.159.192.1:2408".parse().unwrap(),
+            "162.159.192.9:2408".parse().unwrap(),
+            "188.114.96.1:2408".parse().unwrap(),
+        ];
+        spread_hops(&mut found);
+
+        assert_eq!(edge_network(found[0].ip()), Some([162, 159, 192]));
+        assert_ne!(
+            edge_network(found[1].ip()),
+            edge_network(found[0].ip()),
+            "the second hop must sit in another range"
+        );
+    }
+
+    #[test]
     fn an_ipv6_outer_edge_yields_ipv6_inner_candidates() {
         let outer: SocketAddr = "[2606:4700:d0::a29f:c601]:443".parse().unwrap();
-        let candidates = inner_masque_candidates(outer, 4);
+        let candidates = inner_masque_candidates(outer, 4, false);
 
         assert_eq!(candidates.len(), 4);
         assert!(candidates.iter().all(|candidate| candidate.is_ipv6()));

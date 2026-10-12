@@ -253,15 +253,3 @@ If Aether has been useful to you, consider supporting its development:
 ## License
 
 See the LICENSE file for licensing information.
-
-
-## Note on the 1.2.9 AI features (Android app only)
-
-The Gemini AI features added in AetherMobile 1.2.9 - the user's own API key, model
-discovery, the per-setting explanations, the DPI/log settings advisor and the
-in-app chat - live entirely in the **Android app layer**
-(`app/src/main/java/studio/cluvex/aether/ai/`). This engine is unchanged by them:
-no new option, no new environment variable, no new network path. The AI talks to
-Google through the tunnel the engine builds, using the app's own local SOCKS5
-proxy, and the only thing it may write is a subset of the app's own tuning
-options - never an engine credential, a peer address or a routing rule.

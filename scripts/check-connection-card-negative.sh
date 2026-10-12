@@ -8,7 +8,6 @@ set -u
 cd "$(dirname "$0")/.."
 
 GUARD=scripts/check-connection-card.py
-K=native/aether/aether/src/tor.rs
 S=src-tauri/src/state.rs
 P=src-tauri/src/probe.rs
 E=src-tauri/src/engine.rs
@@ -17,11 +16,11 @@ C=src/views/connectioncard.js
 N=src-tauri/src/tor_native.rs
 F=src-tauri/src/firsthop.rs
 
-cp "$K" /tmp/c.kern; cp "$S" /tmp/c.state; cp "$P" /tmp/c.probe
+cp "$S" /tmp/c.state; cp "$P" /tmp/c.probe
 cp "$E" /tmp/c.engine; cp "$M" /tmp/c.main; cp "$C" /tmp/c.card
 cp "$N" /tmp/c.native; cp "$F" /tmp/c.firsthop
 restore() {
-  cp /tmp/c.kern "$K"; cp /tmp/c.state "$S"; cp /tmp/c.probe "$P"
+  cp /tmp/c.state "$S"; cp /tmp/c.probe "$P"
   cp /tmp/c.engine "$E"; cp /tmp/c.main "$M"; cp /tmp/c.card "$C"
   cp /tmp/c.native "$N"; cp /tmp/c.firsthop "$F"
 }
@@ -54,19 +53,6 @@ expect_red() { # نام
 }
 
 echo "کنترل‌های منفی — کارتِ اتصال و زنجیره‌های تور"
-
-# ۱) رانتایم به مسیرِ async برمی‌گردد — همان پانیکِ loge3
-python3 - "$K" <<'PY'
-import sys, pathlib
-p = pathlib.Path(sys.argv[1]); t = p.read_text(encoding="utf-8")
-t = t.replace('.name("tor-runtime-birth".to_string())', '.name("tor-runtime".to_string())')
-p.write_text(t, encoding="utf-8")
-PY
-expect_red "نامِ تردِ تولد گم شود (رانتایم دوباره در async ساخته می‌شود)"
-
-# ۲) ساختِ کلاینت به شکلِ همگام برمی‌گردد (قفلِ فایل، executor بسته)
-sed -i 's/create_unbootstrapped_async()/create_unbootstrapped()/' "$K"
-expect_red "ساختِ همگامِ کلاینت"
 
 # ۳) دروازه دوباره منتظرِ پورتِ خروجیِ زنجیره می‌شود — قفلِ دوطرفهٔ loge4
 python3 - "$S" <<'PY'
@@ -106,27 +92,15 @@ expect_red "برگشتِ اندپوینت به IPِ خروجی"
 sed -i 's/token.parse::<SocketAddr>()/Ok::<String, ()>(token.to_string())/' "$F"
 expect_red "پذیرشِ هر واژه به‌جای نشانی"
 
-# ۹) کاشیِ پروتکل به شکلِ قبلی برمی‌گردد — «SMART» در حالتِ تورِ تنها
+# ۹) کاشیِ پروتکل به شکلِ قبلی برمی‌گردد — «SMART» در حالتِ تور و تور → سایفون
 python3 - "$S" <<'PY'
-import sys, pathlib, re
+import sys, pathlib
 p = pathlib.Path(sys.argv[1]); t = p.read_text(encoding="utf-8")
-# بی‌توجه به قالب‌بندی: هر چه `cargo fmt` با فاصله‌ها و شکستِ سطر کرده
-# باشد، شرطِ دولایه را به شکلِ قدیمی برمی‌گردانیم.
-alt = """        if self.chain_exit_port.is_some() {
-            if let Some(label) = self.profile.backend.protocol_label() {
-                return Some(label.to_string());
-            }
-        }"""
-muster = re.compile(
-    r"        if let Some\(label\) = self\.profile\.backend\.protocol_label\(\) \{\s*"
-    r"\n\s*if !self\.profile\.is_chained\(\) \|\| self\.chain_exit_port\.is_some\(\) \{"
-    r"\s*\n\s*return Some\(label\.to_string\(\)\);\s*\n\s*\}\s*\n\s*\}"
-)
-neu, zahl = muster.subn(alt, t, count=1)
-assert zahl == 1, "شکلِ تازهٔ display_protocol پیدا نشد"
-p.write_text(neu, encoding="utf-8")
+alt = "            return pipeline_name.map(str::to_string);\n"
+assert alt in t, "شکلِ تازهٔ display_protocol پیدا نشد"
+p.write_text(t.replace(alt, "            let _ = &pipeline_name;\n", 1), encoding="utf-8")
 PY
-expect_red "برگشتِ display_protocol به شرطِ زنجیره"
+expect_red "برگشتِ SMART برای Tor → Psiphon"
 
 # ۱۰) `T1` دوباره کشور حساب می‌شود — پرچمِ کره‌ای
 sed -i 's/^const PSEUDO: \[&str; 5\]/const PSEUDO: [\&str; 4]/' "$P"
@@ -185,7 +159,7 @@ expect_red "نیفتادنِ فرستندهٔ اصلی"
 
 echo
 if [ "$fails" -eq 0 ]; then
-  echo "✓ همهٔ ۱۶ کنترلِ منفی قرمز شدند"
+  echo "✓ همهٔ ۱۴ کنترلِ منفی قرمز شدند"
   exit 0
 fi
 echo "✗ $fails کنترلِ منفی نگرفت"

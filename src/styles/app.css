@@ -1125,6 +1125,7 @@ html[dir="rtl"] .switch.is-on .switch__knob { transform: translateX(-20px); }
 .ai__probe.is-ok { color: var(--aether-cyan); }
 .ai__probe.is-bad { color: #ff8fa3; }
 
+.ai__section[hidden] { display: none; }
 .ai__models { display: flex; flex-direction: column; gap: 6px; }
 .ai__model {
   display: flex; align-items: center; gap: 10px;
@@ -1139,8 +1140,10 @@ html[dir="rtl"] .switch.is-on .switch__knob { transform: translateX(-20px); }
 }
 .ai__model:hover { background: color-mix(in srgb, #ffffff 8%, transparent); }
 .ai__model.is-active { border-color: #8b7cff; background: color-mix(in srgb, #8b7cff 15%, transparent); }
-.ai__modelname { flex: 1; }
-.ai__modelmeta { font-size: 11px; color: var(--text-dim, #8b97a8); }
+.ai__modeldetail { display: flex; flex: 1; flex-direction: column; align-items: flex-start; gap: 4px; min-width: 0; }
+.ai__modelname { font-size: 12.5px; }
+.ai__modelmeta { font-size: 11px; color: var(--text-dim, #8b97a8); line-height: 1.5; }
+.ai__modellimits { font-size: 10px; color: var(--text-dim, #8b97a8); }
 
 .ai__advisor { display: flex; flex-direction: column; gap: 5px; }
 .ai__reason { margin: 0; font-size: 12.5px; line-height: 1.75; color: var(--text, #e6edf6); }
@@ -1178,6 +1181,116 @@ html[dir="rtl"] .switch.is-on .switch__knob { transform: translateX(-20px); }
 /* =============================================================================
    v1.2.4 — منوی تنظیمات (پورت a2)
    ============================================================================= */
+
+/* >>> AETHER-APP-PATCH connection-page-a1-a2
+   صفحهٔ اتصال: پیکِ موبایل (برگهٔ پایینی a1) و کاشی‌های دوستونه (a2) + کارتِ گروهی.
+   ========================================================================== */
+
+/* کارتِ گروهی: برچسب فوق‌العاده + کارت + یادداشتِ پائین. */
+.scard-group { display: flex; flex-direction: column; gap: 8px; }
+.scard__caption { margin: 0; }
+.scard { padding: 0; overflow: visible; }
+.scard--fields > * { border-top: 1px solid rgba(255, 255, 255, 0.07); }
+.scard--fields > :first-child { border-top: 0; }
+.scard__block { display: flex; flex-direction: column; gap: 8px; }
+.scard__footer { margin: 0; font-size: 13px; line-height: 1.65; color: var(--on-dark-muted); }
+
+/* ردیفِ انتخاب برگه‌ای (a1): آیکن + عنوان/توضیح + مقدارِ فعلی، با شامل‌شدن پرچم. */
+.field--pick { padding: 15px 16px; display: flex; flex-direction: column; gap: 8px; margin: 0; }
+.field--pick:first-child { padding-top: 12px; }
+.pick { display: flex; align-items: center; gap: 12px; cursor: pointer; padding: 0; border: 0; background: none; }
+.pick:focus-visible { outline: 2px solid #4c8dff; outline-offset: -2px; border-radius: 10px; margin: 0 -4px; padding: 0 4px; }
+.pick[aria-disabled="true"] { opacity: 0.45; cursor: not-allowed; }
+.pick__icon { flex: 0 0 32px; display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; border-radius: 10px; background: color-mix(in srgb, #4c8dff 12%, transparent); color: #8fb6ff; }
+.pick__text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.pick__text .field__label { font-size: 13.5px; font-weight: 500; }
+.pick__text .field__hint { margin: 0; font-size: 11px; }
+.pick__value { flex: 0 1 40%; display: flex; align-items: center; gap: 6px; font-size: 13px; color: #6f9fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.seg__flag { flex: 0 0 auto; width: 18px; height: 12px; display: inline-block; }
+.pick__chev { flex: 0 0 auto; color: var(--text-dim, #8b97a8); display: inline-flex; }
+
+/* برگهٔ پایینی برای انتخاب بک‌اند / کشور. شامل جعبهٔ شفاف + پنلِ پایینی. */
+.sheet { position: fixed; top: 0; left: 0; right: 0; bottom: 0; z-index: 2000; display: flex; flex-direction: column; pointer-events: none; }
+.sheet:not([hidden]) { pointer-events: auto; }
+.sheet__scrim { flex: 1; background: rgba(0, 0, 0, 0.5); pointer-events: auto; }
+.sheet__panel { margin-top: auto; border-radius: 28px 28px 0 0; background: var(--navy-800); padding: 20px 0; display: flex; flex-direction: column; gap: 16px; max-height: 75vh; overflow-y: auto; transform: translateY(100%); transition: transform 300ms cubic-bezier(0.2, 0, 0.3, 1); }
+.sheet.is-open .sheet__panel { transform: translateY(0); }
+.sheet__handle { width: 36px; height: 4px; border-radius: 2px; background: rgba(255, 255, 255, 0.2); align-self: center; margin: 8px 0 4px; }
+.sheet__title { margin: 0 20px; font-size: 20px; font-weight: 600; color: var(--text, #e6edf6); }
+
+/* کاشی‌های دوستونه (a2) برای پروتکل و نسخهٔ IP. */
+.field--tiles { display: flex; flex-direction: column; gap: 8px; }
+.seg--grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 8px;
+  padding: 12px;
+  background: transparent;
+  border: none;
+}
+.seg--odd .seg__item:last-child { grid-column: 1 / -1; }
+.seg--grid .seg__item {
+  flex: none;
+  width: auto;
+  padding: 14px;
+  border-radius: 14px;
+  background: var(--navy-700);
+  border: 2px solid transparent;
+  position: relative;
+}
+.seg--grid .seg__item:hover { background: var(--navy-600); }
+.seg--grid .seg__item.is-active {
+  background: color-mix(in srgb, #4c8dff 18%, transparent);
+  border-color: #4c8dff;
+}
+.seg--grid .seg__item:disabled { opacity: 0.45; cursor: not-allowed; }
+.seg--grid .seg__text { font-size: 13px; font-weight: 500; white-space: normal; }
+.seg__check {
+  position: absolute;
+  top: 6px; right: 6px;
+  display: none;
+  color: #4c8dff;
+}
+.seg__item.is-active .seg__check { display: inline-flex; }
+
+/* کاشی‌های برگه‌ای (روی پنلِ پایینی) — یک‌ستونی و پهن‌تر. */
+.seg--sheet {
+  display: flex;
+  flex-direction: column;
+  padding: 8px 12px;
+  gap: 4px;
+  background: transparent;
+  border: none;
+}
+.seg--sheet .seg__item {
+  flex: 1 1 auto;
+  width: auto;
+  justify-content: flex-start;
+  gap: 12px;
+  padding: 12px 14px;
+  background: transparent;
+  border: 2px solid transparent;
+  border-radius: 12px;
+  color: var(--on-dark-muted);
+  font-size: 14px;
+}
+.seg--sheet .seg__item:hover { background: color-mix(in srgb, #ffffff 5%, transparent); }
+.seg--sheet .seg__item.is-active {
+  background: var(--navy-700);
+  color: #fff;
+  border-color: #4c8dff;
+}
+.seg--sheet .seg__item:disabled { opacity: 0.45; }
+.seg--sheet .seg__text { flex: 1; }
+.seg--sheet .seg__flag { order: -1; }
+.seg--sheet .seg__check { position: static; }
+
+/* یادداشتِ i — فقط زیر پروتکل. */
+.pnote { display: flex; gap: 8px; padding: 12px; margin: 8px 12px 0; border-radius: 12px; background: color-mix(in srgb, #4c8dff 8%, transparent); font-size: 12px; line-height: 1.5; color: #b0c5ff; }
+.pnote__icon { flex: 0 0 18px; color: #6f9fff; }
+.pnote__text { flex: 1; }
+
+/* <<< AETHER-APP-PATCH connection-page-a1-a2
 
 .view--settings { display: flex; flex-direction: column; gap: 4px; }
 
@@ -1264,3 +1377,465 @@ html[dir="rtl"] .switch.is-on .switch__knob { transform: translateX(-20px); }
 /* برچسبِ گزینه + ✨ در یک ردیف — چیدمان a2. */
 .field__head { display: flex; align-items: center; gap: 8px; }
 .field__head .field__label { flex: 1; min-width: 0; }
+
+/* >>> AETHER-APP-PATCH fit-to-content-1.3.0-r4
+   ============================================================================
+   سه ایرادِ چیدمان در تصاویر a1/a2/a3 — هر سه از یک ریشه: اندازهٔ عناصر از
+   ظرف گرفته می‌شد، نه از محتوا.
+   ۱) a1: `.scard` پدینگ صفر دارد (برای ردیف‌های پیک که پدینگ خودشان را دارند)،
+      ولی بلوکِ کاشی‌ها پدینگ نداشت؛ پس برچسب «پروتکل» و ✨ دقیقاً روی لبهٔ کارت
+      می‌نشستند و بیرون‌زده دیده می‌شدند. کاشی‌ها هم دوستونهٔ تمام‌عرض بودند و
+      گزینهٔ پنجمِ تک، کل عرض را می‌گرفت.
+   ۲) a2: برگهٔ پایینی تمام‌عرضِ پنجره بود و گزینه‌ها یک ستونِ عمودیِ کشیده.
+      حالا یک پنل با عرض محدود و گزینه‌ها شبکه‌ای افقی و خودتنظیم‌اند.
+   ۳) a3: کارت اتصال به دکمه چسبیده بود و برای دسکتاپ پهن بود.
+   همه‌چیز با `auto-fit`/`minmax`/`clamp` هوشمند می‌شود: در پنجرهٔ باریک
+   خودکار به ردیف بعد می‌رود، هیچ متنی دوخطی یا بریده نمی‌شود.
+   ========================================================================= */
+
+/* --- ۱. محتوای داخل کارت‌های گروهی پدینگ استاندارد می‌گیرد --- */
+.scard > .scard__block { padding: 14px 16px 14px; gap: 10px; }
+.scard > .scard__block + .field--pick,
+.scard > .field--pick + .scard__block { border-top: 1px solid rgba(255, 255, 255, 0.07); }
+.scard--fields .field:not(.field--pick) { padding: 12px 16px; }
+.scard--fields > div > .field + .field { border-top: 1px solid rgba(255, 255, 255, 0.05); }
+.scard .field--tiles { gap: 10px; }
+.scard .pnote { margin: 2px 0 0; }
+
+/* سرِ هر گزینه: برچسب و ✨ هم‌تراز، و برچسب بلند به‌جای بیرون‌زدن می‌شکند. */
+.field__head { min-width: 0; }
+.field__head .field__label { overflow-wrap: anywhere; }
+/* در ردیف پیک، ✨ کنار خودِ عنوان می‌نشیند و نه وسط ردیف. */
+.pick__text .field__head { justify-content: flex-start; }
+.pick__text .field__head .field__label { flex: 0 1 auto; }
+.pick__text .aihint { width: 24px; height: 24px; border-radius: 8px; }
+.pick__value { max-width: 42%; }
+.pick__value-text { overflow: hidden; text-overflow: ellipsis; }
+
+/* --- کاشی‌های پروتکل / نسخهٔ IP: فشرده و افقی، به اندازهٔ متن --- */
+.seg--grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
+  gap: 8px;
+  padding: 0;
+}
+.seg--odd .seg__item:last-child { grid-column: auto; }
+.seg--grid .seg__item {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-width: 0;
+  min-height: 40px;
+  padding: 8px 12px;
+  border-radius: 12px;
+  border-width: 1.5px;
+  white-space: nowrap;
+}
+.seg--grid .seg__text {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 13px;
+}
+.seg--grid .seg__check { position: static; flex: 0 0 auto; }
+.seg--grid .seg__check svg { width: 14px; height: 14px; }
+
+/* --- متن‌های راهنما: جملهٔ انگلیسی داخل صفحهٔ فارسی نقطه‌اش را اول خط نبرد --- */
+.pnote__text, .field__hint, .scard__footer, .setrow__sub, .setnotice__text {
+  unicode-bidi: plaintext;
+}
+html[dir="rtl"] .pnote__text, html[dir="rtl"] .field__hint,
+html[dir="rtl"] .scard__footer, html[dir="rtl"] .setrow__sub,
+html[dir="rtl"] .setnotice__text { text-align: right; }
+
+/* ردیف‌های افقی (کلید/منو): برچسب جا را می‌گیرد، کنترل هرگز بیرون نمی‌زند. */
+.field--row > :first-child { flex: 1 1 auto; min-width: 0; }
+.field--row > .select, .field--row > .fdrop { flex: 0 1 auto; max-width: 55%; min-width: 0; }
+.field--row > .switch { flex: 0 0 auto; }
+.select { max-width: 100%; text-overflow: ellipsis; }
+
+/* --- ۲. برگهٔ پایینی (a2): پنلِ میانه با عرض محدود، گزینه‌ها افقی --- */
+.sheet { align-items: center; }
+.sheet__scrim { position: absolute; inset: 0; }
+.sheet__panel {
+  position: relative;
+  width: min(100%, 620px);
+  margin: auto auto 0;
+  padding: 10px 0 18px;
+  gap: 10px;
+  max-height: min(70vh, 520px);
+  border-radius: 24px 24px 0 0;
+  box-shadow: 0 -18px 50px rgba(0, 0, 0, 0.45);
+}
+.sheet__handle { margin: 2px 0 0; }
+.sheet__title { margin: 0 20px; font-size: 16px; text-align: start; }
+.seg--sheet {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
+  gap: 8px;
+  padding: 2px 16px;
+  overflow: visible;
+}
+.seg--sheet .seg__item {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  min-width: 0;
+  min-height: 44px;
+  padding: 9px 12px;
+  border: 1.5px solid rgba(255, 255, 255, 0.06);
+  border-radius: 12px;
+  background: color-mix(in srgb, #ffffff 3%, transparent);
+  font-size: 13.5px;
+  text-align: start;
+  white-space: nowrap;
+}
+.seg--sheet .seg__item:hover { background: color-mix(in srgb, #ffffff 7%, transparent); }
+.seg--sheet .seg__item.is-active { background: color-mix(in srgb, #4c8dff 16%, transparent); border-color: #4c8dff; }
+.seg--sheet .seg__text { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.seg--sheet .seg__check { flex: 0 0 auto; }
+.seg--sheet .seg__check svg { width: 16px; height: 16px; }
+
+/* --- ۳. کارت اتصال (a3): فاصلهٔ استاندارد از دکمه و عرضِ جمع‌وجورتر --- */
+.view--home .ccard {
+  max-width: 400px;
+  margin-top: clamp(8px, 2.4vh, 20px);
+}
+@media (max-height: 800px) {
+  .view--home .ccard { margin-top: 10px; }
+}
+@media (max-height: 700px) {
+  /* کوچک‌ترین پنجره: ارتفاع طلاست؛ فاصله کم می‌شود ولی نمی‌چسبد. */
+  .view--home .ccard { margin-top: 4px; max-width: 420px; }
+}
+/* <<< AETHER-APP-PATCH fit-to-content-1.3.0-r4 */
+
+/* ===========================================================================
+   ۱.۵.۰ — Zero Trust (عضویت، ورود، آزمایش توکن) و «اشتراک VPN»
+   =========================================================================== */
+.zt__member { gap: 8px; }
+.zt__notice,
+.share__notice {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 12px;
+  font-size: 12.5px;
+  line-height: 1.75;
+  white-space: pre-line;
+  color: var(--on-dark-muted);
+  background: color-mix(in srgb, #ffffff 4%, transparent);
+  border: 1px solid color-mix(in srgb, #ffffff 8%, transparent);
+}
+.zt__notice.is-ok { color: #9ff3e2; border-color: color-mix(in srgb, #32E0C4 35%, transparent); }
+.zt__notice.is-warn,
+.share__notice.is-warn { color: #ffd59a; border-color: color-mix(in srgb, #ffb648 35%, transparent); }
+.share__notice.is-error { color: #ff8fa3; border-color: color-mix(in srgb, #FF5C7A 40%, transparent); }
+.zt__action { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; margin-top: 6px; }
+.zt__tokencheck { margin-top: -4px; }
+.field__hint.is-error,
+.chat__modalnote.is-error { color: #ff8fa3; }
+.field__hint.is-ok { color: #9ff3e2; }
+.chat__modalnote.is-busy { opacity: .85; font-style: italic; }
+.modal__body { display: flex; flex-direction: column; gap: 8px; }
+.modal__code { letter-spacing: .2em; font-size: 16px; text-align: center; }
+.modal__link { align-self: flex-start; }
+
+.view__lead.is-live { color: #32E0C4; }
+.share__body,
+.share__auth { display: flex; flex-direction: column; gap: 10px; }
+.share__divider { border: 0; border-top: 1px solid color-mix(in srgb, #ffffff 8%, transparent); margin: 6px 0; width: 100%; }
+.share__pill {
+  align-self: flex-start;
+  margin: 0;
+  padding: 4px 12px;
+  border-radius: 999px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: #32E0C4;
+  background: color-mix(in srgb, #32E0C4 12%, transparent);
+}
+.share__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: color-mix(in srgb, #ffffff 4%, transparent);
+  border: 1px solid color-mix(in srgb, #ffffff 7%, transparent);
+}
+.share__rowtext { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.share__label { font-size: 12px; color: var(--on-dark-muted); }
+.share__value { font-family: ui-monospace, Consolas, monospace; font-size: 13.5px; overflow-wrap: anywhere; }
+.share__rowbtns { display: flex; gap: 6px; flex: 0 0 auto; }
+.share__copyall { align-self: stretch; }
+.share__steps { margin: 0; padding-inline-start: 20px; display: flex; flex-direction: column; gap: 6px; font-size: 13px; line-height: 1.75; }
+.share__warn { margin: 0; font-size: 12px; line-height: 1.75; color: #ffd59a; }
+
+/* >>> AETHER-APP-PATCH custom-configs (1.3.0 — mobile 1.5.0 CustomConfigsPage) */
+.view--custom { display: flex; flex-direction: column; gap: 18px; }
+.view--custom .scard--fields > .field { padding: 12px 16px; }
+.cc-enable:disabled { opacity: 0.45; cursor: not-allowed; }
+.cc-enable-hint { display: block; }
+/* ردیفِ «زنجیره» + برگهٔ پایینی (a4 موبایل): کارت‌های گرد، عنوان + زیرنویس، قابِ آبی و تیک. */
+.cc-chainpick .cc-pick { align-items: center; }
+.cc-modes { scroll-padding: 8px; }
+.cc-pick__value { flex: 0 1 46%; max-width: 46%; flex-direction: column; align-items: flex-end; gap: 2px; white-space: nowrap; }
+.cc-chain { font-size: 13px; font-weight: 600; color: #6f9fff; max-width: 100%; overflow: hidden; text-overflow: ellipsis; unicode-bidi: isolate; }
+.cc-chain:empty { display: none; }
+.cc-pick__hops { font-size: 11px; color: var(--on-dark-muted); }
+.cc-pick__hops:empty { display: none; }
+.cc-sheet .sheet__panel { width: min(100%, 560px); max-height: min(82vh, 760px); }
+.seg--chain { display: flex; flex-direction: column; gap: 10px; padding: 4px 16px 6px; }
+.seg--chain .seg__item.cc-opt {
+  display: flex; align-items: center; gap: 12px; min-height: 64px; padding: 12px 16px;
+  border: 1.5px solid rgba(255, 255, 255, 0.08); border-radius: 16px;
+  background: color-mix(in srgb, #ffffff 2%, transparent);
+  color: var(--on-dark); white-space: normal; text-align: start; cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+.seg--chain .seg__item.cc-opt:hover { background: color-mix(in srgb, #ffffff 6%, transparent); }
+.seg--chain .seg__item.cc-opt:focus-visible { outline: 2px solid #4c8dff; outline-offset: 2px; }
+.seg--chain .seg__item.cc-opt.is-active { background: color-mix(in srgb, #4c8dff 14%, transparent); border-color: #4c8dff; }
+.seg--chain .seg__text { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 4px; overflow: visible; }
+.cc-opt__title { font-size: 15px; font-weight: 700; letter-spacing: 0.2px; color: var(--on-dark); unicode-bidi: isolate; }
+.cc-opt.is-active .cc-opt__title { color: #7fa8ff; }
+.cc-opt__sub { font-size: 12px; color: var(--on-dark-muted); }
+.seg--chain .seg__check { flex: 0 0 auto; color: #4c8dff; }
+.seg--chain .seg__check svg { width: 20px; height: 20px; }
+.cc-paste { min-height: 84px; }
+.cc-buttons { display: flex; flex-wrap: wrap; gap: 8px; }
+.cc-import, .cc-file { flex: none; }
+.cc-file-input { display: none; }
+.cc-drop {
+  border: 1.5px dashed rgba(255, 255, 255, 0.18); border-radius: 12px; padding: 14px;
+  text-align: center; font-size: 12.5px; color: var(--on-dark-muted);
+  transition: border-color 0.15s, background 0.15s;
+}
+.cc-drop.is-over { border-color: var(--aether-blue); background: color-mix(in srgb, #4c8dff 10%, transparent); color: var(--on-dark); }
+.cc-list-title { margin: 0; }
+/* فهرستِ کانفیگ‌ها: هر کانفیگ یک کارتِ گردِ جدا (مثلِ موبایل)؛ انتخاب‌شده با قابِ آبی و تیک. */
+.view--custom .cc-list { padding: 0; background: transparent; border: 0; box-shadow: none; display: flex; flex-direction: column; gap: 8px; }
+.cc-empty { margin: 0; padding: 14px 16px; font-size: 13px; color: var(--on-dark-muted); border-radius: 16px; background: var(--navy-800); }
+/* «حذف همه» در کارتِ جدای خودش، با همان فاصلهٔ استانداردِ بینِ گروه‌ها. */
+.cc-danger-group { margin-top: 4px; }
+.cc-delete-all { cursor: pointer; }
+.cc-edit { min-height: 160px; }
+.ccfg {
+  display: flex; align-items: flex-start; gap: 12px; padding: 14px 16px; cursor: pointer;
+  border: 1.5px solid rgba(255, 255, 255, 0.07); border-radius: 16px;
+  background: var(--navy-800, #111a2b);
+  transition: border-color 0.15s, background 0.15s;
+}
+.ccfg:hover { background: color-mix(in srgb, #ffffff 4%, var(--navy-800, #111a2b)); }
+.ccfg:focus-visible { outline: 2px solid var(--aether-blue); outline-offset: 2px; }
+.ccfg.is-active { border-color: var(--aether-blue); background: color-mix(in srgb, #4c8dff 12%, var(--navy-800, #111a2b)); }
+.ccfg.is-expired .ccfg__name { opacity: 0.6; }
+.ccfg__dot {
+  flex: none; display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; margin-top: 1px; border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.28); color: transparent;
+}
+.ccfg__dot svg { width: 14px; height: 14px; }
+.ccfg.is-active .ccfg__dot { border-color: var(--aether-blue); background: var(--aether-blue); color: #fff; }
+.ccfg.is-active .ccfg__name { color: #cfe0ff; }
+/* نامِ فارسی در رابطِ انگلیسی (و برعکس) هم‌ترازِ بقیهٔ کارت می‌ماند. */
+:root:not([dir="rtl"]) .ccfg__name { text-align: left; }
+:root[dir="rtl"] .ccfg__name { text-align: right; }
+.ccfg__text { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.ccfg__name { font-size: 14px; font-weight: 600; color: var(--on-dark); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ccfg__meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.ccfg__badge {
+  font-size: 11px; font-weight: 600; padding: 2px 7px; border-radius: 999px;
+  background: color-mix(in srgb, #4c8dff 16%, transparent); color: #b0c5ff;
+}
+.ccfg__badge--lock { background: color-mix(in srgb, #ffc04c 16%, transparent); color: #ffd58f; }
+.ccfg__badge--bad { background: color-mix(in srgb, #ff5c7a 16%, transparent); color: #ff8fa3; }
+/* ۱.۳.۰ — پینگِ واقعی: عدد/وضعیت کنارِ نشان‌ها، دکمهٔ «Test all» کنارِ عنوانِ فهرست. */
+.ccfg__ping {
+  font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 999px;
+  background: color-mix(in srgb, currentColor 12%, transparent);
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.ccfg__ping.is-good { color: #6fe3a5; }
+.ccfg__ping.is-slow { color: #ffd58f; }
+.ccfg__ping.is-bad { color: #ff8fa3; }
+.ccfg__ping.is-wait { color: var(--on-dark-muted); }
+.ccfg__ping-btn { font-variant-numeric: tabular-nums; }
+.cc-list-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.cc-list-head .scard__caption { margin-inline-end: auto; }
+.cc-ping-all { flex: none; white-space: nowrap; }
+.ccfg__server { font-family: 'Cascadia Mono', Consolas, ui-monospace, monospace; font-size: 12px; color: var(--on-dark-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+.ccfg__note { font-size: 12px; color: var(--on-dark-muted); }
+.ccfg__actions { flex: none; display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 4px; max-width: 46%; }
+.chat__modalnote.is-error { color: var(--aether-error); }
+/* کارتِ اتصال: اگر کوتاه‌ترین شکلِ زنجیره هم جا نشد، فونت کوچک‌تر می‌شود. */
+.ccard__slide-v--tight { font-size: 11px; letter-spacing: -0.2px; }
+/* <<< AETHER-APP-PATCH custom-configs */
+
+/* ==========================================================================
+   ۱.۳.۰ — پنجرهٔ «تازه‌ها» (What's New) + بایگانیِ پیام‌ها
+   کاملاً راست‌چین، وزیرمتن، تمِ سرمه‌ایِ تیره، اسکرول‌بارِ باریکِ هماهنگ.
+   ========================================================================== */
+@font-face {
+  font-family: 'Vazirmatn';
+  /* فقط فایلِ Bold همراه است (مثل اندروید)؛ برای همهٔ وزن‌ها اعلام می‌شود تا
+     مرورگر روی یک فونتِ از قبل Bold، پررنگیِ مصنوعی نکشد. */
+  src: url('/fonts/Vazirmatn-Bold.ttf') format('truetype');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+.news {
+  position: fixed;
+  inset: var(--titlebar-height) 0 0 0; /* نوارِ عنوان قابل‌کشیدن و بستن می‌ماند */
+  z-index: 1900;
+  display: flex; align-items: center; justify-content: center;
+  padding: 20px;
+  background: var(--news-scrim);
+  direction: rtl;
+  animation: news-fade .18s var(--motion-standard);
+}
+.news__card {
+  width: min(600px, 100%);
+  max-height: min(720px, 100%);
+  display: flex; flex-direction: column;
+  border-radius: 18px;
+  background: linear-gradient(180deg, var(--news-bg-2), var(--news-bg) 120px);
+  border: 1px solid var(--news-border);
+  box-shadow: 0 24px 64px rgba(0, 0, 0, .55);
+  color: var(--news-text);
+  font-family: 'Vazirmatn', 'IRANSans', Tahoma, sans-serif;
+  font-synthesis: none;
+  text-align: right;
+  overflow: hidden;
+  animation: news-rise .24s var(--motion-emphasized);
+}
+.news__head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 14px 20px 12px 10px;
+  border-bottom: 1px solid var(--news-divider);
+}
+.news__headtext { flex: 1 1 auto; min-width: 0; }
+.news__title { font-size: 16px; line-height: 1.6; color: var(--news-text); }
+.news__ver { unicode-bidi: isolate; direction: ltr; }
+.news__sub { font-size: 12px; line-height: 1.6; color: var(--news-text-2); }
+.news__close {
+  flex: 0 0 auto;
+  width: 34px; height: 34px;
+  display: grid; place-items: center;
+  border: 0; border-radius: 50%;
+  background: transparent; color: var(--news-text-2);
+  cursor: pointer;
+}
+.news__close:hover { background: rgba(255, 255, 255, .06); color: var(--news-text); }
+.news__close:focus-visible, .news__ok:focus-visible, .news__check:focus-within {
+  outline: 2px solid var(--news-accent); outline-offset: 2px;
+}
+
+/* کادرِ متن: ارتفاعِ مشخص (باقیِ کارت) با اسکرولِ عمودیِ نرم. */
+.news__body {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: 60vh;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  scroll-behavior: smooth;
+  padding: 16px 20px 18px 16px;
+  outline: none;
+}
+.news__body::-webkit-scrollbar { width: 6px; }
+.news__body::-webkit-scrollbar-track { background: var(--news-scroll-track); border-radius: 3px; margin: 8px 0; }
+.news__body::-webkit-scrollbar-thumb { background: var(--news-scroll-thumb); border-radius: 3px; }
+.news__body::-webkit-scrollbar-thumb:hover { background: var(--news-scroll-hover); }
+@supports not selector(::-webkit-scrollbar) {
+  .news__body { scrollbar-width: thin; scrollbar-color: var(--news-scroll-thumb) var(--news-scroll-track); }
+}
+
+.announcement-content {
+  direction: rtl;
+  text-align: right;
+  font-family: 'Vazirmatn', sans-serif;
+  color: var(--news-text-2);
+  font-size: 14px;
+  line-height: 1.8;
+  unicode-bidi: isolate;
+}
+.announcement-content strong { color: var(--news-text); font-weight: 700; }
+.announcement-content em { color: var(--news-text-2); }
+.announcement-content p { margin: 0 0 10px; }
+.announcement-content ul, .announcement-content ol { margin: 0 0 12px; padding-right: 20px; padding-left: 0; }
+.announcement-content li { margin-bottom: 6px; }
+.announcement-content ol { list-style-type: persian; }
+.announcement-content ol > li { margin-bottom: 8px; }
+.announcement-content li::marker { color: var(--news-accent-2); }
+.announcement-content ol > li::marker { color: var(--news-accent); }
+.announcement-content [dir="ltr"] { unicode-bidi: isolate; direction: ltr; }
+.announcement-content .news__h2 { color: var(--news-accent); font-size: 18px; line-height: 1.7; margin: 0 0 12px; font-weight: 700; }
+.announcement-content .news__h3 { color: var(--news-accent); font-size: 15.5px; line-height: 1.7; margin: 20px 0 8px; font-weight: 700; }
+.announcement-content .news__warn {
+  background: var(--news-warn-bg);
+  border-right: 4px solid var(--news-warn-bar);
+  padding: 12px;
+  border-radius: 6px;
+  margin: 15px 0;
+}
+.announcement-content .news__note { color: var(--news-note); font-size: 0.9em; }
+.announcement-content .news__note em, .announcement-content .news__note strong { color: var(--news-note); }
+
+.news__foot {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 20px;
+  border-top: 1px solid var(--news-divider);
+}
+.news__check {
+  flex: 1 1 auto;
+  display: inline-flex; align-items: center; gap: 10px;
+  font-size: 13.5px; color: var(--news-text-2);
+  cursor: pointer; user-select: none;
+  border-radius: 8px;
+}
+.news__check[hidden] { display: none; }
+.news__checkbox {
+  appearance: none;
+  width: 18px; height: 18px; margin: 0;
+  border: 2px solid var(--news-check-idle);
+  border-radius: 4px;
+  display: grid; place-items: center;
+  cursor: pointer;
+  transition: background .15s, border-color .15s;
+}
+.news__checkbox:checked { background: var(--news-accent); border-color: var(--news-accent); }
+.news__checkbox:checked::after {
+  content: ''; width: 5px; height: 9px;
+  border: solid var(--news-on-accent); border-width: 0 2px 2px 0;
+  transform: translateY(-1px) rotate(45deg);
+}
+.news__ok {
+  margin-inline-start: auto;
+  min-width: 132px; height: 40px;
+  padding: 0 20px;
+  border: 0; border-radius: 10px;
+  background: var(--news-accent); color: var(--news-on-accent);
+  font: 700 14px/1 'Vazirmatn', sans-serif;
+  cursor: pointer;
+  transition: background .15s;
+}
+.news__ok:hover { background: var(--news-accent-2); }
+
+@keyframes news-fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes news-rise { from { opacity: 0; transform: translateY(8px) scale(.98); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) {
+  .news, .news__card { animation: none; }
+  .news__body { scroll-behavior: auto; }
+}
+
+/* بایگانی در تنظیمات */
+.newsarchive { display: flex; flex-direction: column; gap: 8px; }
+.newsarchive .setrow__title { font-family: 'Vazirmatn', 'IRANSans', sans-serif; }
+.newsarchive__foot { margin: 4px 6px 0; font-size: 12px; line-height: 1.7; color: var(--on-dark-muted); }

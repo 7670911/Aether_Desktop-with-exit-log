@@ -21,9 +21,6 @@ const PROBE_HOSTS: [(&str, u16); 3] = [
 ];
 
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(4_000);
-/// `connection not allowed by ruleset` (RFC 1928 §6) — تنها کد پاسخی که
-/// به‌عنوان شاهدِ فیلترینگ به واچ‌داگ Psiphon گزارش می‌شود.
-const SOCKS5_REP_NOT_ALLOWED: u8 = 0x02;
 const IO_TIMEOUT: Duration = Duration::from_millis(4_000);
 
 pub struct EgressResult {
@@ -153,17 +150,7 @@ pub fn socks5_stream(dest_host: &str, dest_port: u16, timeout: Duration) -> Opti
 
 /// همان CONNECT، روی یک پورت SOCKS5 مشخص.
 ///
-/// # چرا کد پاسخ اینجا اهمیت دارد
-///
-/// `REP = 0x02` (`connection not allowed by ruleset`) ترجمهٔ SOCKS5 همان
-/// `ssh: rejected: administratively prohibited` است: سرور Psiphon زنده است،
-/// تونل سالم است، و **همین سرور** باز کردن این مقصد را رد می‌کند. این تنها
-/// شاهدی است که [crate::psiphon_health] به‌عنوان «فیلترینگ» می‌پذیرد.
-///
-/// هر شکست دیگری — مقصدی که خودش خوابیده (`0x04`/`0x05`)، تایم‌اوت، شبکهٔ
-/// نامرغوب — عمداً گزارش **نمی‌شود**. در اندروید یک‌بار همین تفکیک نبود و
-/// واچ‌داگ روی **بار** شلیک کرد: باز کردن یک ویدیو ۲۶ رد‌شدن در ۴٫۲ ثانیه ساخت،
-/// چرخش وسط پخش اتفاق افتاد و کاربر شش ثانیه قطعی دید.
+/// The desktop checks the finished SOCKS route; the engine owns child health.
 pub fn socks5_stream_on(
     proxy_port: u16,
     dest_host: &str,
@@ -191,11 +178,6 @@ pub fn socks5_stream_on(
     let mut head = [0u8; 4];
     s.read_exact(&mut head).ok()?;
     if head[0] != 0x05 || head[1] != 0x00 {
-        // شاهدِ فیلترینگ فقط از خروجیِ خط لوله معنی دارد: یک رد‌شدن روی استیج ۱
-        // دربارهٔ سرور Psiphon هیچ نمی‌گوید.
-        if head[1] == SOCKS5_REP_NOT_ALLOWED && proxy_port == crate::engine::exit_socks_port() {
-            crate::psiphon_health::on_destination_refused(dest_host, dest_port);
-        }
         return None;
     }
     match head[3] {
@@ -218,22 +200,12 @@ pub fn socks5_stream_on(
     Some(s)
 }
 
-/// Destinations the connected-state watchdog dials through the pipeline.
-///
-/// Exposed so `state.rs` can register them with [`crate::psiphon_health`] as
-/// self-probes: a refusal of one of the app's own probes is not evidence that the
-/// exit filters, and counting it used to convict healthy servers and trigger a
-/// rotation that killed every live flow.
-pub const WATCHDOG_TARGETS: [(&str, u16); 3] = [
+/// End-to-end watchdog targets; these are not used to score Psiphon servers.
+const WATCHDOG_TARGETS: [(&str, u16); 3] = [
     ("cloudflare.com", 80),
     ("www.gstatic.com", 80),
     ("1.1.1.1", 80),
 ];
-
-/// The watchdog destinations, for whoever needs to exempt them from scoring.
-pub fn watchdog_targets() -> impl Iterator<Item = (&'static str, u16)> {
-    WATCHDOG_TARGETS.iter().copied()
-}
 
 /// معادل `NetProbe.checkTcpViaProxy` — CONNECT به IP خام، بدون DNS.
 /// v1.2.0 watchdog: three independent end-to-end targets. A check passes
@@ -249,6 +221,11 @@ pub fn watchdog_probe() -> bool {
 
 pub fn tcp_via_proxy(dest_ip: &str, dest_port: u16) -> bool {
     socks5_stream(dest_ip, dest_port, CONNECT_TIMEOUT).is_some()
+}
+
+/// همان سنجه با مهلتِ دلخواه — برای خط لوله‌های تور (AETHER-APP-FIX tor-proves-its-exit).
+pub fn tcp_via_proxy_within(dest_ip: &str, dest_port: u16, timeout: Duration) -> bool {
+    socks5_stream(dest_ip, dest_port, timeout).is_some()
 }
 
 /// همان بررسی، روی یک پورت SOCKS5 مشخص (دروازهٔ استیج ۱).

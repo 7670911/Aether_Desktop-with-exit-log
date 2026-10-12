@@ -33,6 +33,7 @@ import {
   applyChanges,
 } from '../ai.js'
 import { consumeQueuedQuestion } from '../ui/nav.js'
+import { renderMarkdown, plainText } from '../ui/markdown.js'
 import { toast } from '../ui/toast.js'
 
 /** چهار پرسشِ آماده روی صفحهٔ خالی — همان چهارتای `ai_chat_suggest_*` موبایل. */
@@ -130,8 +131,12 @@ function bubble(message, ctx) {
       detail.textContent = message.text
       body.appendChild(detail)
     }
-  } else {
+  } else if (message.fromUser) {
     body.textContent = message.text
+  } else {
+    // ۱.۴.۰-r4: پاسخِ مدل Markdown است (FORMAT در پرامپت) — رندرِ امن، بدون innerHTML.
+    body.classList.add('md')
+    renderMarkdown(body, message.text)
   }
   box.appendChild(body)
 
@@ -163,7 +168,7 @@ function bubble(message, ctx) {
   } else if (message.fromUser) {
     acts.appendChild(iconButton('edit', t('Edit'), () => ctx.edit(message)))
   } else {
-    acts.appendChild(iconButton('copy', t('Copy answer'), () => copyText(message.text)))
+    acts.appendChild(iconButton('copy', t('Copy answer'), () => copyText(plainText(message.text))))
   }
   acts.appendChild(iconButton('trash', t('Delete'), () => ctx.remove([message.id])))
   box.appendChild(acts)

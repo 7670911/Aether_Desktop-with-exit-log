@@ -140,6 +140,7 @@ SHA256SUMS.txt
 npm ci
 ./scripts/build-engine.ps1 -Target x86_64-pc-windows-msvc
 ./scripts/fetch-wintun.ps1 -ArchDir bin/amd64
+./scripts/stage-xray.ps1 -Arch x64   # هستهٔ Xray برای «کانفیگ‌های سفارشی» (اختیاری)
 npm run tauri dev
 ```
 

@@ -14,7 +14,7 @@ const CHECK_COLOR = { PASS: '#32E0C4', FAIL: '#FF5C7A', RUNNING: '#F5C451', PEND
 const LEVEL_CLASS = { E: 'log__line--e', W: 'log__line--w', I: 'log__line--i', D: 'log__line--d' }
 
 function esc(s) {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
 }
 
 export function renderDiagnostics() {

@@ -21,6 +21,21 @@ use std::time::{Duration, Instant};
 
 const TAG: &str = "diag";
 
+/// 1.3.0: generation of the running self-test. A teardown bumps it so the
+/// retry loop of an abandoned attempt stops at once. Before this, the loop of
+/// a dead rung kept probing for its whole grace window and overlapped the next
+/// rung's probes — the doubled `proxied geo … failed` lines in the field log.
+static SELF_TEST_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Abandons any self-test still running (called from every teardown).
+pub fn cancel_self_test() {
+    SELF_TEST_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn self_test_cancelled(generation: u64) -> bool {
+    SELF_TEST_GEN.load(std::sync::atomic::Ordering::SeqCst) != generation
+}
+
 // شناسهٔ بررسی‌ها — همان مقادیر Diagnostics.kt.
 pub const C_PORT: &str = "socks_port";
 pub const C_HANDSHAKE: &str = "socks_handshake";
@@ -300,10 +315,46 @@ pub fn run_proxy_stage_with_grace(
     // دور و درونِ همان حامل انجام می‌شود — هم بی‌نشتی، هم همان چیزی که
     // استیج ۲ لحزه‌ای بعد لازم دارد. دو مقصد، چون یک خروجیِ تور می‌تواند
     // یکیِ معین را رد کند و آن دربارهٔ حامل چیزی نمی‌گوید.
-    if !STAGE_ONE_TARGETS
-        .iter()
-        .any(|(host, dest)| probe::tcp_via_proxy_on(port, host, *dest))
-    {
+    // After Tor reports 100%, a circuit may still reject its first stream.
+    // The field log showed two 4s probes failing immediately after bootstrap,
+    // while later Tor-only traffic through the same installation succeeded.
+    // Retry ONLY the Tor-fronted chain: non-Tor stages keep the original fast gate.
+    // Every target is sent as SOCKS5 ATYP=DOMAIN; no local DNS resolution.
+    let tor_targets: [(&str, u16); 3] = [
+        ("cloudflare.com", 443),
+        ("www.gstatic.com", 443),
+        ("cloudflare.com", 80),
+    ];
+    let targets: &[(&str, u16)] = if grace_ms > 0 {
+        &tor_targets
+    } else {
+        &STAGE_ONE_TARGETS
+    };
+    let stream_deadline = Instant::now() + Duration::from_secs(25);
+    let mut working = false;
+    loop {
+        for (host, dest) in targets {
+            if !alive() || abort() {
+                break;
+            }
+            if probe::tcp_via_proxy_on(port, host, *dest) {
+                working = true;
+                break;
+            }
+            if grace_ms > 0 && Instant::now() >= stream_deadline {
+                break;
+            }
+        }
+        if working || grace_ms == 0 || !alive() || abort() || Instant::now() >= stream_deadline {
+            break;
+        }
+        DiagnosticsLog::w(
+            TAG,
+            "Tor has a circuit but its exit did not open a stream yet; retrying a fresh stream.",
+        );
+        std::thread::sleep(Duration::from_millis(750));
+    }
+    if !working {
         DiagnosticsLog::e(
             TAG,
             &format!("stage 1: 127.0.0.1:{port} speaks SOCKS5 but cannot reach the internet"),
@@ -414,6 +465,7 @@ pub fn webrtc_leak_check(exit_ip: Option<&str>) -> LeakReport {
 
 /// معادل `Diagnostics.run()` — دروازهٔ اعلام Connected.
 pub fn self_test(grace_ms: u64) -> SelfTestOutcome {
+    let generation = SELF_TEST_GEN.load(std::sync::atomic::Ordering::SeqCst);
     reset_checks();
     DiagnosticsLog::i(TAG, "Starting connectivity self-test…");
 
@@ -463,7 +515,15 @@ pub fn self_test(grace_ms: u64) -> SelfTestOutcome {
     let mut dns: Option<(probe::IpInfo, u64)> = None;
     loop {
         if !tcp_ok {
-            tcp_ok = probe::tcp_via_proxy("1.1.1.1", 80);
+            // AETHER-APP-FIX tor-proves-its-exit: در پنجرهٔ بلند (تور/زنجیره) سنجهٔ
+            // TCP هم مهلتِ بلندتر می‌گیرد؛ اینجا سنجه‌ها پشتِ‌سرِ‌هم‌اند، نه
+            // هم‌زمان مثلِ موبایل، پس ۴ ثانیه روی مدارِ تازه یعنی بریدنِ استریمی
+            // که داشت می‌رسید.
+            tcp_ok = if grace_ms >= EXTERNAL_GRACE_MS {
+                probe::tcp_via_proxy_within("1.1.1.1", 80, Duration::from_secs(12))
+            } else {
+                probe::tcp_via_proxy("1.1.1.1", 80)
+            };
             if tcp_ok {
                 DiagnosticsLog::update_check(C_TCP, "PASS", Some("connected"));
                 DiagnosticsLog::i(TAG, "TCP via proxy: OK");
@@ -471,7 +531,16 @@ pub fn self_test(grace_ms: u64) -> SelfTestOutcome {
         }
         if dns.is_none() {
             let started = Instant::now();
-            if let Some(info) = probe::fetch_ip_via_socks(6_000) {
+            // A Tor -> Aether route crosses Tor, TLS and the WARP carrier;
+            // the former 6s budget could reject a verified data-plane solely
+            // because the HTTPS geo request was still in its handshake.
+            // Keep the shorter budget for a normal single-hop connection.
+            let geo_timeout_ms = if grace_ms >= EXTERNAL_GRACE_MS {
+                15_000
+            } else {
+                6_000
+            };
+            if let Some(info) = probe::fetch_ip_via_socks(geo_timeout_ms) {
                 let ms = started.elapsed().as_millis() as u64;
                 let cc = info
                     .country_code
@@ -499,7 +568,7 @@ pub fn self_test(grace_ms: u64) -> SelfTestOutcome {
         if tcp_ok && dns.is_some() {
             break;
         }
-        if Instant::now() >= deadline {
+        if Instant::now() >= deadline || self_test_cancelled(generation) {
             break;
         }
         std::thread::sleep(Duration::from_millis(RETRY_DELAY_MS));
@@ -522,7 +591,7 @@ pub fn self_test(grace_ms: u64) -> SelfTestOutcome {
         if tcp_ok {
             DiagnosticsLog::w(
                 TAG,
-                "Raw TCP works but DNS+HTTP failed — upstream DNS looks broken.",
+                "Raw TCP works, but the HTTPS exit-IP probe failed (DNS, TLS, HTTP or remote service); cause not yet known.",
             );
         } else {
             DiagnosticsLog::w(
@@ -713,15 +782,18 @@ pub fn run(profile: &ConnectionProfile) -> Report {
         Some(engine) if crate::provenance::consistent() => check(
             "Build identity",
             Verdict::Pass,
-            format!("app and engine are both patch level {engine}"),
+            format!(
+                "app {} runs the bundled, unmodified Aether core {engine}",
+                crate::provenance::APP_PATCH_LEVEL
+            ),
         ),
         Some(engine) => check(
             "Build identity",
             Verdict::Fail,
             format!(
-                "STALE ENGINE: the app is {} but aether.exe is {engine}. Nothing this \
-                 session reports about the data plane can be trusted.",
-                crate::provenance::APP_PATCH_LEVEL
+                "WRONG ENGINE: this app ships Aether core {} but aether.exe reports {engine}. \
+                 Reinstall so the engine and the app match.",
+                crate::provenance::expected_core_version()
             ),
         ),
         // موتور هنوز حرف نزده — پیش از نخستین اتصال حالتِ عادی است.
@@ -729,7 +801,7 @@ pub fn run(profile: &ConnectionProfile) -> Report {
             "Build identity",
             Verdict::Warn,
             format!(
-                "app patch level {}; the engine has not reported its own yet",
+                "app patch level {}; the engine has not reported its core version yet",
                 crate::provenance::APP_PATCH_LEVEL
             ),
         ),
