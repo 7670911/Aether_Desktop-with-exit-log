@@ -500,6 +500,10 @@ impl AetherProcess {
         // upstream for both localhost and LAN peers, so it must never route direct.
         engine_profile.route_direct.clear();
         let mut args = engine_profile.to_args_with_caps(caps);
+
+        args.push("--exit-loc".into());
+        args.push("!IR".into());
+        
         if self.psiphon_only_run(profile) {
             // Core's Psiphon-only path binds the primary SOCKS listener (1819).
             // Never ask it to bootstrap a second, internal arti process: the
