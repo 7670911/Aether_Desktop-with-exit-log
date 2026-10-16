@@ -663,14 +663,28 @@ jobs:
           # عمقِ پوشه‌ها ثابت نیست.
           APP_PATCHLEVEL: ${{ steps.patch.outputs.level }}
         run: |
+          
           $ErrorActionPreference = 'Continue'
-          ./scripts/build-engine.ps1 -Target '${{ matrix.rust_target }}'
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "::warning::Engine build failed with the freshly synced core - rolling back."
-            ./scripts/core-rollback.ps1
-            $ErrorActionPreference = 'Stop'
-            ./scripts/build-engine.ps1 -Target '${{ matrix.rust_target }}'
-          }
+
+# Create a short drive path to avoid deeply nested Windows build paths.
+subst Z: /d 2>$null
+subst Z: "$((Get-Location).Path)"
+
+if (-not (Test-Path 'Z:\scripts\build-engine.ps1')) {
+    throw 'Could not create the short build path Z:\'
+}
+
+Set-Location Z:\
+
+./scripts/build-engine.ps1 -Target '${{ matrix.rust_target }}'
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "::warning::Engine build failed with the freshly synced core - rolling back."
+    ./scripts/core-rollback.ps1
+
+    $ErrorActionPreference = 'Stop'
+    ./scripts/build-engine.ps1 -Target '${{ matrix.rust_target }}'
+}
 
       # موتور باید همان هستهٔ CORE_VERSION باشد — هستهٔ دست‌نخورده نسخهٔ خودش را
       # با `--version` می‌گوید (`aether 2.3.0`).
